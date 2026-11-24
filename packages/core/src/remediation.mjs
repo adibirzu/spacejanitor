@@ -32,12 +32,18 @@ export function createRemediationPlan(candidates = [], options = {}) {
   }
 
   items.sort((a, b) => a.path.localeCompare(b.path));
-  const canonical = JSON.stringify(items.map((i) => [i.id, i.path, i.bytes, i.kind]));
+  const nonce = crypto.randomBytes(16).toString("hex");
+  const canonical = JSON.stringify({
+    nonce,
+    items: items.map((i) => [i.id, i.path, i.bytes, i.kind]),
+  });
   const planSha256 = crypto.createHash("sha256").update(canonical).digest("hex");
   const totalBytes = items.reduce((acc, i) => acc + i.bytes, 0);
 
   return {
     schema: "spacejanitor.plan.v1",
+    planId: planSha256,
+    nonce,
     dryRun: true,
     items,
     blockedItems,

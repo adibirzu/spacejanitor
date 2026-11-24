@@ -9,17 +9,47 @@ export const ALLOWLISTED_IPC_METHODS = new Set([
   "orphans",
   "trash",
   "mcp-audit",
-  "plan_reap",
-  "execute_reap",
-  "plan_cleanup",
-  "execute_cleanup",
-  "slm_get_config",
-  "slm_update_config",
-  "slm_explain",
 ]);
 
 export function validateIpcMethod(method: string): boolean {
   return typeof method === "string" && ALLOWLISTED_IPC_METHODS.has(method);
+}
+
+export function sanitizeIpcParams(rawParams: unknown): Record<string, unknown> {
+  if (!rawParams || typeof rawParams !== "object") return {};
+  const params = { ...(rawParams as Record<string, unknown>) };
+  delete params.configDirs;
+  delete params.homeDir;
+  delete params.isProtectedFn;
+  delete params.redactFn;
+  return params;
+}
+
+export function isAuthorizedSenderFrame(
+  frameUrl: string | undefined,
+  allowedEntry: { devUrl?: string; indexPath?: string }
+): boolean {
+  if (!frameUrl || typeof frameUrl !== "string") return false;
+  let parsed: URL;
+  try {
+    parsed = new URL(frameUrl);
+  } catch {
+    return false;
+  }
+  if (allowedEntry.devUrl) {
+    try {
+      const devParsed = new URL(allowedEntry.devUrl);
+      return parsed.origin === devParsed.origin;
+    } catch {
+      return false;
+    }
+  }
+  if (allowedEntry.indexPath && parsed.protocol === "file:") {
+    const normalizedFrame = decodeURIComponent(parsed.pathname).replace(/\\/g, "/");
+    const normalizedExpected = allowedEntry.indexPath.replace(/\\/g, "/");
+    return normalizedFrame === normalizedExpected || normalizedFrame === `/${normalizedExpected}`;
+  }
+  return false;
 }
 
 export function validateTargetPath(rawPath: unknown): { valid: boolean; reason?: string; value?: string } {

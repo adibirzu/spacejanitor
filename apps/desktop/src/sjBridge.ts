@@ -10,26 +10,36 @@ const execFileAsync = promisify(execFile);
 export interface ResolveBinaryOptions {
   resourcesPath?: string;
   cwd?: string;
+  isPackaged?: boolean;
   platform?: NodeJS.Platform;
   existsSync?: (p: string) => boolean;
 }
+
+const PACKAGE_REPO_ROOT = path.resolve(__dirname, "../../..");
 
 export function resolveSjBinary(options: ResolveBinaryOptions = {}): string | null {
   const platform = options.platform ?? process.platform;
   const exe = platform === "win32" ? "sj.exe" : "sj";
   const exists = options.existsSync ?? fs.existsSync;
   const resourcesPath = options.resourcesPath ?? (process as { resourcesPath?: string }).resourcesPath ?? "";
-  const cwd = options.cwd ?? process.cwd();
+  const isPackaged = options.isPackaged ?? false;
 
-  const candidates = [
-    resourcesPath ? path.join(resourcesPath, "bin", exe) : "",
-    path.resolve(cwd, "target", "release", exe),
-    path.resolve(cwd, "target", "debug", exe),
-    path.resolve(cwd, "..", "..", "target", "release", exe),
-    path.resolve(cwd, "..", "..", "target", "debug", exe),
-  ].filter(Boolean);
+  if (resourcesPath) {
+    const bundled = path.join(resourcesPath, "bin", exe);
+    if (exists(bundled)) return bundled;
+  }
+  if (isPackaged) {
+    return null;
+  }
 
-  for (const cand of candidates) {
+  const envBin = process.env.SPACEJANITOR_SJ_BIN;
+  if (envBin && exists(envBin)) return envBin;
+
+  const repoCandidates = [
+    path.resolve(PACKAGE_REPO_ROOT, "target", "release", exe),
+    path.resolve(PACKAGE_REPO_ROOT, "target", "debug", exe),
+  ];
+  for (const cand of repoCandidates) {
     if (exists(cand)) return cand;
   }
 
@@ -70,14 +80,20 @@ export class SjBridge {
       });
       child.stdout.setEncoding("utf8");
       child.stdout.on("data", (chunk: string) => this.handleStdout(chunk));
-      child.on("exit", () => {
+      child.stderr.on("data", () => {
+        // drain stderr cleanly
+      });
+      const failPending = (reason: string) => {
         this.proc = null;
         for (const [id, req] of this.pending.entries()) {
           clearTimeout(req.timer);
-          req.reject(new Error("sj_sidecar_exited"));
+          req.reject(new Error(reason));
           this.pending.delete(id);
         }
-      });
+      };
+      child.on("error", (err) => failPending(err.message || "sj_sidecar_error"));
+      child.stdin.on("error", (err) => failPending(err.message || "sj_stdin_error"));
+      child.on("exit", () => failPending("sj_sidecar_exited"));
       this.proc = child;
       return true;
     } catch {
@@ -103,7 +119,7 @@ export class SjBridge {
             if (msg.error) {
               req.reject(new Error(String(msg.error.message || "rpc_error")));
             } else {
-              req.resolve({ ...(msg.result || {}), source: "sj-core" });
+              req.resolve(core.normalizeReportEnvelope({ ...(msg.result || {}), source: "sj-core" }));
             }
           }
         } catch {
@@ -151,7 +167,7 @@ export class SjBridge {
       });
       const parsed = JSON.parse(stdout);
       if (parsed && typeof parsed === "object" && parsed.schema) {
-        return { ...parsed, source: "sj-core" };
+        return core.normalizeReportEnvelope({ ...parsed, source: "sj-core" });
       }
     } catch {
       return null;

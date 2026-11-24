@@ -11,11 +11,17 @@ test("rejects shell metacharacters and empty paths in IPC payloads", () => {
   assert.equal(validateTargetPath("/tmp | cat").valid, false);
 });
 
-test("allows only allowlisted IPC methods", () => {
+test("allows only allowlisted IPC methods and blocks gate-bypass methods", () => {
   assert.equal(validateIpcMethod("summary"), true);
   assert.equal(validateIpcMethod("disk"), true);
-  assert.equal(validateIpcMethod("plan_reap"), true);
-  assert.equal(validateIpcMethod("execute_reap"), true);
+  assert.equal(validateIpcMethod("mcp-audit"), true);
+  assert.equal(validateIpcMethod("plan_reap"), false);
+  assert.equal(validateIpcMethod("execute_reap"), false);
+  assert.equal(validateIpcMethod("plan_cleanup"), false);
+  assert.equal(validateIpcMethod("execute_cleanup"), false);
+  assert.equal(validateIpcMethod("slm_get_config"), false);
+  assert.equal(validateIpcMethod("slm_update_config"), false);
+  assert.equal(validateIpcMethod("slm_explain"), false);
   assert.equal(validateIpcMethod("exec_shell"), false);
   assert.equal(validateIpcMethod("fs_write"), false);
 });

@@ -1,18 +1,21 @@
+import { normalizeReportEnvelope } from "./telemetry.mjs";
+
 /**
  * Compact, token-efficient TOON formatter for SpaceJanitor v1 envelopes (ADR-003).
  */
-export function formatToon(report) {
-  if (!report || typeof report !== "object") return "status: UNKNOWN";
+export function formatToon(rawReport) {
+  if (!rawReport || typeof rawReport !== "object") return "status: UNKNOWN";
+  const report = normalizeReportEnvelope(rawReport);
   const lines = [];
   if (report.schema) lines.push(`schema: ${report.schema}`);
   if (report.status) lines.push(`status: ${report.status}`);
   if (report.source) lines.push(`source: ${report.source}`);
 
   if (report.schema === "spacejanitor.doctor.v1") {
-    lines.push(`host: ${report.platform}/${report.arch} (node ${report.node})`);
+    lines.push(`host: ${report.platform}/${report.arch} (${report.node})`);
     lines.push(`mem_gib: ${report.freeMemGiB}/${report.totalMemGiB} free | safety: ${report.safetyMode}`);
-    lines.push(`ready: ${report.ready}`);
-  } else if (report.schema === "spacejanitor.disk.v1") {
+    lines.push(`ready: ${Boolean(report.ready)}`);
+  } else if (report.schema === "spacejanitor.disk.v1" || report.schema === "spacejanitor.storage.v1") {
     lines.push(`target: ${report.targetPath} | free_gib: ${report.freeGiB}`);
     for (const c of (report.topConsumers || []).slice(0, 8)) {
       const mb = (c.bytes / (1024 * 1024)).toFixed(1);
@@ -50,6 +53,8 @@ export function formatToon(report) {
     lines.push(`dry_run: ${report.dryRun} | items: ${report.items.length} | reclaim_mib: ${mib}`);
     lines.push(`plan_sha256: ${report.planSha256}`);
     lines.push(`confirm_phrase: ${report.confirmationPhrase}`);
+  } else if (report.schema === "spacejanitor.reap.v1") {
+    lines.push(`executed: ${Boolean(report.executed)}${report.error ? ` | error: ${report.error}` : ""}`);
   } else if (report.schema === "spacejanitor.summary.v1") {
     lines.push(`disk_free_gib: ${report.disk?.freeGiB} [${report.disk?.status}]`);
     lines.push(`memory: [${report.memory?.status}] | blockers: [${report.blockers?.status}]`);

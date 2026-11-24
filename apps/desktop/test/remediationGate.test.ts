@@ -42,3 +42,25 @@ test("enforces 2-step SHA-256 plan and execute gate in main process", () => {
   });
   assert.equal(replay.allowed, false);
 });
+
+test("B3 & #5: gate binds planId to server-approved candidates and includes cryptographic nonce", () => {
+  const gate = new RemediationGate({ homeDir: SYNTHETIC_HOME });
+  const approved = [
+    { id: "c1", path: "/home/developer/.cache/vite", bytes: 4096, kind: "dir" as const },
+  ];
+  gate.registerApprovedCandidates(approved);
+
+  // Renderer-supplied arbitrary path not in server-approved list must be rejected
+  assert.throws(
+    () =>
+      gate.createDryRunPlan([
+        { id: "evil", path: "/home/developer/important-notes.txt", bytes: 100, kind: "file" },
+      ]),
+    /unapproved_candidate/
+  );
+
+  // Two plans with identical approved items must have distinct planSha256 (per-plan nonce)
+  const p1 = gate.createDryRunPlan(approved);
+  const p2 = gate.createDryRunPlan(approved);
+  assert.notEqual(p1.planSha256, p2.planSha256);
+});

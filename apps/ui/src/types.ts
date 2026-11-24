@@ -80,10 +80,12 @@ export interface SummaryReport {
     secretRiskCount: number;
     servers: McpServerEntry[];
   };
+  cleanableCaches?: DiskConsumer[];
 }
 
 export interface RemediationPlan {
   schema: string;
+  planId?: string;
   dryRun: boolean;
   items: DiskConsumer[];
   blockedItems: Array<{ id: string; path: string; bytes: number; reason: string }>;

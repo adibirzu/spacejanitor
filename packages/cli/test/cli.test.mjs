@@ -44,3 +44,22 @@ test("AXI CLI remediate fails closed when --execute is passed without valid conf
     (err) => err.status === 1
   );
 });
+
+test("AXI CLI supports --path before subcommand and never fakes --execute success on empty environment", () => {
+  const diskOut = runCli(["--path", process.cwd(), "disk", "--json"]);
+  const diskParsed = JSON.parse(diskOut);
+  assert.ok(
+    diskParsed.schema === "spacejanitor.disk.v1" || diskParsed.schema === "spacejanitor.storage.v1"
+  );
+
+  // Even if someone passes --execute, on an empty/no-op environment it must never return executed: true
+  assert.throws(
+    () => runCli(["remediate", "--execute", "--confirm", "CONFIRM-00000000", "--plan-sha256", "0".repeat(64), "--json"]),
+    (err) => {
+      assert.equal(err.status, 1);
+      const parsed = JSON.parse(err.stdout || "{}");
+      assert.equal(parsed.executed, false);
+      return true;
+    }
+  );
+});

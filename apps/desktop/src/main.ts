@@ -1,24 +1,39 @@
-import { app, BrowserWindow, ipcMain, Menu, nativeImage, session, Tray } from "electron";
+import { app, BrowserWindow, ipcMain, IpcMainInvokeEvent, Menu, nativeImage, session, shell, Tray } from "electron";
+import { execFile } from "node:child_process";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
-import { isSafeNavigationUrl, validateIpcMethod, validateTargetPath } from "./ipcValidation";
+import { promisify } from "node:util";
+import {
+  isAuthorizedSenderFrame,
+  isSafeNavigationUrl,
+  sanitizeIpcParams,
+  validateIpcMethod,
+  validateTargetPath,
+} from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
-import { SjBridge } from "./sjBridge";
+import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
+
+const execFileAsync = promisify(execFile);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
 let isQuitting = false;
 let lastStatusSummary = "Status: Initializing...";
 
-const bridge = new SjBridge();
+const bridge = new SjBridge({
+  binaryPath: resolveSjBinary({ isPackaged: app.isPackaged }),
+});
 const gate = new RemediationGate();
 const slmAdvisor = new SlmAdvisorService();
 
 function resolveUiEntry(): { devUrl?: string; indexPath?: string } {
-  const devUrl = process.env.SPACEJANITOR_UI_URL;
-  if (devUrl && isSafeNavigationUrl(devUrl)) {
-    return { devUrl };
+  if (!app.isPackaged) {
+    const devUrl = process.env.SPACEJANITOR_UI_URL;
+    if (devUrl && isSafeNavigationUrl(devUrl)) {
+      return { devUrl };
+    }
   }
   const prodIndex = path.resolve(__dirname, "../../ui/dist/index.html");
   if (fs.existsSync(prodIndex)) {
@@ -50,9 +65,10 @@ function createMainWindow(): BrowserWindow {
     },
   });
 
+  const entry = resolveUiEntry();
   win.webContents.setWindowOpenHandler(() => ({ action: "deny" }));
   win.webContents.on("will-navigate", (event, url) => {
-    if (!isSafeNavigationUrl(url)) {
+    if (!isAuthorizedSenderFrame(url, entry)) {
       event.preventDefault();
     }
   });
@@ -67,7 +83,6 @@ function createMainWindow(): BrowserWindow {
     }
   });
 
-  const entry = resolveUiEntry();
   if (entry.devUrl) {
     void win.loadURL(entry.devUrl);
   } else if (entry.indexPath) {
@@ -138,13 +153,48 @@ function setupTray(): void {
   refreshTrayMenu();
 }
 
+function assertAuthorizedSender(event: IpcMainInvokeEvent): void {
+  const entry = resolveUiEntry();
+  const frameUrl = event.senderFrame?.url;
+  if (!isAuthorizedSenderFrame(frameUrl, entry)) {
+    throw new Error("Unauthorized IPC sender frame");
+  }
+}
+
+function registerApprovedFromReport(method: string, result: Record<string, unknown>): void {
+  if (method !== "summary") return;
+  const trashCands = Array.isArray((result.trash as { candidates?: RemediationCandidate[] })?.candidates)
+    ? ((result.trash as { candidates: RemediationCandidate[] }).candidates)
+    : [];
+  const cacheCands = Array.isArray(result.cleanableCaches)
+    ? (result.cleanableCaches as RemediationCandidate[])
+    : [];
+  const orphanCands = Array.isArray((result.orphans as { candidates?: Array<RemediationCandidate & { safeToPrune?: boolean }> })?.candidates)
+    ? (result.orphans as { candidates: Array<RemediationCandidate & { safeToPrune?: boolean }> }).candidates.filter(
+        (c) => c.safeToPrune
+      )
+    : [];
+  gate.registerApprovedCandidates([...trashCands, ...cacheCands, ...orphanCands]);
+}
+
+function isInsideOsTrash(targetPath: string): boolean {
+  const home = os.homedir();
+  const resolved = path.resolve(targetPath);
+  const trashRoots = [
+    path.join(home, ".Trash"),
+    path.join(home, ".local", "share", "Trash", "files"),
+  ];
+  return trashRoots.some((r) => resolved === r || resolved.startsWith(`${r}${path.sep}`));
+}
+
 function registerIpcHandlers(): void {
-  ipcMain.handle("sj:invoke", async (_event, payload: { method?: string; params?: Record<string, unknown> }) => {
+  ipcMain.handle("sj:invoke", async (event, payload: { method?: string; params?: Record<string, unknown> }) => {
+    assertAuthorizedSender(event);
     const method = String(payload?.method || "");
     if (!validateIpcMethod(method)) {
       throw new Error(`Disallowed IPC method: ${method}`);
     }
-    const params = { ...(payload?.params || {}) };
+    const params = sanitizeIpcParams(payload?.params);
     if (params.targetPath !== undefined && params.targetPath !== null && params.targetPath !== "") {
       const pathCheck = validateTargetPath(params.targetPath);
       if (!pathCheck.valid) {
@@ -154,10 +204,13 @@ function registerIpcHandlers(): void {
     } else {
       delete params.targetPath;
     }
-    return bridge.invoke(method, params);
+    const result = await bridge.invoke(method, params);
+    registerApprovedFromReport(method, result);
+    return result;
   });
 
-  ipcMain.handle("sj:plan", async (_event, payload: { candidates?: RemediationCandidate[] }) => {
+  ipcMain.handle("sj:plan", async (event, payload: { candidates?: RemediationCandidate[] }) => {
+    assertAuthorizedSender(event);
     const candidates = Array.isArray(payload?.candidates) ? payload.candidates : [];
     for (const c of candidates) {
       const check = validateTargetPath(c?.path);
@@ -168,7 +221,8 @@ function registerIpcHandlers(): void {
     return gate.createDryRunPlan(candidates);
   });
 
-  ipcMain.handle("sj:execute", async (_event, payload: { planSha256?: string; phrase?: string }) => {
+  ipcMain.handle("sj:execute", async (event, payload: { planSha256?: string; phrase?: string }) => {
+    assertAuthorizedSender(event);
     const planSha256 = String(payload?.planSha256 || "");
     const phrase = String(payload?.phrase || "");
     const auth = gate.authorizeExecute({ planSha256, phrase });
@@ -181,22 +235,35 @@ function registerIpcHandlers(): void {
     }
 
     return gate.withMutex(async () => {
-      // Safe execution: remove only validated non-protected items via fs.rmSync
       const removed: string[] = [];
       const failed: Array<{ path: string; error: string }> = [];
       for (const item of auth.plan!.items) {
         try {
-          if (fs.existsSync(item.path)) {
-            fs.rmSync(item.path, { recursive: item.kind === "dir", force: false });
+          if (!fs.existsSync(item.path)) {
+            failed.push({ path: item.path, error: "target_missing" });
+            continue;
           }
-          removed.push(item.path);
+          if (item.kind === "git-worktree") {
+            await execFileAsync("git", ["worktree", "remove", item.path], {
+              cwd: path.dirname(item.path),
+              timeout: 5000,
+            });
+            removed.push(item.path);
+          } else if (isInsideOsTrash(item.path)) {
+            fs.rmSync(item.path, { recursive: item.kind === "dir", force: false });
+            removed.push(item.path);
+          } else {
+            await shell.trashItem(item.path);
+            removed.push(item.path);
+          }
         } catch (err) {
-          failed.push({ path: item.path, error: err instanceof Error ? err.message : "rm_failed" });
+          failed.push({ path: item.path, error: err instanceof Error ? err.message : "remediation_failed" });
         }
       }
       return {
         schema: "spacejanitor.reap.v1",
-        executed: true,
+        executed: failed.length === 0 && removed.length > 0,
+        partial: removed.length > 0 && failed.length > 0,
         planSha256,
         removed,
         failed,
@@ -204,15 +271,22 @@ function registerIpcHandlers(): void {
     });
   });
 
-  ipcMain.handle("sj:slm-get-config", () => slmAdvisor.getConfig());
-  ipcMain.handle("sj:slm-update-config", (_event, config) => slmAdvisor.updateConfig(config || {}));
-  ipcMain.handle("sj:slm-explain", (_event, payload) =>
-    slmAdvisor.explainPlan({
+  ipcMain.handle("sj:slm-get-config", (event) => {
+    assertAuthorizedSender(event);
+    return slmAdvisor.getConfig();
+  });
+  ipcMain.handle("sj:slm-update-config", (event, config) => {
+    assertAuthorizedSender(event);
+    return slmAdvisor.updateConfig(config || {});
+  });
+  ipcMain.handle("sj:slm-explain", (event, payload) => {
+    assertAuthorizedSender(event);
+    return slmAdvisor.explainPlan({
       summary: payload?.summary || {},
       candidates: Array.isArray(payload?.candidates) ? payload.candidates : [],
       memoryReport: payload?.memoryReport,
-    })
-  );
+    });
+  });
 }
 
 app.whenReady().then(() => {

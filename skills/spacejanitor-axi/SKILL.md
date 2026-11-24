@@ -35,11 +35,16 @@ npx spacejanitor-axi remediate [--json]   # dry-run SHA-256 plan preview only (z
 ## Exit Codes
 
 - `0`: Healthy (`OK`/`CHECK`) or dry-run completed cleanly.
-- `1`: Operational/runtime error or missing/invalid remediation confirmation flags.
+- `1`: Operational/runtime error, missing/invalid remediation confirmation flags, or `--execute` in read-only Node AXI CLI (`not_implemented`).
 - `2`: Threshold breach (`ALERT`/`CRITICAL`) when `--fail-on-alert` is passed.
+
+## Engine Notes (`sj-core` vs `node-fallback`)
+
+- When the Rust `sj` binary is present, `doctor`, `disk` (`spacejanitor.storage.v1`), `trash` (`spacejanitor.trash.v1`), and `orphans` (`spacejanitor.orphans.v1`) are backed by `sj-core` and normalized to the shared v1 contract.
+- When `sj` is absent, `@spacejanitor/core` provides `node-fallback` telemetry (`spacejanitor.disk.v1`, `memory.v1`, `blockers.v1`, `mcp_audit.v1`, `orphans.v1`, `trash.v1`, `summary.v1`).
 
 ## Safety Rules for Agents
 
-- **Never pass `--execute` automatically.** Only run read-only diagnostics or dry-run previews (`remediate` without `--execute`) unless the human operator explicitly provides `--plan-sha256` and `--confirm`.
+- **Never pass `--execute` automatically.** `spacejanitor-axi remediate` is a dry-run SHA-256 planner only (`--execute` fails closed in Node fallback with `executed: false` and exit `1`).
 - **Respect protected paths and git proofs.** Never suggest deleting dirty or unpushed git repositories or credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`).
 - **Zero raw secrets.** All process arguments and MCP configs are redacted before output.

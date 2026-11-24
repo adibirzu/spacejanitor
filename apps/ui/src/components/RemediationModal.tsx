@@ -43,9 +43,12 @@ export const RemediationModal: React.FC<Props> = ({ plan, onClose, onExecute, re
             <strong>{plan.items.length}</strong> target(s).
           </p>
           <div className="badge-row">
-            <span className="badge badge-ok">Protected Denylist Pass</span>
-            {plan.blockedItems.length > 0 && (
-              <span className="badge badge-warn">{plan.blockedItems.length} Protected Item(s) Blocked</span>
+            {plan.blockedItems.length === 0 ? (
+              <span className="badge badge-ok">Gate Verified: 0 Protected Targets</span>
+            ) : (
+              <span className="badge badge-warn">
+                Gate Filtered: {plan.blockedItems.length} Protected Item(s) Blocked
+              </span>
             )}
           </div>
           <div className="digest-box">

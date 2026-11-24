@@ -10,6 +10,7 @@ export interface RemediationCandidate {
 
 export interface RemediationPlan {
   schema: string;
+  planId: string;
   dryRun: boolean;
   items: RemediationCandidate[];
   blockedItems: Array<{ id: string; path: string; bytes: number; reason: string }>;
@@ -23,6 +24,8 @@ export interface RemediationPlan {
 export class RemediationGate {
   private readonly homeDir?: string;
   private activePlan: RemediationPlan | null = null;
+  private readonly approvedPaths = new Set<string>();
+  private hasRegisteredCandidates = false;
   private readonly usedDigests = new Set<string>();
   private executing = false;
 
@@ -30,7 +33,24 @@ export class RemediationGate {
     this.homeDir = options.homeDir;
   }
 
+  registerApprovedCandidates(candidates: RemediationCandidate[]): void {
+    this.approvedPaths.clear();
+    this.hasRegisteredCandidates = true;
+    for (const c of candidates) {
+      if (c && typeof c.path === "string" && c.path.trim()) {
+        this.approvedPaths.add(c.path);
+      }
+    }
+  }
+
   createDryRunPlan(candidates: RemediationCandidate[], nowMs = Date.now()): RemediationPlan {
+    if (this.hasRegisteredCandidates) {
+      for (const cand of candidates) {
+        if (!cand || !this.approvedPaths.has(cand.path)) {
+          throw new Error(`unapproved_candidate: ${cand?.path || "unknown"}`);
+        }
+      }
+    }
     const plan: RemediationPlan = core.createRemediationPlan(candidates, {
       homeDir: this.homeDir,
       nowMs,

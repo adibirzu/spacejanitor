@@ -105,22 +105,34 @@ export async function adviseWithLocalSlm({
   }
 
   const safePayload = redactSlmPayload({ summary, candidates }, redactFn);
-  const res = await fetchImpl(urlCheck.url, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({
-      model,
-      temperature: 0.1,
-      messages: [
-        {
-          role: "system",
-          content:
-            "You are SpaceJanitor's read-only local cleanup advisor. Respond with concise JSON: { explanation: string, proposals: [{ target, category, safety_tier, rationale }] }. Never suggest deleting protected credential or system paths.",
-        },
-        { role: "user", content: JSON.stringify(safePayload) },
-      ],
-    }),
-  });
+  let res;
+  try {
+    res = await fetchImpl(urlCheck.url, {
+      method: "POST",
+      redirect: "error",
+      signal: AbortSignal.timeout(15000),
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        model,
+        temperature: 0.1,
+        messages: [
+          {
+            role: "system",
+            content:
+              "You are SpaceJanitor's read-only local cleanup advisor. Respond with concise JSON: { explanation: string, proposals: [{ target, category, safety_tier, rationale }] }. Never suggest deleting protected credential or system paths.",
+          },
+          { role: "user", content: JSON.stringify(safePayload) },
+        ],
+      }),
+    });
+  } catch (err) {
+    return {
+      schema: "spacejanitor.proposal.v1",
+      ok: false,
+      reason: err instanceof Error ? err.message : "slm_fetch_failed",
+      proposals: [],
+    };
+  }
 
   if (!res.ok) {
     return {

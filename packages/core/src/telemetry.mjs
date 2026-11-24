@@ -174,43 +174,84 @@ export async function collectTrash({ homeDir = os.homedir() } = {}) {
   };
 }
 
-async function safeExec(cmd, args, cwd) {
+async function safeExecResult(cmd, args, cwd) {
   try {
     const { stdout } = await execFileAsync(cmd, args, { cwd, timeout: 3000, maxBuffer: 1024 * 1024 });
-    return stdout.trim();
+    return { ok: true, stdout: stdout.trim() };
   } catch {
-    return "";
+    return { ok: false, stdout: "" };
   }
+}
+
+async function safeExec(cmd, args, cwd) {
+  const res = await safeExecResult(cmd, args, cwd);
+  return res.stdout;
 }
 
 export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14 } = {}) {
   const resolved = path.resolve(targetPath);
   const candidates = [];
 
-  const insideGit = await safeExec("git", ["rev-parse", "--is-inside-work-tree"], resolved);
-  if (insideGit === "true") {
-    const wtOut = await safeExec("git", ["worktree", "list", "--porcelain"], resolved);
-    const lines = wtOut.split(/\r?\n/);
-    for (const line of lines) {
-      if (!line.startsWith("worktree ")) continue;
-      const wtPath = line.slice("worktree ".length).trim();
-      if (!wtPath || wtPath === resolved) continue;
-      const dirty = await safeExec("git", ["status", "--porcelain"], wtPath);
-      const remotes = await safeExec("git", ["remote"], wtPath);
-      const unpushed = await safeExec("git", ["rev-list", "--branches", "--not", "--remotes", "--count"], wtPath);
-      const isClean = dirty.length === 0;
-      const hasRemote = remotes.length > 0;
-      const hasUnpushed = Number(unpushed || "0") > 0;
-      candidates.push({
-        id: `wt-${path.basename(wtPath)}`,
-        path: wtPath,
-        kind: "git-worktree",
-        clean: isClean,
-        hasRemote,
-        hasUnpushed,
-        safeToPrune: isClean && hasRemote && !hasUnpushed,
-        maxAgeDays,
-      });
+  const insideGit = await safeExecResult("git", ["rev-parse", "--is-inside-work-tree"], resolved);
+  if (insideGit.ok && insideGit.stdout === "true") {
+    const wtOut = await safeExecResult("git", ["worktree", "list", "--porcelain"], resolved);
+    if (wtOut.ok) {
+      const lines = wtOut.stdout.split(/\r?\n/);
+      for (const line of lines) {
+        if (!line.startsWith("worktree ")) continue;
+        const wtPath = line.slice("worktree ".length).trim();
+        if (!wtPath || wtPath === resolved) continue;
+
+        const dirtyRes = await safeExecResult("git", ["status", "--porcelain"], wtPath);
+        const remotesRes = await safeExecResult("git", ["remote"], wtPath);
+        const branchesUnpushedRes = await safeExecResult(
+          "git",
+          ["rev-list", "--branches", "--not", "--remotes", "--count"],
+          wtPath
+        );
+        const headUnpushedRes = await safeExecResult(
+          "git",
+          ["rev-list", "HEAD", "--not", "--remotes", "--count"],
+          wtPath
+        );
+
+        const allOk =
+          dirtyRes.ok && remotesRes.ok && branchesUnpushedRes.ok && headUnpushedRes.ok;
+        if (!allOk) {
+          candidates.push({
+            id: `wt-${path.basename(wtPath)}`,
+            path: wtPath,
+            kind: "git-worktree",
+            clean: false,
+            hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false,
+            hasUnpushed: true,
+            proofStatus: "unverified",
+            safeToPrune: false,
+            maxAgeDays,
+          });
+          continue;
+        }
+
+        const isClean = dirtyRes.stdout.length === 0;
+        const hasRemote = remotesRes.stdout.length > 0;
+        const branchCount = Number(branchesUnpushedRes.stdout);
+        const headCount = Number(headUnpushedRes.stdout);
+        const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
+        const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0;
+        const proofStatus = countsValid ? "verified" : "unverified";
+
+        candidates.push({
+          id: `wt-${path.basename(wtPath)}`,
+          path: wtPath,
+          kind: "git-worktree",
+          clean: isClean,
+          hasRemote,
+          hasUnpushed,
+          proofStatus,
+          safeToPrune: isClean && hasRemote && !hasUnpushed && proofStatus === "verified",
+          maxAgeDays,
+        });
+      }
     }
   }
 
@@ -224,20 +265,56 @@ export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 
   };
 }
 
+export function parseMacOsVmStat(vmStatOutput, swapOutput = "", totalBytes = os.totalmem()) {
+  const pageMatch = vmStatOutput.match(/page size of (\d+) bytes/i);
+  const pageSize = pageMatch ? Number(pageMatch[1]) : 16384;
+  const readPages = (label) => {
+    const m = vmStatOutput.match(new RegExp(`${label}:\\s+(\\d+)\\.`, "i"));
+    return m ? Number(m[1]) : 0;
+  };
+  const freePages = readPages("Pages free");
+  const inactivePages = readPages("Pages inactive");
+  const speculativePages = readPages("Pages speculative");
+  const purgeablePages = readPages("Pages purgeable");
+  const availableBytes = (freePages + inactivePages + speculativePages + purgeablePages) * pageSize;
+
+  let swapTotalBytes = 0;
+  let swapUsedBytes = 0;
+  const totalMatch = swapOutput.match(/total\s*=\s*([\d.]+)M/);
+  const usedMatch = swapOutput.match(/used\s*=\s*([\d.]+)M/);
+  if (totalMatch) swapTotalBytes = Math.round(Number(totalMatch[1]) * 1024 * 1024);
+  if (usedMatch) swapUsedBytes = Math.round(Number(usedMatch[1]) * 1024 * 1024);
+
+  const boundedAvail = Math.min(totalBytes, Math.max(0, availableBytes));
+  return { availableBytes: boundedAvail, swapTotalBytes, swapUsedBytes };
+}
+
 export async function collectMemory({ top = 15, redactFn = (s) => s } = {}) {
   const totalBytes = os.totalmem();
-  const freeBytes = os.freemem();
-  const usedBytes = Math.max(0, totalBytes - freeBytes);
+  let freeBytes = os.freemem();
   let swapUsedBytes = 0;
   let swapTotalBytes = 0;
 
   if (os.platform() === "darwin") {
-    const swapOut = await safeExec("sysctl", ["-n", "vm.swapusage"]);
-    const totalMatch = swapOut.match(/total\s*=\s*([\d.]+)M/);
-    const usedMatch = swapOut.match(/used\s*=\s*([\d.]+)M/);
-    if (totalMatch) swapTotalBytes = Math.round(Number(totalMatch[1]) * 1024 * 1024);
-    if (usedMatch) swapUsedBytes = Math.round(Number(usedMatch[1]) * 1024 * 1024);
+    const [vmRes, swapRes] = await Promise.all([
+      safeExecResult("vm_stat", []),
+      safeExecResult("sysctl", ["-n", "vm.swapusage"]),
+    ]);
+    if (vmRes.ok && vmRes.stdout) {
+      const parsed = parseMacOsVmStat(vmRes.stdout, swapRes.stdout, totalBytes);
+      if (parsed.availableBytes > 0) {
+        freeBytes = parsed.availableBytes;
+      }
+      swapTotalBytes = parsed.swapTotalBytes;
+      swapUsedBytes = parsed.swapUsedBytes;
+    } else if (swapRes.ok) {
+      const totalMatch = swapRes.stdout.match(/total\s*=\s*([\d.]+)M/);
+      const usedMatch = swapRes.stdout.match(/used\s*=\s*([\d.]+)M/);
+      if (totalMatch) swapTotalBytes = Math.round(Number(totalMatch[1]) * 1024 * 1024);
+      if (usedMatch) swapUsedBytes = Math.round(Number(usedMatch[1]) * 1024 * 1024);
+    }
   }
+  const usedBytes = Math.max(0, totalBytes - freeBytes);
 
   const processes = [];
   if (os.platform() !== "win32") {
@@ -315,10 +392,98 @@ export async function collectBlockers() {
   };
 }
 
-export async function collectMcpAudit({ configDirs, redactFn = (s) => s } = {}) {
-  const dirs = Array.isArray(configDirs) ? configDirs : [];
+function defaultMcpConfigDirs(homeDir = os.homedir()) {
+  const candidates = [
+    path.join(homeDir, ".cursor"),
+    path.join(homeDir, ".claude"),
+    path.join(homeDir, ".codex"),
+    path.join(homeDir, ".codeium", "windsurf"),
+    path.join(homeDir, ".config", "claude"),
+    path.join(homeDir, ".config", "Code", "User"),
+    path.join(homeDir, "Library", "Application Support", "Claude"),
+    path.join(homeDir, "Library", "Application Support", "Code", "User"),
+  ];
+  if (process.env.APPDATA) {
+    candidates.push(path.join(process.env.APPDATA, "Claude"));
+    candidates.push(path.join(process.env.APPDATA, "Code", "User"));
+  }
+  return [...new Set(candidates)];
+}
+
+function parseTomlMcpServers(tomlText) {
+  const servers = {};
+  let current = null;
+  for (const rawLine of tomlText.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line || line.startsWith("#")) continue;
+    const secMatch = line.match(/^\[(?:mcp_servers|mcpServers)\.([^\]]+)\]$/);
+    if (secMatch) {
+      const name = secMatch[1].replace(/^["']|["']$/g, "");
+      current = servers[name] || { args: [], env: {} };
+      servers[name] = current;
+      continue;
+    }
+    if (line.startsWith("[")) {
+      current = null;
+      continue;
+    }
+    if (!current) continue;
+    const kv = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
+    if (!kv) continue;
+    const [, key, rawVal] = kv;
+    if (key === "command" || key === "url") {
+      current[key] = rawVal.replace(/^["']|["']$/g, "");
+    } else if (key === "args" && rawVal.startsWith("[")) {
+      try {
+        current.args = JSON.parse(rawVal.replace(/'/g, '"'));
+      } catch {
+        current.args = [rawVal];
+      }
+    }
+  }
+  return servers;
+}
+
+export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), redactFn = (s) => s } = {}) {
+  const dirs = Array.isArray(configDirs) ? configDirs : defaultMcpConfigDirs(homeDir);
   const servers = [];
   const seenNames = new Map();
+
+  const recordServer = (name, cfg, sourceFile) => {
+    const count = (seenNames.get(name) || 0) + 1;
+    seenNames.set(name, count);
+    const argsList = Array.isArray(cfg?.args) ? cfg.args.map(String) : [];
+    const headerList =
+      cfg?.headers && typeof cfg.headers === "object"
+        ? Object.entries(cfg.headers).map(([k, v]) => `${k}: ${v}`)
+        : [];
+    const combinedRaw = [cfg?.url ? String(cfg.url) : "", ...argsList, ...headerList]
+      .filter(Boolean)
+      .join(" ");
+    const redactedArgs = redactFn(combinedRaw);
+    const rawCommand = String(cfg?.command || "");
+    const redactedCommand = redactFn(rawCommand);
+    const envEntries = cfg?.env && typeof cfg.env === "object" ? Object.entries(cfg.env) : [];
+    const envHasSecret = envEntries.some(
+      ([k, v]) =>
+        /KEY|TOKEN|SECRET|PASSWORD|AUTH/i.test(k) || redactFn(String(v)) !== String(v)
+    );
+    const hasSecretRisk =
+      redactedArgs !== combinedRaw ||
+      redactedCommand !== rawCommand ||
+      redactedArgs.includes("<REDACTED>") ||
+      redactedCommand.includes("<REDACTED>") ||
+      envHasSecret;
+
+    servers.push({
+      name,
+      command: redactedCommand,
+      argsRedacted: redactedArgs,
+      duplicateCount: count,
+      hasSecretRisk,
+      sourceFile,
+    });
+  };
 
   for (const dir of dirs) {
     if (!dir || !fs.existsSync(dir)) continue;
@@ -329,30 +494,28 @@ export async function collectMcpAudit({ configDirs, redactFn = (s) => s } = {}) 
       continue;
     }
     for (const ent of entries) {
-      if (!ent.isFile() || !ent.name.endsWith(".json")) continue;
-      try {
-        const raw = JSON.parse(fs.readFileSync(path.join(dir, ent.name), "utf8"));
-        const mcpServers = raw?.mcpServers || {};
-        for (const [name, cfg] of Object.entries(mcpServers)) {
-          const count = (seenNames.get(name) || 0) + 1;
-          seenNames.set(name, count);
-          const argsStr = Array.isArray(cfg?.args) ? cfg.args.join(" ") : "";
-          const redactedArgs = redactFn(argsStr);
-          const envKeys = cfg?.env && typeof cfg.env === "object" ? Object.keys(cfg.env) : [];
-          const hasSecretRisk =
-            redactedArgs.includes("<REDACTED>") ||
-            envKeys.some((k) => /KEY|TOKEN|SECRET|PASSWORD/i.test(k));
-          servers.push({
-            name,
-            command: redactFn(String(cfg?.command || "")),
-            argsRedacted: redactedArgs,
-            duplicateCount: count,
-            hasSecretRisk,
-            sourceFile: ent.name,
-          });
+      if (!ent.isFile()) continue;
+      const fullPath = path.join(dir, ent.name);
+      if (ent.name.endsWith(".json")) {
+        try {
+          const raw = JSON.parse(fs.readFileSync(fullPath, "utf8"));
+          const mcpServers = raw?.mcpServers || raw?.servers || {};
+          for (const [name, cfg] of Object.entries(mcpServers)) {
+            recordServer(name, cfg, ent.name);
+          }
+        } catch {
+          // ignore invalid json
         }
-      } catch {
-        // ignore invalid json
+      } else if (ent.name.endsWith(".toml")) {
+        try {
+          const raw = fs.readFileSync(fullPath, "utf8");
+          const mcpServers = parseTomlMcpServers(raw);
+          for (const [name, cfg] of Object.entries(mcpServers)) {
+            recordServer(name, cfg, ent.name);
+          }
+        } catch {
+          // ignore invalid toml
+        }
       }
     }
   }
@@ -368,16 +531,154 @@ export async function collectMcpAudit({ configDirs, redactFn = (s) => s } = {}) 
   };
 }
 
+export async function collectCleanableCaches({ homeDir = os.homedir(), isProtectedFn } = {}) {
+  const knownCaches = [
+    path.join(homeDir, ".cache", "npm"),
+    path.join(homeDir, ".npm", "_cacache"),
+    path.join(homeDir, ".cache", "pip"),
+    path.join(homeDir, ".cache", "yarn"),
+    path.join(homeDir, ".cache", "pnpm"),
+    path.join(homeDir, "Library", "Caches", "Homebrew"),
+    path.join(homeDir, "Library", "Caches", "pip"),
+    path.join(homeDir, "Library", "Caches", "pnpm"),
+    path.join(homeDir, ".cargo", "registry", "cache"),
+    path.join(homeDir, ".gradle", "caches"),
+  ];
+  const candidates = [];
+  for (const cachePath of knownCaches) {
+    if (!fs.existsSync(cachePath)) continue;
+    const prot = isProtectedFn ? isProtectedFn(cachePath, { homeDir }) : { protected: false };
+    if (prot.protected) continue;
+    const bytes = dirSizeBounded(cachePath, 2);
+    candidates.push({
+      id: `cache-${path.basename(path.dirname(cachePath))}-${path.basename(cachePath)}`,
+      path: cachePath,
+      bytes,
+      kind: "dir",
+      category: "cache",
+      protected: false,
+    });
+  }
+  return candidates;
+}
+
+export function normalizeReportEnvelope(raw) {
+  if (!raw || typeof raw !== "object") return raw;
+  const schema = raw.schema;
+  const normStatus = (st) => {
+    const up = String(st || "OK").toUpperCase();
+    if (up === "FLOOR" || up === "STOP") return "CRITICAL";
+    return up;
+  };
+
+  if (schema === SCHEMA_VERSIONS_EXT.doctor) {
+    return {
+      ...raw,
+      platform: raw.platform ?? raw.os ?? os.platform(),
+      node: raw.node ?? (raw.engine === "rust" ? `rust/${raw.version || "0.1.0"}` : process.version),
+      freeMemGiB: raw.freeMemGiB ?? Number((os.freemem() / GIB).toFixed(2)),
+      totalMemGiB: raw.totalMemGiB ?? Number((os.totalmem() / GIB).toFixed(2)),
+      safetyMode: raw.safetyMode ?? "dry-run-default",
+    };
+  }
+
+  if (schema === SCHEMA_VERSIONS_EXT.storage || schema === SCHEMA_VERSIONS_EXT.disk) {
+    const targetPath = raw.targetPath ?? raw.root ?? process.cwd();
+    let freeBytes = raw.freeBytes;
+    let totalBytes = raw.totalBytes;
+    if (typeof freeBytes !== "number" || typeof totalBytes !== "number") {
+      try {
+        const st = fs.statfsSync(targetPath);
+        freeBytes = Number(st.bavail) * Number(st.bsize);
+        totalBytes = Number(st.blocks) * Number(st.bsize);
+      } catch {
+        freeBytes = 0;
+        totalBytes = raw.total_bytes ?? 0;
+      }
+    }
+    const entries = raw.topConsumers ?? raw.entries ?? [];
+    const topConsumers = entries.map((e, idx) => ({
+      id: e.id ?? `entry-${idx}`,
+      path: e.path,
+      bytes: Number(e.bytes || 0),
+      kind: e.kind || "dir",
+      protected: Boolean(e.protected),
+      protectedReason: e.protectedReason || "",
+    }));
+    return {
+      ...raw,
+      status: normStatus(raw.status),
+      targetPath,
+      totalBytes,
+      freeBytes,
+      freeGiB: raw.freeGiB ?? Number((freeBytes / GIB).toFixed(2)),
+      topConsumers,
+    };
+  }
+
+  if (schema === SCHEMA_VERSIONS_EXT.trash) {
+    const rawItems = raw.candidates ?? raw.items ?? [];
+    const candidates = rawItems.map((it, idx) => ({
+      id: it.id ?? `trash-${idx}`,
+      path: it.path,
+      bytes: Number(it.bytes || 0),
+      kind: it.kind || "file",
+      protected: Boolean(it.protected),
+    }));
+    return {
+      ...raw,
+      trashPath: raw.trashPath ?? raw.trash_path ?? "",
+      itemCount: raw.itemCount ?? raw.item_count ?? candidates.length,
+      totalBytes: raw.totalBytes ?? raw.total_bytes ?? 0,
+      candidates,
+    };
+  }
+
+  if (schema === SCHEMA_VERSIONS_EXT.orphans) {
+    if (Array.isArray(raw.candidates)) return raw;
+    const safe = (raw.safe_to_prune || []).map((c, idx) => ({
+      id: `wt-safe-${idx}`,
+      path: c.path,
+      kind: c.is_worktree ? "git-worktree" : "git-repo",
+      clean: true,
+      hasRemote: true,
+      hasUnpushed: false,
+      proofStatus: "verified",
+      safeToPrune: true,
+      bytes: Number(c.bytes || 0),
+    }));
+    const blocked = (raw.blocked || []).map((c, idx) => ({
+      id: `wt-blocked-${idx}`,
+      path: c.path,
+      kind: "git-worktree",
+      clean: false,
+      hasRemote: false,
+      hasUnpushed: true,
+      proofStatus: "unverified",
+      safeToPrune: false,
+      reasons: c.reasons || [],
+    }));
+    return {
+      ...raw,
+      targetPath: raw.targetPath ?? raw.root ?? process.cwd(),
+      candidates: [...safe, ...blocked],
+    };
+  }
+
+  return raw;
+}
+
 const STATUS_RANK = { OK: 0, CHECK: 1, WARN: 2, ALERT: 2, CRITICAL: 3 };
 
 export async function collectSummary(options = {}) {
-  const [disk, memory, blockers, orphans, trash, mcpAudit] = await Promise.all([
+  const [disk, memory, blockers, orphans, trash, mcpAudit, cleanableCaches] = await Promise.all([
     collectDisk(options),
     collectMemory(options),
     collectBlockers(options),
     collectOrphans(options),
     collectTrash(options),
     collectMcpAudit(options),
+    collectCleanableCaches(options),
   ]);
 
   const statuses = [disk.status, memory.status, blockers.status];
@@ -396,6 +697,7 @@ export async function collectSummary(options = {}) {
     orphans,
     trash,
     mcpAudit,
+    cleanableCaches,
     timestamp: new Date().toISOString(),
   };
 }

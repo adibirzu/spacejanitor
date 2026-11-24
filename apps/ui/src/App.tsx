@@ -74,12 +74,22 @@ export const App: React.FC = () => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  const allCandidates: DiskConsumer[] = [
-    ...(summary?.disk.topConsumers || []),
+  const cleanableCandidates: DiskConsumer[] = [
+    ...(summary?.cleanableCaches || []),
     ...(summary?.trash.candidates || []),
+    ...(summary?.orphans.candidates || [])
+      .filter((o) => o.safeToPrune)
+      .map((o) => ({
+        id: o.id,
+        path: o.path,
+        bytes: 0,
+        kind: "git-worktree" as const,
+        protected: false,
+      })),
   ];
+  const readOnlyConsumers: DiskConsumer[] = summary?.disk.topConsumers || [];
 
-  const selectedCandidates = allCandidates.filter((c) => selectedIds.has(c.id));
+  const selectedCandidates = cleanableCandidates.filter((c) => selectedIds.has(c.id));
 
   const toggleCandidate = (id: string) => {
     setSelectedIds((prev) => {
@@ -116,8 +126,26 @@ export const App: React.FC = () => {
       setExecResult("Browser preview mode: execution disabled.");
       return;
     }
-    const res = await window.spaceJanitor.executeRemediation({ planSha256, phrase });
-    setExecResult(res.executed ? "Cleanup completed safely." : `Blocked: ${String(res.error || "failed")}`);
+    const res = (await window.spaceJanitor.executeRemediation({ planSha256, phrase })) as {
+      executed?: boolean;
+      partial?: boolean;
+      error?: string;
+      removed?: string[];
+      failed?: Array<{ path: string; error: string }>;
+    };
+    const removedCount = Array.isArray(res.removed) ? res.removed.length : 0;
+    const failedList = Array.isArray(res.failed) ? res.failed : [];
+    if (res.executed) {
+      setExecResult(`Moved ${removedCount} item(s) to OS Trash / pruned safely.`);
+    } else if (res.partial) {
+      setExecResult(
+        `Partial cleanup: ${removedCount} succeeded, ${failedList.length} failed (${failedList.map((f) => `${f.path}: ${f.error}`).join("; ")}).`
+      );
+    } else if (failedList.length > 0) {
+      setExecResult(`Failed: ${failedList.map((f) => `${f.path}: ${f.error}`).join("; ")}`);
+    } else {
+      setExecResult(`Blocked: ${String(res.error || "failed")}`);
+    }
     await refresh();
   };
 
@@ -232,7 +260,7 @@ export const App: React.FC = () => {
             <SlmAdvisorDrawer
               config={slmConfig}
               summary={summary}
-              candidates={allCandidates.slice(0, 8)}
+              candidates={cleanableCandidates.slice(0, 8)}
               onUpdateConfig={async (next) => {
                 if (window.spaceJanitor) {
                   const updated = await window.spaceJanitor.updateSlmConfig(next);
@@ -254,52 +282,88 @@ export const App: React.FC = () => {
         )}
 
         {summary && tab === "disk" && (
-          <section className="card">
-            <div className="card-header">
-              <h2>Top Space Consumers &amp; Trash</h2>
-              <button
-                type="button"
-                className="btn-primary"
-                disabled={selectedCandidates.length === 0}
-                onClick={() => void handleOpenDryRun()}
-              >
-                Dry-Run Plan ({selectedCandidates.length})
-              </button>
-            </div>
-            <table className="data-table">
-              <thead>
-                <tr>
-                  <th>Select</th>
-                  <th>Path</th>
-                  <th>Size</th>
-                  <th>Protection</th>
-                </tr>
-              </thead>
-              <tbody>
-                {allCandidates.map((c) => (
-                  <tr key={c.id}>
-                    <td>
-                      <input
-                        type="checkbox"
-                        disabled={Boolean(c.protected)}
-                        checked={selectedIds.has(c.id)}
-                        onChange={() => toggleCandidate(c.id)}
-                      />
-                    </td>
-                    <td className="mono">{c.path}</td>
-                    <td>{formatBytes(c.bytes)}</td>
-                    <td>
-                      {c.protected ? (
-                        <span className="badge badge-warn">LOCKED ({c.protectedReason})</span>
-                      ) : (
-                        <span className="badge badge-ok">Candidate</span>
-                      )}
-                    </td>
+          <>
+            <section className="card">
+              <div className="card-header">
+                <h2>Safe Remediation Candidates (Caches, Trash &amp; Verified Orphans)</h2>
+                <button
+                  type="button"
+                  className="btn-primary"
+                  disabled={selectedCandidates.length === 0}
+                  onClick={() => void handleOpenDryRun()}
+                >
+                  Dry-Run Plan ({selectedCandidates.length})
+                </button>
+              </div>
+              {cleanableCandidates.length === 0 ? (
+                <p className="muted">No allowlisted cleanable caches, trash items, or verified orphan worktrees found.</p>
+              ) : (
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Select</th>
+                      <th>Path</th>
+                      <th>Size</th>
+                      <th>Protection</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {cleanableCandidates.map((c) => (
+                      <tr key={c.id}>
+                        <td>
+                          <input
+                            type="checkbox"
+                            disabled={Boolean(c.protected)}
+                            checked={selectedIds.has(c.id)}
+                            onChange={() => toggleCandidate(c.id)}
+                          />
+                        </td>
+                        <td className="mono">{c.path}</td>
+                        <td>{formatBytes(c.bytes)}</td>
+                        <td>
+                          {c.protected ? (
+                            <span className="badge badge-warn">LOCKED ({c.protectedReason})</span>
+                          ) : (
+                            <span className="badge badge-ok">Cleanable Candidate</span>
+                          )}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              )}
+            </section>
+
+            <section className="card">
+              <div className="card-header">
+                <h2>Top Space Consumers (Read-Only Audit)</h2>
+              </div>
+              <table className="data-table">
+                <thead>
+                  <tr>
+                    <th>Path</th>
+                    <th>Size</th>
+                    <th>Status</th>
                   </tr>
-                ))}
-              </tbody>
-            </table>
-          </section>
+                </thead>
+                <tbody>
+                  {readOnlyConsumers.map((c) => (
+                    <tr key={c.id}>
+                      <td className="mono">{c.path}</td>
+                      <td>{formatBytes(c.bytes)}</td>
+                      <td>
+                        {c.protected ? (
+                          <span className="badge badge-warn">PROTECTED ({c.protectedReason})</span>
+                        ) : (
+                          <span className="badge badge-ok">Read-Only</span>
+                        )}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </section>
+          </>
         )}
 
         {summary && tab === "memory" && (
