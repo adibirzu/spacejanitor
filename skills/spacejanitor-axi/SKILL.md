@@ -18,18 +18,28 @@ Read-only workstation diagnostics and dry-run remediation planner for macOS, Lin
 
 ## Commands
 
+Default output is compact **TOON** (token-efficient line format). Pass `--json` for versioned `spacejanitor.*.v1` JSON envelopes.
+
 ```sh
-spacejanitor doctor --json     # verify platform, Node runtime, and schema versions
-spacejanitor disk --json       # storage capacity, snapshots, and Tier 1/2 dry-run plan
-spacejanitor memory --json     # true footprint (RSS + compressed/swap) by owner group
-spacejanitor blockers --json   # kernel vnodes / inotify / handles / VFS locks / orphans
-spacejanitor orphans --json    # git worktrees (clean + pushed proof) & stale build trees
-spacejanitor trash --json      # OS Trash / Recycle Bin audit
-spacejanitor mcp-audit --json  # MCP process multiplication & duplicate stdio check
-spacejanitor remediate         # dry-run preview only (zero deletions or kills)
+npx spacejanitor-axi summary [--json]     # aggregated health across disk, memory, blockers, orphans, mcp
+npx spacejanitor-axi doctor [--json]      # verify platform, Node runtime, and schema versions
+npx spacejanitor-axi disk [--json]        # storage capacity, thresholds, and top consumers
+npx spacejanitor-axi memory [--json]      # true footprint (RSS + compressed/swap) by process
+npx spacejanitor-axi blockers [--json]    # kernel vnodes / inotify / handles / VFS lock blockers
+npx spacejanitor-axi mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
+npx spacejanitor-axi orphans [--json]     # git worktrees (clean + pushed proof) & stale build trees
+npx spacejanitor-axi trash [--json]       # OS Trash / Recycle Bin audit
+npx spacejanitor-axi remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
 ```
+
+## Exit Codes
+
+- `0`: Healthy (`OK`/`CHECK`) or dry-run completed cleanly.
+- `1`: Operational/runtime error or missing/invalid remediation confirmation flags.
+- `2`: Threshold breach (`ALERT`/`CRITICAL`) when `--fail-on-alert` is passed.
 
 ## Safety Rules for Agents
 
-- **Never pass `--execute` automatically.** Only run read-only diagnostics or dry-run previews (`remediate` without `--execute`) unless the human operator explicitly approves specific item IDs.
-- **Respect protected paths and git proofs.** Never suggest deleting dirty or unpushed git repositories or credential directories.
+- **Never pass `--execute` automatically.** Only run read-only diagnostics or dry-run previews (`remediate` without `--execute`) unless the human operator explicitly provides `--plan-sha256` and `--confirm`.
+- **Respect protected paths and git proofs.** Never suggest deleting dirty or unpushed git repositories or credential directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`).
+- **Zero raw secrets.** All process arguments and MCP configs are redacted before output.

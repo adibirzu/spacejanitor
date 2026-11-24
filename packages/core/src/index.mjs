@@ -1,13 +1,28 @@
 import os from "node:os";
 import path from "node:path";
+import {
+  SCHEMA_VERSIONS_EXT,
+  collectDoctor,
+  collectDisk as _collectDisk,
+  collectTrash,
+  collectOrphans,
+  collectMemory as _collectMemory,
+  collectBlockers,
+  collectMcpAudit as _collectMcpAudit,
+  collectSummary as _collectSummary,
+} from "./telemetry.mjs";
+import {
+  createRemediationPlan as _createRemediationPlan,
+  verifyRemediationGate as _verifyRemediationGate,
+} from "./remediation.mjs";
+import {
+  validateLoopbackSlmUrl,
+  redactSlmPayload as _redactSlmPayload,
+  adviseWithLocalSlm as _adviseWithLocalSlm,
+} from "./slm.mjs";
+import { formatToon } from "./toon.mjs";
 
-export const SCHEMA_VERSIONS = Object.freeze({
-  storage: "spacejanitor.storage.v1",
-  memory: "spacejanitor.memory.v1",
-  blockers: "spacejanitor.blockers.v1",
-  orphans: "spacejanitor.orphans.v1",
-  mcpAudit: "spacejanitor.mcp_audit.v1",
-});
+export const SCHEMA_VERSIONS = SCHEMA_VERSIONS_EXT;
 
 export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
   exactRoots: Object.freeze(["/", "/System", "/Windows", "C:\\Windows"]),
@@ -142,4 +157,38 @@ export function redactSecrets(input) {
     .replace(SECRET_MATCHERS.flagRe, "$1=<REDACTED>")
     .replace(SECRET_MATCHERS.bearerRe, "$1 <REDACTED>")
     .replace(SECRET_MATCHERS.vendorRe, "<REDACTED>");
+}
+
+export { collectDoctor, collectTrash, collectOrphans, collectBlockers, validateLoopbackSlmUrl, formatToon };
+
+export function collectDisk(options = {}) {
+  return _collectDisk({ ...options, isProtectedFn: isProtectedPath });
+}
+
+export function collectMemory(options = {}) {
+  return _collectMemory({ ...options, redactFn: redactSecrets });
+}
+
+export function collectMcpAudit(options = {}) {
+  return _collectMcpAudit({ ...options, redactFn: redactSecrets });
+}
+
+export function collectSummary(options = {}) {
+  return _collectSummary({ ...options, isProtectedFn: isProtectedPath, redactFn: redactSecrets });
+}
+
+export function createRemediationPlan(candidates = [], options = {}) {
+  return _createRemediationPlan(candidates, { ...options, isProtectedFn: isProtectedPath });
+}
+
+export function verifyRemediationGate(options = {}) {
+  return _verifyRemediationGate({ ...options, isProtectedFn: isProtectedPath });
+}
+
+export function redactSlmPayload(value) {
+  return _redactSlmPayload(value, redactSecrets);
+}
+
+export function adviseWithLocalSlm(options = {}) {
+  return _adviseWithLocalSlm({ ...options, redactFn: redactSecrets, isProtectedFn: isProtectedPath });
 }
