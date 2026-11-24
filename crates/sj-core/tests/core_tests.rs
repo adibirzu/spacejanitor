@@ -1682,3 +1682,516 @@ fn zero_stage_residue_on_happy_path_execution() {
         );
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn post_stage_unlink_failure_restores_when_unmodified_and_preserves_quarantine_path_on_partial() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let id_out = Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&id_out.stdout).trim() == "0" {
+        return;
+    }
+
+    struct ChmodGuard(Vec<(PathBuf, u32)>);
+    impl Drop for ChmodGuard {
+        fn drop(&mut self) {
+            for (p, mode) in self.0.iter().rev() {
+                let _ = fs::set_permissions(p, fs::Permissions::from_mode(*mode));
+            }
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    fs::create_dir_all(&trash_dir).unwrap();
+    let mut guard = ChmodGuard(Vec::new());
+
+    // Case 1: no unlinks yet -> clean restore to original path
+    let ro_no_unlink = trash_dir.join("ro_no_unlink");
+    let ro_sub = ro_no_unlink.join("ro_sub");
+    fs::create_dir_all(&ro_sub).unwrap();
+    let leaf = ro_sub.join("leaf.txt");
+    fs::write(&leaf, b"cannot unlink me").unwrap();
+
+    // Case 2: partial unlink -> quarantine preserved + exact path reported
+    let ro_partial = trash_dir.join("ro_partial");
+    let ro_parent = ro_partial.join("ro_parent");
+    let writable_child = ro_parent.join("writable_child");
+    fs::create_dir_all(&writable_child).unwrap();
+    let inner_file = writable_child.join("inner.txt");
+    fs::write(&inner_file, b"unlinked first").unwrap();
+
+    fs::set_permissions(&ro_sub, fs::Permissions::from_mode(0o555)).unwrap();
+    guard.0.push((ro_sub.clone(), 0o755));
+    fs::set_permissions(&ro_parent, fs::Permissions::from_mode(0o555)).unwrap();
+    guard.0.push((ro_parent.clone(), 0o755));
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        root,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: false,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 2);
+
+    let no_unlink_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("ro_no_unlink"))
+        .unwrap();
+    let res1 = execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: no_unlink_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    );
+    assert!(
+        res1.is_err(),
+        "execute must fail when ro_sub prevents unlinkat"
+    );
+    assert!(
+        leaf.exists(),
+        "when zero entries were unlinked, target must be cleanly restored to original path"
+    );
+    let stage_leftovers_after_case1: Vec<_> = fs::read_dir(&trash_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+        .collect();
+    assert!(
+        stage_leftovers_after_case1.is_empty(),
+        "clean rollback must leave zero .sj-stage-* residue: {stage_leftovers_after_case1:?}"
+    );
+
+    let partial_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("ro_partial"))
+        .unwrap();
+    let res2 = execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: partial_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    );
+    let err_msg = match res2 {
+        Err(sj_core::SjError::ExecutionGate(msg)) => msg,
+        other => panic!("expected ExecutionGate error on partial unlink failure, got: {other:?}"),
+    };
+    assert!(
+        err_msg.contains("partial deletion aborted"),
+        "expected partial deletion aborted message: {err_msg}"
+    );
+    assert!(
+        err_msg.contains(".sj-stage-") && err_msg.contains("/target"),
+        "error must report quarantine target path: {err_msg}"
+    );
+
+    let stage_dirs: Vec<PathBuf> = fs::read_dir(&trash_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(".sj-stage-"))
+        })
+        .collect();
+    assert_eq!(
+        stage_dirs.len(),
+        1,
+        "expected exactly one preserved .sj-stage-* dir in Trash: {stage_dirs:?}"
+    );
+    let quarantined_target = stage_dirs[0].join("target");
+    guard.0.push((quarantined_target.join("ro_parent"), 0o755));
+    assert!(
+        err_msg.contains(&quarantined_target.display().to_string()),
+        "error message '{err_msg}' must contain exact quarantined path '{}'",
+        quarantined_target.display()
+    );
+    assert!(
+        !ro_partial.exists(),
+        "partial tree must NOT be restored over original path"
+    );
+    assert!(
+        quarantined_target
+            .join("ro_parent")
+            .join("writable_child")
+            .exists(),
+        "remaining target must be preserved safely in quarantine"
+    );
+}
+
+#[test]
+fn quarantine_stage_namespace_excluded_from_discovery_planning_and_execution() {
+    use sj_core::plan::{compute_plan_sha256, PlanItem, RemediationPlan, TargetSnapshot};
+    use sj_core::SCHEMA_PROPOSAL_V1;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let workspace_dir = root.join("workspaces");
+    let remotes_dir = root.join("remotes");
+    fs::create_dir_all(&trash_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&remotes_dir).unwrap();
+
+    let trash_stage = trash_dir.join(".sj-stage-999-deadbeef01234567");
+    let trash_target = trash_stage.join("target");
+    fs::create_dir_all(&trash_target).unwrap();
+    fs::write(trash_target.join("leftover.txt"), b"recover me").unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    let orphan_stage = workspace_dir.join(".sj-stage-999-cafebabe01234567");
+    fs::create_dir_all(&orphan_stage).unwrap();
+    run_git(
+        &orphan_stage,
+        &["clone", bare_remote.to_str().unwrap(), "target"],
+    );
+    let orphan_target = orphan_stage.join("target");
+    fs::write(orphan_target.join("README.md"), "quarantined repo\n").unwrap();
+    run_git(&orphan_target, &["add", "README.md"]);
+    run_git(&orphan_target, &["commit", "-m", "init"]);
+    run_git(&orphan_target, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+
+    for p in [
+        trash_stage.clone(),
+        trash_target.clone(),
+        workspace_dir.join(".SJ-STAGE-999-UPPERCASE"),
+    ] {
+        let v = check_path_protection(&p, &ctx);
+        assert!(v.protected, "expected {} to be protected", p.display());
+        assert!(
+            v.reason.starts_with("quarantine_stage_recovery_required:"),
+            "unexpected protection reason for {}: {}",
+            p.display(),
+            v.reason
+        );
+    }
+
+    let trash_report = discover_trash_at(&trash_dir, &ctx).unwrap();
+    assert!(
+        trash_report.items.is_empty(),
+        "quarantine stage must not appear in trash_report.items: {:?}",
+        trash_report.items
+    );
+    assert_eq!(trash_report.reclaimable_bytes, 0);
+    assert!(
+        trash_report.protected_items.iter().any(|i| {
+            i.path.ends_with(".sj-stage-999-deadbeef01234567")
+                && i.reason.as_deref()
+                    == Some("quarantine_stage_recovery_required:.sj-stage-999-deadbeef01234567")
+        }),
+        "trash_report.protected_items must surface quarantine stage: {:?}",
+        trash_report.protected_items
+    );
+
+    let orphan_report =
+        inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        orphan_report.safe_to_prune.is_empty(),
+        "quarantine stage repo must never be in safe_to_prune: {:?}",
+        orphan_report.safe_to_prune
+    );
+    assert!(
+        orphan_report.blocked.iter().any(|b| {
+            b.path.ends_with(".sj-stage-999-cafebabe01234567")
+                && b.reasons.iter().any(|r| {
+                    r == "quarantine_stage_recovery_required:.sj-stage-999-cafebabe01234567"
+                })
+        }),
+        "orphan_report.blocked must surface quarantine stage: {:?}",
+        orphan_report.blocked
+    );
+
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: true,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    assert!(
+        plan.items.is_empty(),
+        "plan.items must exclude quarantine stage items: {:?}",
+        plan.items
+    );
+    assert!(
+        plan.protected_exclusions.iter().any(|e| {
+            e.path.ends_with(".sj-stage-999-deadbeef01234567")
+                && e.reason.contains("quarantine_stage_recovery_required:")
+        }),
+        "protected_exclusions missing trash quarantine stage: {:?}",
+        plan.protected_exclusions
+    );
+    assert!(
+        plan.protected_exclusions.iter().any(|e| {
+            e.path.ends_with(".sj-stage-999-cafebabe01234567")
+                && e.reason.contains("quarantine_stage_recovery_required:")
+        }),
+        "protected_exclusions missing orphan quarantine stage: {:?}",
+        plan.protected_exclusions
+    );
+
+    // Direct execution refusal via forged plans
+    let dummy_snapshot = TargetSnapshot {
+        entry_type: "dir".to_string(),
+        dev: None,
+        ino: None,
+        size: 0,
+        mtime_secs: None,
+        mtime_nanos: None,
+        content_or_tree_sha256: String::new(),
+        git_head: None,
+        git_tree: None,
+        git_refs_sha256: None,
+    };
+
+    for (id, kind, path) in [
+        (
+            "item_forged_trash",
+            "trash_item",
+            trash_stage.to_string_lossy().into_owned(),
+        ),
+        (
+            "item_forged_orphan",
+            "orphan_worktree",
+            orphan_target.to_string_lossy().into_owned(),
+        ),
+    ] {
+        let items = vec![PlanItem {
+            id: id.to_string(),
+            kind: kind.to_string(),
+            path,
+            bytes: 0,
+            tier: "tier1".to_string(),
+            safety_reasons: vec![],
+            snapshot: dummy_snapshot.clone(),
+        }];
+        let plan_sha256 = compute_plan_sha256(&items).unwrap();
+        let forged = RemediationPlan {
+            schema: SCHEMA_PROPOSAL_V1.to_string(),
+            mode: "dry-run".to_string(),
+            mutated: false,
+            plan_sha256: plan_sha256.clone(),
+            total_reclaimable_bytes: 0,
+            items,
+            protected_exclusions: vec![],
+        };
+        let res = execute_plan_item_with_roots(
+            &forged,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256,
+                item_id: id.to_string(),
+            },
+            &ctx,
+            std::slice::from_ref(&trash_dir),
+        );
+        match res {
+            Err(sj_core::SjError::ProtectedPath(reason)) => {
+                assert!(
+                    reason.contains("quarantine_stage_recovery_required"),
+                    "unexpected ProtectedPath reason for {kind}: {reason}"
+                );
+            }
+            other => panic!("expected ProtectedPath refusal for forged {kind}, got: {other:?}"),
+        }
+    }
+
+    assert!(trash_target.join("leftover.txt").exists());
+    assert!(orphan_target.join("README.md").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn staged_orphan_execution_preserves_relative_git_remote_and_worktree_gitdir() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    // (a) Clean orphan with relative local remote URL (../../remotes/origin.git)
+    let rel_remote_orphan = workspace_dir.join("rel_remote_orphan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "rel_remote_orphan"],
+    );
+    fs::write(rel_remote_orphan.join("README.md"), "relative remote\n").unwrap();
+    run_git(&rel_remote_orphan, &["add", "README.md"]);
+    run_git(&rel_remote_orphan, &["commit", "-m", "init"]);
+    run_git(&rel_remote_orphan, &["push", "-u", "origin", "HEAD"]);
+    run_git(
+        &rel_remote_orphan,
+        &["remote", "set-url", "origin", "../../remotes/origin.git"],
+    );
+
+    // (b) Clean linked git worktree with relative `gitdir:` in `.git` AND relative local remote URL
+    let main_repo = workspace_dir.join("main_repo");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "main_repo"],
+    );
+    run_git(
+        &main_repo,
+        &["remote", "set-url", "origin", "../../remotes/origin.git"],
+    );
+    run_git(
+        &main_repo,
+        &["worktree", "add", "../linked_wt", "-b", "wt-rel-branch"],
+    );
+    let linked_wt = workspace_dir.join("linked_wt");
+    fs::write(linked_wt.join("wt.txt"), "worktree file\n").unwrap();
+    run_git(&linked_wt, &["add", "wt.txt"]);
+    run_git(&linked_wt, &["commit", "-m", "wt commit"]);
+    run_git(&linked_wt, &["push", "-u", "origin", "wt-rel-branch"]);
+    fs::write(
+        linked_wt.join(".git"),
+        "gitdir: ../main_repo/.git/worktrees/linked_wt\n",
+    )
+    .unwrap();
+
+    // (c) Unpushed relative-remote orphan still fails closed with clean rollback
+    let unpushed_rel_orphan = workspace_dir.join("unpushed_rel_orphan");
+    run_git(
+        &workspace_dir,
+        &[
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "unpushed_rel_orphan",
+        ],
+    );
+    run_git(&unpushed_rel_orphan, &["checkout", "-b", "ephemeral"]);
+    fs::write(unpushed_rel_orphan.join("eph.txt"), "ephemeral\n").unwrap();
+    run_git(&unpushed_rel_orphan, &["add", "eph.txt"]);
+    run_git(&unpushed_rel_orphan, &["commit", "-m", "eph"]);
+    run_git(&unpushed_rel_orphan, &["push", "-u", "origin", "ephemeral"]);
+    run_git(
+        &unpushed_rel_orphan,
+        &["remote", "set-url", "origin", "../../remotes/origin.git"],
+    );
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: false,
+            include_orphans: true,
+            trash_path_override: None,
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+
+    // Delete refs/heads/ephemeral on bare remote AFTER planning so local files/refs match snapshot
+    run_git(&bare_remote, &["update-ref", "-d", "refs/heads/ephemeral"]);
+
+    let rel_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("rel_remote_orphan"))
+        .expect("rel_remote_orphan must be planned");
+    execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: rel_item.id.clone(),
+        },
+        &ctx,
+        &[],
+    )
+    .unwrap();
+    assert!(!rel_remote_orphan.exists());
+
+    let wt_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("linked_wt"))
+        .expect("linked_wt must be planned");
+    execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: wt_item.id.clone(),
+        },
+        &ctx,
+        &[],
+    )
+    .unwrap();
+    assert!(!linked_wt.exists());
+    assert!(main_repo.exists());
+
+    let unpushed_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("unpushed_rel_orphan"))
+        .expect("unpushed_rel_orphan must be planned before remote branch delete");
+    let res_unpushed = execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: unpushed_item.id.clone(),
+        },
+        &ctx,
+        &[],
+    );
+    assert!(
+        res_unpushed.is_err(),
+        "unpushed relative-remote orphan must fail closed when remote branch disappeared"
+    );
+    assert!(
+        unpushed_rel_orphan.exists(),
+        "unpushed_rel_orphan must be cleanly rolled back"
+    );
+
+    let stage_leftovers: Vec<_> = fs::read_dir(&workspace_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+        .collect();
+    assert!(
+        stage_leftovers.is_empty(),
+        "expected zero .sj-stage-* residue in workspaces, found: {stage_leftovers:?}"
+    );
+}

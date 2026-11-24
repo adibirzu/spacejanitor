@@ -1,6 +1,11 @@
-use crate::orphans::{capture_git_snapshot_identity, verify_orphan_safe_to_remove};
+use crate::orphans::{
+    capture_git_snapshot_identity_staged, verify_orphan_safe_to_remove,
+    verify_orphan_safe_to_remove_staged,
+};
 use crate::plan::{PlanItem, TargetSnapshot};
-use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
+use crate::protect::{
+    check_path_protection, is_symlink_path, ProtectionContext, QUARANTINE_STAGE_PREFIX,
+};
 use crate::SjError;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -496,7 +501,7 @@ mod unix_impl {
         Ok(())
     }
 
-    pub(super) fn delete_dir_from_manifest(
+    fn verify_dir_against_manifest(
         dir_fd: &OwnedFd,
         dir_path: &Path,
         manifest: &ManifestDir,
@@ -577,6 +582,149 @@ mod unix_impl {
             )?;
             let sub_st = fstat_fd(&sub_fd)?;
             if (sub_st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || (sub_st.st_dev as u64) != root_dev
+                || (sub_st.st_dev as u64) != sub.dev
+                || (sub_st.st_ino as u64) != sub.ino
+            {
+                return Err(SjError::ExecutionGate(
+                    "subdirectory fd identity mismatch during manifest verification".to_string(),
+                ));
+            }
+            verify_dir_against_manifest(&sub_fd, &sub_path, sub, root_dev, ctx, depth + 1)?;
+        }
+
+        for file in &manifest.files {
+            let file_path = dir_path.join(&file.name_str);
+            let prot = check_path_protection(&file_path, ctx);
+            if prot.protected {
+                return Err(SjError::ProtectedPath(format!(
+                    "protected_descendant:{}",
+                    prot.reason
+                )));
+            }
+            let child_st = fstatat_nofollow(dir_fd, &file.name_c)?;
+            if (child_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || (child_st.st_dev as u64) != file.dev
+                || (child_st.st_ino as u64) != file.ino
+                || (child_st.st_size as u64) != file.size
+                || (child_st.st_mtime as i64) != file.mtime_secs
+                || (child_st.st_mtime_nsec as i64) != file.mtime_nsec
+            {
+                return Err(SjError::ExecutionGate(
+                    "file identity drifted from reviewed manifest; aborting deletion".to_string(),
+                ));
+            }
+            let file_fd = openat_nofollow(
+                dir_fd.as_raw_fd(),
+                &file.name_c,
+                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let f_st = fstat_fd(&file_fd)?;
+            if (f_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                || (f_st.st_dev as u64) != file.dev
+                || (f_st.st_ino as u64) != file.ino
+                || (f_st.st_size as u64) != file.size
+                || (f_st.st_mtime as i64) != file.mtime_secs
+                || (f_st.st_mtime_nsec as i64) != file.mtime_nsec
+            {
+                return Err(SjError::ExecutionGate(
+                    "file fd identity mismatch during manifest verification".to_string(),
+                ));
+            }
+            let live_sha = hash_fd_stable(&file_fd, &f_st)?;
+            if live_sha != file.content_sha256 {
+                return Err(SjError::ExecutionGate(
+                    "file content digest drifted from reviewed manifest; aborting deletion"
+                        .to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn unlink_dir_from_manifest(
+        dir_fd: &OwnedFd,
+        dir_path: &Path,
+        manifest: &ManifestDir,
+        root_dev: u64,
+        ctx: &ProtectionContext,
+        depth: usize,
+        any_unlinked: &mut bool,
+    ) -> Result<(), SjError> {
+        use std::collections::HashSet;
+
+        if depth > MAX_DIR_DEPTH {
+            return Err(SjError::ExecutionGate(
+                "directory depth limit exceeded during safe deletion".to_string(),
+            ));
+        }
+        let guard = fd_to_dir(dir_fd)?;
+        let mut live_names: Vec<String> = Vec::new();
+        loop {
+            set_errno(0);
+            let dent = unsafe { libc::readdir(guard.0) };
+            if dent.is_null() {
+                let err = get_errno();
+                if err != 0 {
+                    return Err(SjError::Io(std::io::Error::from_raw_os_error(err)));
+                }
+                break;
+            }
+            let name_c = unsafe { CStr::from_ptr((*dent).d_name.as_ptr()) };
+            let name_str = name_c.to_str().map_err(|_| {
+                SjError::ExecutionGate("non-UTF-8 directory entry name".to_string())
+            })?;
+            if name_str == "." || name_str == ".." {
+                continue;
+            }
+            live_names.push(name_str.to_string());
+        }
+        drop(guard);
+
+        let expected_names: HashSet<&str> = manifest
+            .dirs
+            .iter()
+            .map(|d| d.name_str.as_str())
+            .chain(manifest.files.iter().map(|f| f.name_str.as_str()))
+            .collect();
+        let live_set: HashSet<&str> = live_names.iter().map(String::as_str).collect();
+        if live_names.len() != expected_names.len()
+            || live_set.len() != expected_names.len()
+            || !live_set.iter().all(|n| expected_names.contains(n))
+        {
+            return Err(SjError::ExecutionGate(
+                "directory contents drifted from reviewed manifest; aborting deletion".to_string(),
+            ));
+        }
+
+        for sub in &manifest.dirs {
+            let sub_path = dir_path.join(&sub.name_str);
+            let prot = check_path_protection(&sub_path, ctx);
+            if prot.protected {
+                return Err(SjError::ProtectedPath(format!(
+                    "protected_descendant:{}",
+                    prot.reason
+                )));
+            }
+            let child_st = fstatat_nofollow(dir_fd, &sub.name_c)?;
+            if (child_st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || (child_st.st_dev as u64) != root_dev
+                || (child_st.st_dev as u64) != sub.dev
+                || (child_st.st_ino as u64) != sub.ino
+            {
+                return Err(SjError::ExecutionGate(
+                    "subdirectory identity drifted from reviewed manifest; aborting deletion"
+                        .to_string(),
+                ));
+            }
+            let sub_fd = openat_nofollow(
+                dir_fd.as_raw_fd(),
+                &sub.name_c,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let sub_st = fstat_fd(&sub_fd)?;
+            if (sub_st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                || (sub_st.st_dev as u64) != root_dev
                 || (sub_st.st_dev as u64) != sub.dev
                 || (sub_st.st_ino as u64) != sub.ino
             {
@@ -584,7 +732,15 @@ mod unix_impl {
                     "subdirectory fd identity mismatch during manifest deletion".to_string(),
                 ));
             }
-            delete_dir_from_manifest(&sub_fd, &sub_path, sub, root_dev, ctx, depth + 1)?;
+            unlink_dir_from_manifest(
+                &sub_fd,
+                &sub_path,
+                sub,
+                root_dev,
+                ctx,
+                depth + 1,
+                any_unlinked,
+            )?;
             drop(sub_fd);
 
             let recheck_st = fstatat_nofollow(dir_fd, &sub.name_c)?;
@@ -602,6 +758,7 @@ mod unix_impl {
             if rc != 0 {
                 return Err(last_os_err());
             }
+            *any_unlinked = true;
         }
 
         for file in &manifest.files {
@@ -667,8 +824,53 @@ mod unix_impl {
             if rc != 0 {
                 return Err(last_os_err());
             }
+            *any_unlinked = true;
         }
         Ok(())
+    }
+
+    pub(super) fn delete_dir_from_manifest_tracked(
+        dir_fd: &OwnedFd,
+        dir_path: &Path,
+        manifest: &ManifestDir,
+        root_dev: u64,
+        ctx: &ProtectionContext,
+        depth: usize,
+        any_unlinked: &mut bool,
+    ) -> Result<(), SjError> {
+        if depth == 1 {
+            verify_dir_against_manifest(dir_fd, dir_path, manifest, root_dev, ctx, depth)?;
+        }
+        unlink_dir_from_manifest(
+            dir_fd,
+            dir_path,
+            manifest,
+            root_dev,
+            ctx,
+            depth,
+            any_unlinked,
+        )
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn delete_dir_from_manifest(
+        dir_fd: &OwnedFd,
+        dir_path: &Path,
+        manifest: &ManifestDir,
+        root_dev: u64,
+        ctx: &ProtectionContext,
+        depth: usize,
+    ) -> Result<(), SjError> {
+        let mut any_unlinked = false;
+        delete_dir_from_manifest_tracked(
+            dir_fd,
+            dir_path,
+            manifest,
+            root_dev,
+            ctx,
+            depth,
+            &mut any_unlinked,
+        )
     }
 
     pub(super) fn capture_snapshot_unix(
@@ -756,7 +958,8 @@ mod unix_impl {
             let tree_hash = hash_dir_tree_records(&state.records);
             let (ms, mn) = stat_mtime(&st);
             let (git_head, git_tree, git_refs_sha256) = if is_orphan {
-                let (h, t, r) = capture_git_snapshot_identity(&canon_target)?;
+                let (h, t, r) =
+                    capture_git_snapshot_identity_staged(&canon_target, &canon_target, ctx)?;
                 (Some(h), Some(t), Some(r))
             } else {
                 (None, None, None)
@@ -808,7 +1011,7 @@ mod unix_impl {
             hasher.update(nanos.to_le_bytes());
             hasher.update(urandom_buf);
             let hex = sha256_to_hex(hasher.finalize());
-            let stage_name = format!(".sj-stage-{pid}-{}", &hex[..16]);
+            let stage_name = format!("{QUARANTINE_STAGE_PREFIX}{pid}-{}", &hex[..16]);
             let stage_c = to_cstring(&stage_name)?;
 
             let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), stage_c.as_ptr(), 0o700) };
@@ -949,8 +1152,10 @@ mod unix_impl {
     pub(super) fn restore_staged_or_preserve(
         parent_fd: &OwnedFd,
         leaf_c: &CStr,
+        canon_target: &Path,
         stage_fd: &OwnedFd,
         stage_name_c: &CStr,
+        stage_dir_path: &Path,
     ) -> Result<(), String> {
         let target_c = c"target";
         match renameat_no_replace(stage_fd, target_c, parent_fd, leaf_c) {
@@ -965,13 +1170,17 @@ mod unix_impl {
                 if rc != 0 {
                     let err = std::io::Error::last_os_error();
                     return Err(format!(
-                        "restored target but failed to remove empty staging directory: {err}"
+                        "restored target to {} but failed to remove empty staging directory {}: {err}",
+                        canon_target.display(),
+                        stage_dir_path.display()
                     ));
                 }
                 Ok(())
             }
             Err(e) => Err(format!(
-                "staged target preserved in quarantine without overwrite: {e}"
+                "could not restore {} without overwrite ({e}); staged target preserved in quarantine at {} for manual recovery",
+                canon_target.display(),
+                stage_dir_path.join("target").display()
             )),
         }
     }
@@ -1105,8 +1314,9 @@ mod unix_impl {
                 ));
             }
 
-            let (stage_fd, stage_name_c, _stage_name_str) =
+            let (stage_fd, stage_name_c, stage_name_str) =
                 create_private_stage_dir(&parent_fd, st_parent.st_dev as u64)?;
+            let stage_dir_path = canon_parent.join(&stage_name_str);
             if let Err(e) = renameat_no_replace(&parent_fd, &leaf_c, &stage_fd, target_c) {
                 drop(stage_fd);
                 let _ = unsafe {
@@ -1169,8 +1379,10 @@ mod unix_impl {
                 return match restore_staged_or_preserve(
                     &parent_fd,
                     &leaf_c,
+                    &canon_target,
                     &stage_fd,
                     &stage_name_c,
+                    &stage_dir_path,
                 ) {
                     Ok(()) => Err(err),
                     Err(rollback_note) => {
@@ -1181,7 +1393,20 @@ mod unix_impl {
 
             let rc = unsafe { libc::unlinkat(stage_fd.as_raw_fd(), target_c.as_ptr(), 0) };
             if rc != 0 {
-                return Err(last_os_err());
+                let err = last_os_err();
+                return match restore_staged_or_preserve(
+                    &parent_fd,
+                    &leaf_c,
+                    &canon_target,
+                    &stage_fd,
+                    &stage_name_c,
+                    &stage_dir_path,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_note) => {
+                        Err(SjError::ExecutionGate(format!("{err}; {rollback_note}")))
+                    }
+                };
             }
             drop(stage_fd);
             let rc = unsafe {
@@ -1192,7 +1417,11 @@ mod unix_impl {
                 )
             };
             if rc != 0 {
-                return Err(last_os_err());
+                let err = last_os_err();
+                return Err(SjError::ExecutionGate(format!(
+                    "deleted target but failed to remove empty staging directory {}: {err}",
+                    stage_dir_path.display()
+                )));
             }
             return Ok(());
         }
@@ -1220,6 +1449,8 @@ mod unix_impl {
 
         let (stage_fd, stage_name_c, stage_name_str) =
             create_private_stage_dir(&parent_fd, st_parent.st_dev as u64)?;
+        let stage_dir_path = canon_parent.join(&stage_name_str);
+        let quarantined_target_path = stage_dir_path.join("target");
         if let Err(e) = renameat_no_replace(&parent_fd, &leaf_c, &stage_fd, target_c) {
             drop(stage_fd);
             let _ = unsafe {
@@ -1251,9 +1482,8 @@ mod unix_impl {
             }
 
             let root_dev = st_root.st_dev as u64;
-            let staged_target_path = canon_parent.join(&stage_name_str).join("target");
             let (git_head, git_tree, git_refs_sha256) = if is_orphan {
-                let st_lstat_before = lstat_path(&staged_target_path)?;
+                let st_lstat_before = lstat_path(&quarantined_target_path)?;
                 let st_at_before = fstatat_nofollow(&stage_fd, target_c)?;
                 if !stat_matches_dev_ino(&st_root, &st_lstat_before)
                     || !stat_matches_dev_ino(&st_root, &st_at_before)
@@ -1263,10 +1493,14 @@ mod unix_impl {
                     ));
                 }
 
-                verify_orphan_safe_to_remove(&staged_target_path, ctx)?;
-                let (h, t, r) = capture_git_snapshot_identity(&staged_target_path)?;
+                verify_orphan_safe_to_remove_staged(&quarantined_target_path, &canon_target, ctx)?;
+                let (h, t, r) = capture_git_snapshot_identity_staged(
+                    &quarantined_target_path,
+                    &canon_target,
+                    ctx,
+                )?;
 
-                let st_lstat_after = lstat_path(&staged_target_path)?;
+                let st_lstat_after = lstat_path(&quarantined_target_path)?;
                 let st_at_after = fstatat_nofollow(&stage_fd, target_c)?;
                 if !stat_matches_dev_ino(&st_root, &st_lstat_after)
                     || !stat_matches_dev_ino(&st_root, &st_at_after)
@@ -1275,14 +1509,14 @@ mod unix_impl {
                         "orphan directory identity changed during git checks".to_string(),
                     ));
                 }
-                let prot_after = check_path_protection(&staged_target_path, ctx);
+                let prot_after = check_path_protection(&canon_target, ctx);
                 if prot_after.protected {
                     return Err(SjError::ProtectedPath(prot_after.reason));
                 }
-                if is_symlink_path(&staged_target_path)? {
+                if is_symlink_path(&quarantined_target_path)? {
                     return Err(SjError::ProtectedPath(format!(
                         "refusing symlink target: {}",
-                        staged_target_path.display()
+                        quarantined_target_path.display()
                     )));
                 }
                 (Some(h), Some(t), Some(r))
@@ -1344,8 +1578,10 @@ mod unix_impl {
                 return match restore_staged_or_preserve(
                     &parent_fd,
                     &leaf_c,
+                    &canon_target,
                     &stage_fd,
                     &stage_name_c,
+                    &stage_dir_path,
                 ) {
                     Ok(()) => Err(err),
                     Err(rollback_note) => {
@@ -1355,27 +1591,57 @@ mod unix_impl {
             }
         };
 
-        delete_dir_from_manifest(
-            &staged_dir_fd,
-            &canon_target,
-            &root_manifest,
-            root_dev,
-            ctx,
-            1,
-        )?;
-        drop(staged_dir_fd);
+        let mut any_unlinked = false;
+        let del_and_unlink_res: Result<(), SjError> = (|| {
+            let del_res = delete_dir_from_manifest_tracked(
+                &staged_dir_fd,
+                &canon_target,
+                &root_manifest,
+                root_dev,
+                ctx,
+                1,
+                &mut any_unlinked,
+            );
+            drop(staged_dir_fd);
+            del_res?;
 
-        let st_recheck = fstatat_nofollow(&stage_fd, target_c)?;
-        if !stat_matches_dev_ino(&st_recheck, &st_root) {
-            return Err(SjError::ExecutionGate(
-                "target directory changed before final unlinkat; aborting".to_string(),
-            ));
+            let st_recheck = fstatat_nofollow(&stage_fd, target_c)?;
+            if !stat_matches_dev_ino(&st_recheck, &st_root) {
+                return Err(SjError::ExecutionGate(
+                    "target directory changed before final unlinkat; aborting".to_string(),
+                ));
+            }
+            let rc = unsafe {
+                libc::unlinkat(stage_fd.as_raw_fd(), target_c.as_ptr(), libc::AT_REMOVEDIR)
+            };
+            if rc != 0 {
+                return Err(last_os_err());
+            }
+            Ok(())
+        })();
+
+        if let Err(err) = del_and_unlink_res {
+            if !any_unlinked {
+                return match restore_staged_or_preserve(
+                    &parent_fd,
+                    &leaf_c,
+                    &canon_target,
+                    &stage_fd,
+                    &stage_name_c,
+                    &stage_dir_path,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_note) => {
+                        Err(SjError::ExecutionGate(format!("{err}; {rollback_note}")))
+                    }
+                };
+            }
+            return Err(SjError::ExecutionGate(format!(
+                "{err}; partial deletion aborted — remaining target preserved in quarantine at {} for manual recovery",
+                quarantined_target_path.display()
+            )));
         }
-        let rc =
-            unsafe { libc::unlinkat(stage_fd.as_raw_fd(), target_c.as_ptr(), libc::AT_REMOVEDIR) };
-        if rc != 0 {
-            return Err(last_os_err());
-        }
+
         drop(stage_fd);
         let rc = unsafe {
             libc::unlinkat(
@@ -1385,7 +1651,11 @@ mod unix_impl {
             )
         };
         if rc != 0 {
-            return Err(last_os_err());
+            let err = last_os_err();
+            return Err(SjError::ExecutionGate(format!(
+                "deleted target but failed to remove empty staging directory {}: {err}",
+                stage_dir_path.display()
+            )));
         }
 
         Ok(())
@@ -1578,7 +1848,7 @@ pub(crate) fn capture_snapshot_portable(
         records.sort();
         let tree_hash = hash_dir_tree_records(&records);
         let (git_head, git_tree, git_refs_sha256) = if is_orphan {
-            let (h, t, r) = capture_git_snapshot_identity(target)?;
+            let (h, t, r) = capture_git_snapshot_identity_staged(target, target, ctx)?;
             (Some(h), Some(t), Some(r))
         } else {
             (None, None, None)
@@ -1913,26 +2183,112 @@ mod tests {
             // Simulate concurrent creation of a new file at the original path
             fs::write(&leaf_path, b"new concurrent file").unwrap();
 
+            let stage_dir_path = parent.join(&stage_name_str);
             let res = unix_impl::restore_staged_or_preserve(
                 &parent_fd,
                 &leaf_c,
+                &leaf_path,
                 &stage_fd,
                 &stage_name_c,
+                &stage_dir_path,
             );
             assert!(
                 res.is_err(),
                 "restore_staged_or_preserve must fail when destination already exists"
+            );
+            let quarantined_target = parent.join(&stage_name_str).join("target");
+            let err_msg = res.unwrap_err();
+            assert!(
+                err_msg.contains(&quarantined_target.display().to_string()),
+                "restore_staged_or_preserve error must include exact quarantined target path {}: {err_msg}",
+                quarantined_target.display()
             );
             assert_eq!(
                 fs::read(&leaf_path).unwrap(),
                 b"new concurrent file",
                 "new file at leaf_c must not be clobbered"
             );
-            let quarantined_target = parent.join(&stage_name_str).join("target");
             assert_eq!(
                 fs::read(&quarantined_target).unwrap(),
                 b"staged payload",
                 "staged target must remain preserved in quarantine"
+            );
+        }
+
+        #[test]
+        fn delete_dir_from_manifest_two_phase_prevents_partial_deletion_on_later_drift() {
+            use std::io::Write;
+
+            let tmp = tempdir().unwrap();
+            let target = tmp.path().join("target_dir");
+            let sub_a = target.join("sub_a");
+            let sub_b = target.join("sub_b");
+            fs::create_dir_all(&sub_a).unwrap();
+            fs::create_dir_all(&sub_b).unwrap();
+
+            let keep_file = sub_a.join("keep.txt");
+            let drifted_file = sub_b.join("drifted.txt");
+            fs::write(&keep_file, b"keep-intact").unwrap();
+            fs::write(&drifted_file, b"original").unwrap();
+            let orig_mtime = fs::metadata(&drifted_file).unwrap().modified().unwrap();
+
+            let dir_meta = fs::symlink_metadata(&target).unwrap();
+            let sub_a_meta = fs::symlink_metadata(&sub_a).unwrap();
+            let sub_b_meta = fs::symlink_metadata(&sub_b).unwrap();
+
+            let sub_a_manifest = ManifestDir {
+                name_c: CString::new("sub_a").unwrap(),
+                name_str: "sub_a".to_string(),
+                dev: sub_a_meta.dev(),
+                ino: sub_a_meta.ino(),
+                dirs: Vec::new(),
+                files: vec![build_manifest_file(&sub_a, "keep.txt")],
+            };
+            let sub_b_manifest = ManifestDir {
+                name_c: CString::new("sub_b").unwrap(),
+                name_str: "sub_b".to_string(),
+                dev: sub_b_meta.dev(),
+                ino: sub_b_meta.ino(),
+                dirs: Vec::new(),
+                files: vec![build_manifest_file(&sub_b, "drifted.txt")],
+            };
+            let manifest = ManifestDir {
+                name_c: CString::new("target_dir").unwrap(),
+                name_str: "target_dir".to_string(),
+                dev: dir_meta.dev(),
+                ino: dir_meta.ino(),
+                dirs: vec![sub_a_manifest, sub_b_manifest],
+                files: Vec::new(),
+            };
+
+            let dir_fd = open_dir_fd(&target);
+            {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(false)
+                    .open(&drifted_file)
+                    .unwrap();
+                f.write_all(b"MUTATED!").unwrap();
+                f.flush().unwrap();
+                f.set_modified(orig_mtime).unwrap();
+            }
+
+            let ctx = ProtectionContext::new(tmp.path().to_path_buf(), vec![]);
+            let res =
+                delete_dir_from_manifest(&dir_fd, &target, &manifest, dir_meta.dev(), &ctx, 1);
+            assert!(
+                matches!(res, Err(SjError::ExecutionGate(_))),
+                "later subdir drift must fail closed: {res:?}"
+            );
+            assert_eq!(
+                fs::read(&keep_file).unwrap(),
+                b"keep-intact",
+                "Phase 1 must prevent partial deletion of earlier sibling sub_a/keep.txt"
+            );
+            assert_eq!(
+                fs::read(&drifted_file).unwrap(),
+                b"MUTATED!",
+                "drifted file sub_b/drifted.txt must also remain preserved intact"
             );
         }
     }

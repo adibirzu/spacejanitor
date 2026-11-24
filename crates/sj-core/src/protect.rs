@@ -21,6 +21,13 @@ const PROTECTED_VM_EXTENSIONS: &[&str] = &["vmdk", "qcow2", "vhdx", "vdi", "raw"
 const PROTECTED_KEY_EXTENSIONS: &[&str] = &["pem", "key", "p12", "pfx"];
 const PROTECTED_KEY_PREFIXES: &[&str] = &["id_rsa", "id_ed25519", "id_ecdsa", "id_dsa"];
 
+pub const QUARANTINE_STAGE_PREFIX: &str = ".sj-stage-";
+
+pub fn is_quarantine_stage_name(name: &str) -> bool {
+    name.to_ascii_lowercase()
+        .starts_with(QUARANTINE_STAGE_PREFIX)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProtectionVerdict {
     pub protected: bool,
@@ -223,10 +230,16 @@ pub fn is_protected_path(
     }
 
     // Also protect any path segment matching credential store directories (case-insensitive)
+    // or SpaceJanitor quarantine staging directories.
     let mut prev_seg_low: Option<String> = None;
     for component in Path::new(&cand).components() {
         if let Component::Normal(os_str) = component {
             if let Some(seg) = os_str.to_str() {
+                if is_quarantine_stage_name(seg) {
+                    return ProtectionVerdict::deny(format!(
+                        "quarantine_stage_recovery_required:{seg}"
+                    ));
+                }
                 let seg_low = seg.to_ascii_lowercase();
                 if matches!(
                     seg_low.as_str(),
@@ -381,15 +394,17 @@ pub fn is_symlink_path(path: &Path) -> Result<bool, std::io::Error> {
     Ok(meta.file_type().is_symlink())
 }
 
-/// Bounded recursive non-following check ensuring no descendant inside `dir` is protected,
-/// a symlink, or unreadable. Fails closed on any error or when `max_entries` is exceeded.
-pub fn check_dir_descendants_safe(
-    dir: &Path,
+/// Bounded recursive non-following check ensuring no descendant inside `actual_dir` is protected
+/// (evaluated at `logical_dir`), a symlink, or unreadable. Fails closed on any error or when
+/// `max_entries` is exceeded.
+pub(crate) fn check_dir_descendants_safe_logical(
+    actual_dir: &Path,
+    logical_dir: &Path,
     ctx: &ProtectionContext,
     max_entries: usize,
 ) -> ProtectionVerdict {
     let mut seen: usize = 0;
-    for entry_res in jwalk::WalkDir::new(dir)
+    for entry_res in jwalk::WalkDir::new(actual_dir)
         .follow_links(false)
         .skip_hidden(false)
     {
@@ -415,10 +430,27 @@ pub fn check_dir_descendants_safe(
                 entry.path().display()
             ));
         }
-        let v = check_path_protection(&entry.path(), ctx);
+        let entry_path = entry.path();
+        let Ok(rel) = entry_path.strip_prefix(actual_dir) else {
+            return ProtectionVerdict::deny(format!(
+                "unresolvable_descendant:{}",
+                entry_path.display()
+            ));
+        };
+        let v = check_path_protection(&logical_dir.join(rel), ctx);
         if v.protected {
             return ProtectionVerdict::deny(format!("protected_descendant:{}", v.reason));
         }
     }
     ProtectionVerdict::safe()
+}
+
+/// Bounded recursive non-following check ensuring no descendant inside `dir` is protected,
+/// a symlink, or unreadable. Fails closed on any error or when `max_entries` is exceeded.
+pub fn check_dir_descendants_safe(
+    dir: &Path,
+    ctx: &ProtectionContext,
+    max_entries: usize,
+) -> ProtectionVerdict {
+    check_dir_descendants_safe_logical(dir, dir, ctx, max_entries)
 }

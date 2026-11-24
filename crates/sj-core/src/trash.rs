@@ -1,5 +1,6 @@
 use crate::protect::{
-    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
+    check_dir_descendants_safe, check_path_protection, is_quarantine_stage_name, is_symlink_path,
+    ProtectionContext,
 };
 use crate::{SjError, SCHEMA_TRASH_V1};
 use jwalk::WalkDir;
@@ -123,6 +124,17 @@ pub fn discover_trash_at(
 
         item_count += 1;
         total_bytes = total_bytes.saturating_add(bytes);
+
+        let entry_name = entry.file_name().to_string_lossy().into_owned();
+        if is_quarantine_stage_name(&entry_name) {
+            protected_items.push(TrashItem {
+                path: path.to_string_lossy().into_owned(),
+                bytes,
+                protected: true,
+                reason: Some(format!("quarantine_stage_recovery_required:{entry_name}")),
+            });
+            continue;
+        }
 
         let verdict = check_path_protection(&path, ctx);
         let desc_verdict = if !is_sym && !verdict.protected && meta.is_dir() {

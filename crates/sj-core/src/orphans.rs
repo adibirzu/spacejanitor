@@ -1,13 +1,15 @@
 use crate::protect::{
-    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
+    check_dir_descendants_safe_logical, check_path_protection, is_quarantine_stage_name,
+    is_symlink_path, ProtectionContext,
 };
 use crate::{SjError, SCHEMA_ORPHANS_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 #[derive(Debug, Clone)]
@@ -45,19 +47,62 @@ pub struct OrphansReport {
     pub blocked: Vec<BlockedOrphan>,
 }
 
-fn run_git_raw(repo: &Path, args: &[&str]) -> Result<(bool, String), SjError> {
-    let out = Command::new("git")
-        .current_dir(repo)
+struct GitExecContext {
+    work_tree: PathBuf,
+    git_dir: PathBuf,
+    alternate_object_dirs: Option<OsString>,
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for comp in path.components() {
+        match comp {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
+                    out.pop();
+                } else if !out.has_root() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+fn run_git_raw_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let mut cmd = Command::new("git");
+    cmd.current_dir(&git_ctx.work_tree)
+        .arg("--git-dir")
+        .arg(&git_ctx.git_dir)
+        .arg("--work-tree")
+        .arg(&git_ctx.work_tree)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()?;
+        .env("GIT_OPTIONAL_LOCKS", "0");
+    if let Some(ref alt) = git_ctx.alternate_object_dirs {
+        cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt);
+    }
+    let out = cmd.output()?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     Ok((out.status.success(), stdout))
 }
 
-fn run_git(repo: &Path, args: &[&str]) -> Result<(bool, String), SjError> {
-    let (ok, raw) = run_git_raw(repo, args)?;
+fn run_git_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let (ok, raw) = run_git_raw_ctx(git_ctx, args)?;
     Ok((ok, raw.trim().to_string()))
 }
 
@@ -73,10 +118,10 @@ fn sha256_hex_str(input: &str) -> String {
     out
 }
 
-fn snapshot_local_branches(repo: &Path) -> Result<Vec<(String, String)>, String> {
-    let (ok, out) = run_git_raw(
-        repo,
-        &[
+fn snapshot_local_branches(git_ctx: &GitExecContext) -> Result<Vec<(String, String)>, String> {
+    let (ok, out) = run_git_raw_ctx(
+        git_ctx,
+        [
             "for-each-ref",
             "--format=%(refname)%09%(objectname)",
             "refs/heads",
@@ -106,17 +151,22 @@ fn snapshot_local_branches(repo: &Path) -> Result<Vec<(String, String)>, String>
     Ok(branches)
 }
 
-/// Captures `(git_head, git_tree, git_refs_sha256)` for snapshot binding.
-pub fn capture_git_snapshot_identity(repo: &Path) -> Result<(String, String, String), SjError> {
-    let (head_ok, head) = run_git(repo, &["rev-parse", "--verify", "HEAD"])?;
+pub(crate) fn capture_git_snapshot_identity_staged(
+    actual_repo: &Path,
+    logical_repo: &Path,
+    ctx: &ProtectionContext,
+) -> Result<(String, String, String), SjError> {
+    let (git_ctx, _) =
+        build_git_exec_context(actual_repo, logical_repo, ctx).map_err(SjError::Git)?;
+    let (head_ok, head) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"])?;
     if !head_ok || head.is_empty() {
         return Err(SjError::Git("failed to resolve HEAD".to_string()));
     }
-    let (tree_ok, tree) = run_git(repo, &["rev-parse", "--verify", "HEAD^{tree}"])?;
+    let (tree_ok, tree) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD^{tree}"])?;
     if !tree_ok || tree.is_empty() {
         return Err(SjError::Git("failed to resolve HEAD^{tree}".to_string()));
     }
-    let branches = snapshot_local_branches(repo).map_err(SjError::Git)?;
+    let branches = snapshot_local_branches(&git_ctx).map_err(SjError::Git)?;
     let refs_joined = branches
         .iter()
         .map(|(r, s)| format!("{r}\t{s}"))
@@ -124,6 +174,11 @@ pub fn capture_git_snapshot_identity(repo: &Path) -> Result<(String, String, Str
         .join("\n");
     let refs_sha = sha256_hex_str(&refs_joined);
     Ok((head, tree, refs_sha))
+}
+
+/// Captures `(git_head, git_tree, git_refs_sha256)` for snapshot binding.
+pub fn capture_git_snapshot_identity(repo: &Path) -> Result<(String, String, String), SjError> {
+    capture_git_snapshot_identity_staged(repo, repo, &ProtectionContext::from_env())
 }
 
 fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), String> {
@@ -148,7 +203,7 @@ fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), Stri
         if p.is_absolute() {
             p
         } else {
-            gitdir.join(p)
+            normalize_lexical_path(&gitdir.join(p))
         }
     };
     if is_symlink_path(&common_path).unwrap_or(true) {
@@ -162,10 +217,10 @@ fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), Stri
 }
 
 fn validate_gitdir_pointer(
-    worktree: &Path,
+    logical_worktree: &Path,
     dot_git_file: &Path,
     ctx: &ProtectionContext,
-) -> Result<(), String> {
+) -> Result<PathBuf, String> {
     let raw =
         std::fs::read_to_string(dot_git_file).map_err(|_| "unreadable_dot_git_file".to_string())?;
     let line = raw
@@ -181,7 +236,7 @@ fn validate_gitdir_pointer(
         if p.is_absolute() {
             p
         } else {
-            worktree.join(p)
+            normalize_lexical_path(&logical_worktree.join(p))
         }
     };
     if is_symlink_path(&target).unwrap_or(true) {
@@ -194,7 +249,131 @@ fn validate_gitdir_pointer(
 
     validate_commondir(&target, ctx)?;
 
-    Ok(())
+    Ok(target)
+}
+
+fn resolve_staged_alternates(
+    actual_repo: &Path,
+    logical_repo: &Path,
+) -> Result<Option<OsString>, String> {
+    if actual_repo == logical_repo {
+        return Ok(None);
+    }
+    let alternates_file = actual_repo
+        .join(".git")
+        .join("objects")
+        .join("info")
+        .join("alternates");
+    match std::fs::symlink_metadata(&alternates_file) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err("unreadable_alternates_metadata".to_string()),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err("symlink_alternates_file".to_string());
+            }
+            if !meta.is_file() {
+                return Err("invalid_alternates_file".to_string());
+            }
+        }
+    }
+    let raw = std::fs::read_to_string(&alternates_file)
+        .map_err(|_| "unreadable_alternates".to_string())?;
+    let mut resolved_paths: Vec<PathBuf> = Vec::new();
+    let logical_objects = logical_repo.join(".git").join("objects");
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        let p = Path::new(trimmed);
+        if p.is_absolute() {
+            resolved_paths.push(p.to_path_buf());
+        } else {
+            let resolved = normalize_lexical_path(&logical_objects.join(p));
+            if let Ok(rel_inside) = resolved.strip_prefix(logical_repo) {
+                resolved_paths.push(actual_repo.join(rel_inside));
+            } else {
+                resolved_paths.push(resolved);
+            }
+        }
+    }
+    if resolved_paths.is_empty() {
+        Ok(None)
+    } else {
+        std::env::join_paths(&resolved_paths)
+            .map(Some)
+            .map_err(|_| "invalid_alternates_path".to_string())
+    }
+}
+
+fn build_git_exec_context(
+    actual_repo: &Path,
+    logical_repo: &Path,
+    ctx: &ProtectionContext,
+) -> Result<(GitExecContext, bool), String> {
+    let dot_git = actual_repo.join(".git");
+    let dot_git_meta =
+        std::fs::symlink_metadata(&dot_git).map_err(|_| "missing_dot_git".to_string())?;
+    if dot_git_meta.file_type().is_symlink() {
+        return Err("symlink_dot_git".to_string());
+    }
+    if dot_git_meta.is_file() {
+        let git_dir = validate_gitdir_pointer(logical_repo, &dot_git, ctx)?;
+        Ok((
+            GitExecContext {
+                work_tree: actual_repo.to_path_buf(),
+                git_dir,
+                alternate_object_dirs: None,
+            },
+            true,
+        ))
+    } else if dot_git_meta.is_dir() {
+        validate_commondir(&dot_git, ctx)?;
+        let alternate_object_dirs = resolve_staged_alternates(actual_repo, logical_repo)?;
+        Ok((
+            GitExecContext {
+                work_tree: actual_repo.to_path_buf(),
+                git_dir: dot_git,
+                alternate_object_dirs,
+            },
+            false,
+        ))
+    } else {
+        Err("invalid_dot_git".to_string())
+    }
+}
+
+fn resolve_relative_local_remote(url: &str, logical_repo: &Path) -> Option<PathBuf> {
+    let trimmed = url.trim();
+    if trimmed.is_empty()
+        || trimmed.contains("://")
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('\\')
+        || trimmed.starts_with('~')
+    {
+        return None;
+    }
+    let bytes = trimmed.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        return None;
+    }
+    let first_sep = trimmed.find(['/', '\\']);
+    if let Some(colon) = trimmed.find(':') {
+        if first_sep.is_none_or(|sep| colon < sep) {
+            return None;
+        }
+    }
+    let resolved = normalize_lexical_path(&logical_repo.join(trimmed));
+    if trimmed.starts_with("./")
+        || trimmed.starts_with("../")
+        || trimmed.starts_with(".\\")
+        || trimmed.starts_with("..\\")
+        || resolved.exists()
+    {
+        Some(resolved)
+    } else {
+        None
+    }
 }
 
 fn dir_bytes_no_follow(path: &Path) -> u64 {
@@ -212,47 +391,34 @@ fn dir_bytes_no_follow(path: &Path) -> u64 {
     total
 }
 
-fn validate_single_repo(
-    repo: &Path,
+fn validate_single_repo_at(
+    actual_repo: &Path,
+    logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<OrphanCandidate, Vec<String>> {
     let mut reasons = Vec::new();
 
-    let prot = check_path_protection(repo, ctx);
+    let prot = check_path_protection(logical_repo, ctx);
     if prot.protected {
         reasons.push(format!("protected_path:{}", prot.reason));
         return Err(reasons);
     }
 
-    if is_symlink_path(repo).unwrap_or(true) {
+    if is_symlink_path(actual_repo).unwrap_or(true) {
         reasons.push("symlink_worktree".to_string());
         return Err(reasons);
     }
 
-    let dot_git = repo.join(".git");
-    let Ok(dot_git_meta) = std::fs::symlink_metadata(&dot_git) else {
-        reasons.push("missing_dot_git".to_string());
-        return Err(reasons);
+    let (git_ctx, is_worktree) = match build_git_exec_context(actual_repo, logical_repo, ctx) {
+        Ok(v) => v,
+        Err(reason) => {
+            reasons.push(reason);
+            return Err(reasons);
+        }
     };
-    if dot_git_meta.file_type().is_symlink() {
-        reasons.push("symlink_dot_git".to_string());
-        return Err(reasons);
-    }
 
-    let is_worktree = dot_git_meta.is_file();
-    if is_worktree {
-        if let Err(reason) = validate_gitdir_pointer(repo, &dot_git, ctx) {
-            reasons.push(reason);
-            return Err(reasons);
-        }
-    } else if dot_git_meta.is_dir() {
-        if let Err(reason) = validate_commondir(&dot_git, ctx) {
-            reasons.push(reason);
-            return Err(reasons);
-        }
-    }
-
-    let Ok((head_ok, head_before)) = run_git(repo, &["rev-parse", "--verify", "HEAD"]) else {
+    let Ok((head_ok, head_before)) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"])
+    else {
         reasons.push("git_invocation_failed".to_string());
         return Err(reasons);
     };
@@ -261,7 +427,7 @@ fn validate_single_repo(
     }
 
     let (sym_ok, sym_ref) =
-        run_git(repo, &["symbolic-ref", "-q", "HEAD"]).unwrap_or((false, String::new()));
+        run_git_ctx(&git_ctx, ["symbolic-ref", "-q", "HEAD"]).unwrap_or((false, String::new()));
     let branch = if sym_ok && !sym_ref.is_empty() {
         Some(sym_ref)
     } else {
@@ -269,9 +435,9 @@ fn validate_single_repo(
         None
     };
 
-    let (status_ok, status_out) = run_git_raw(
-        repo,
-        &[
+    let (status_ok, status_out) = run_git_raw_ctx(
+        &git_ctx,
+        [
             "status",
             "--porcelain=v1",
             "--untracked-files=all",
@@ -300,7 +466,8 @@ fn validate_single_repo(
         }
     }
 
-    let (remote_ok, remote_out) = run_git(repo, &["remote"]).unwrap_or((false, String::new()));
+    let (remote_ok, remote_out) =
+        run_git_ctx(&git_ctx, ["remote"]).unwrap_or((false, String::new()));
     let remotes: Vec<String> = if remote_ok {
         remote_out
             .lines()
@@ -314,19 +481,41 @@ fn validate_single_repo(
         reasons.push("no_remote".to_string());
     }
 
-    let (stash_ok, stash_out) = run_git(repo, &["stash", "list"]).unwrap_or((false, String::new()));
+    let (stash_ok, stash_out) =
+        run_git_ctx(&git_ctx, ["stash", "list"]).unwrap_or((false, String::new()));
     if !stash_ok || !stash_out.is_empty() {
         reasons.push("has_stashes".to_string());
     }
 
-    let refs_before = snapshot_local_branches(repo);
+    let refs_before = snapshot_local_branches(&git_ctx);
     let mut all_branches_verified = false;
     if let Ok(ref local_branches) = refs_before {
         if !remotes.is_empty() {
             let mut remote_heads: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut remote_query_failed = false;
             for remote_name in &remotes {
-                match run_git_raw(repo, &["ls-remote", "--heads", "--", remote_name]) {
+                let target_override = if actual_repo != logical_repo {
+                    let cfg_key = format!("remote.{remote_name}.url");
+                    run_git_ctx(&git_ctx, ["config", "--get", &cfg_key])
+                        .ok()
+                        .filter(|(ok, out)| *ok && !out.is_empty())
+                        .and_then(|(_, url)| resolve_relative_local_remote(&url, logical_repo))
+                } else {
+                    None
+                };
+                let ls_target: &OsStr = target_override
+                    .as_ref()
+                    .map(|p| p.as_os_str())
+                    .unwrap_or_else(|| OsStr::new(remote_name));
+                match run_git_raw_ctx(
+                    &git_ctx,
+                    [
+                        OsStr::new("ls-remote"),
+                        OsStr::new("--heads"),
+                        OsStr::new("--"),
+                        ls_target,
+                    ],
+                ) {
                     Ok((true, ls_out)) => {
                         let tips = ls_out
                             .lines()
@@ -345,17 +534,20 @@ fn validate_single_repo(
                 let is_pushed_to_tips = |local_sha: &str, tips: &[String]| -> bool {
                     tips.iter().any(|rsha| {
                         rsha == local_sha
-                            || run_git(repo, &["merge-base", "--is-ancestor", local_sha, rsha])
-                                .map(|(ok, _)| ok)
-                                .unwrap_or(false)
+                            || run_git_ctx(
+                                &git_ctx,
+                                ["merge-base", "--is-ancestor", local_sha, rsha],
+                            )
+                            .map(|(ok, _)| ok)
+                            .unwrap_or(false)
                     })
                 };
 
                 all_branches_verified = local_branches.iter().all(|(refname, local_sha)| {
                     let short_branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);
-                    let remote_cfg = run_git(
-                        repo,
-                        &["config", "--get", &format!("branch.{short_branch}.remote")],
+                    let remote_cfg = run_git_ctx(
+                        &git_ctx,
+                        ["config", "--get", &format!("branch.{short_branch}.remote")],
                     )
                     .ok()
                     .filter(|(ok, out)| *ok && !out.is_empty())
@@ -378,7 +570,7 @@ fn validate_single_repo(
         reasons.push("remote_unverified_or_unpushed".to_string());
     }
 
-    let refs_after = snapshot_local_branches(repo);
+    let refs_after = snapshot_local_branches(&git_ctx);
     if let Ok(ref before) = refs_before {
         if refs_after.as_ref() != Ok(before) {
             reasons.push("concurrent_ref_drift".to_string());
@@ -386,22 +578,29 @@ fn validate_single_repo(
     }
 
     let (head_after_ok, head_after) =
-        run_git(repo, &["rev-parse", "--verify", "HEAD"]).unwrap_or((false, String::new()));
+        run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"]).unwrap_or((false, String::new()));
     if head_ok && (!head_after_ok || head_after != head_before) {
         reasons.push("concurrent_head_drift".to_string());
     }
 
     if reasons.is_empty() {
         Ok(OrphanCandidate {
-            path: repo.to_string_lossy().into_owned(),
+            path: logical_repo.to_string_lossy().into_owned(),
             is_worktree,
             branch,
             head: Some(head_before),
-            bytes: dir_bytes_no_follow(repo),
+            bytes: dir_bytes_no_follow(actual_repo),
         })
     } else {
         Err(reasons)
     }
+}
+
+fn validate_single_repo(
+    repo: &Path,
+    ctx: &ProtectionContext,
+) -> Result<OrphanCandidate, Vec<String>> {
+    validate_single_repo_at(repo, repo, ctx)
 }
 
 pub fn inspect_orphans(
@@ -417,6 +616,7 @@ pub fn inspect_orphans(
     }
 
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
+    let mut quarantined: BTreeMap<PathBuf, String> = BTreeMap::new();
     let ctx_clone = ctx.clone();
     let walker = WalkDir::new(root)
         .follow_links(false)
@@ -425,6 +625,15 @@ pub fn inspect_orphans(
         .process_read_dir(move |depth, _path, _state, children| {
             if depth.is_none() {
                 return;
+            }
+            for entry in children.iter_mut().flatten() {
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_quarantine_stage_name)
+                {
+                    entry.read_children_path = None;
+                }
             }
             children.retain(|res| {
                 let Ok(entry) = res else {
@@ -436,6 +645,13 @@ pub fn inspect_orphans(
                 if entry.file_type().is_symlink() {
                     return false;
                 }
+                if entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(is_quarantine_stage_name)
+                {
+                    return true;
+                }
                 !check_path_protection(&entry.path(), &ctx_clone).protected
             });
         });
@@ -444,6 +660,16 @@ pub fn inspect_orphans(
         let Ok(entry) = entry_res else {
             continue;
         };
+        if entry.depth > 0 {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if is_quarantine_stage_name(&name) {
+                quarantined.insert(
+                    entry.path(),
+                    format!("quarantine_stage_recovery_required:{name}"),
+                );
+                continue;
+            }
+        }
         if entry.file_type().is_dir() {
             let p = entry.path();
             if std::fs::symlink_metadata(p.join(".git")).is_ok() {
@@ -489,7 +715,7 @@ pub fn inspect_orphans(
                     }
                 }
             }
-            let desc = check_dir_descendants_safe(p_ref, ctx, 100_000);
+            let desc = check_dir_descendants_safe_logical(p_ref, p_ref, ctx, 100_000);
             if desc.protected {
                 *res = Err(vec![desc.reason]);
             }
@@ -507,6 +733,13 @@ pub fn inspect_orphans(
                 reasons,
             }),
         }
+    }
+
+    for (p, reason) in quarantined {
+        blocked.push(BlockedOrphan {
+            path: p.to_string_lossy().into_owned(),
+            reasons: vec![reason],
+        });
     }
 
     safe_to_prune.sort_by(|a, b| a.path.cmp(&b.path));
@@ -563,32 +796,48 @@ pub fn discover_nested_repos_exhaustive(
     Ok(repos.into_iter().collect())
 }
 
-/// Fail-closed pre-removal verification for an orphan worktree/repo directory.
-pub fn verify_orphan_safe_to_remove(repo: &Path, ctx: &ProtectionContext) -> Result<(), SjError> {
-    let prot = check_path_protection(repo, ctx);
+pub(crate) fn verify_orphan_safe_to_remove_staged(
+    actual_repo: &Path,
+    logical_repo: &Path,
+    ctx: &ProtectionContext,
+) -> Result<(), SjError> {
+    let prot = check_path_protection(logical_repo, ctx);
     if prot.protected {
         return Err(SjError::ProtectedPath(prot.reason));
     }
-    if let Err(reasons) = validate_single_repo(repo, ctx) {
+    if let Err(reasons) = validate_single_repo_at(actual_repo, logical_repo, ctx) {
         return Err(SjError::ExecutionGate(format!(
             "orphan validation failed: {}",
             reasons.join(",")
         )));
     }
     let nested_repos =
-        discover_nested_repos_exhaustive(repo, 100_000).map_err(SjError::ExecutionGate)?;
-    for nested_repo in nested_repos {
-        if let Err(reasons) = validate_single_repo(&nested_repo, ctx) {
+        discover_nested_repos_exhaustive(actual_repo, 100_000).map_err(SjError::ExecutionGate)?;
+    for nested_actual in nested_repos {
+        let rel = nested_actual.strip_prefix(actual_repo).map_err(|_| {
+            SjError::ExecutionGate(format!(
+                "nested repository {} outside {}",
+                nested_actual.display(),
+                actual_repo.display()
+            ))
+        })?;
+        let nested_logical = logical_repo.join(rel);
+        if let Err(reasons) = validate_single_repo_at(&nested_actual, &nested_logical, ctx) {
             return Err(SjError::ExecutionGate(format!(
                 "orphan has unsafe nested repository {}: {}",
-                nested_repo.display(),
+                nested_logical.display(),
                 reasons.join(",")
             )));
         }
     }
-    let desc = check_dir_descendants_safe(repo, ctx, 100_000);
+    let desc = check_dir_descendants_safe_logical(actual_repo, logical_repo, ctx, 100_000);
     if desc.protected {
         return Err(SjError::ProtectedPath(desc.reason));
     }
     Ok(())
+}
+
+/// Fail-closed pre-removal verification for an orphan worktree/repo directory.
+pub fn verify_orphan_safe_to_remove(repo: &Path, ctx: &ProtectionContext) -> Result<(), SjError> {
+    verify_orphan_safe_to_remove_staged(repo, repo, ctx)
 }
