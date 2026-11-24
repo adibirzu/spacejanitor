@@ -759,3 +759,658 @@ fn scan_rejects_protected_roots_and_zero_depth_but_allows_home() {
         .iter()
         .any(|p| p.ends_with(".ssh")));
 }
+
+#[test]
+fn orphan_blocks_gitignored_files_at_preview_and_execute() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    // 1. Repo with gitignored local.db at preview time
+    let ignored_repo = workspace_dir.join("ignored_repo");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "ignored_repo"],
+    );
+    fs::write(ignored_repo.join(".gitignore"), "*.db\n").unwrap();
+    fs::write(ignored_repo.join("README.md"), "hello\n").unwrap();
+    run_git(&ignored_repo, &["add", ".gitignore", "README.md"]);
+    run_git(&ignored_repo, &["commit", "-m", "init"]);
+    run_git(&ignored_repo, &["push", "-u", "origin", "HEAD"]);
+    fs::write(ignored_repo.join("local.db"), "sqlite data\n").unwrap();
+
+    // 2. Clean repo at preview time, then ignored file created before execute
+    let ignored_after = workspace_dir.join("ignored_after_plan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "ignored_after_plan"],
+    );
+    fs::write(ignored_after.join("after.txt"), "clean\n").unwrap();
+    run_git(&ignored_after, &["add", "after.txt"]);
+    run_git(&ignored_after, &["commit", "-m", "after"]);
+    run_git(&ignored_after, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report.blocked.iter().any(|b| {
+            b.path.ends_with("ignored_repo")
+                && b.reasons.iter().any(|r| r == "ignored_files_present")
+        }),
+        "ignored_repo must be blocked with ignored_files_present: {:?}",
+        report.blocked
+    );
+    assert!(
+        !report
+            .safe_to_prune
+            .iter()
+            .any(|c| c.path.ends_with("ignored_repo")),
+        "ignored_repo must not be safe_to_prune"
+    );
+
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: false,
+            include_orphans: true,
+            trash_path_override: None,
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("ignored_after_plan"))
+        .expect("ignored_after_plan should be planned while clean");
+
+    // Create gitignored file between plan and execute
+    fs::write(ignored_after.join("local.db"), "important local db\n").unwrap();
+    let gate = ExecutionGate {
+        execute: true,
+        confirm: true,
+        plan_sha256: plan.plan_sha256.clone(),
+        item_id: item.id.clone(),
+    };
+    assert!(
+        execute_plan_item(&plan, &gate, &ctx).is_err(),
+        "execute_plan_item must refuse repo with gitignored files created after plan"
+    );
+    assert!(ignored_after.exists());
+    assert!(ignored_after.join("local.db").exists());
+}
+
+#[test]
+fn orphan_live_verifies_every_local_branch_not_just_head() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    // 1. Repo where checked-out branch is pushed, but secondary branch `wip` was deleted on remote
+    //    while stale `refs/remotes/origin/wip` remains locally.
+    let stale_repo = workspace_dir.join("stale_secondary_branch");
+    run_git(
+        &workspace_dir,
+        &[
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "stale_secondary_branch",
+        ],
+    );
+    fs::write(stale_repo.join("README.md"), "hello\n").unwrap();
+    run_git(&stale_repo, &["add", "README.md"]);
+    run_git(&stale_repo, &["commit", "-m", "init"]);
+    run_git(&stale_repo, &["push", "-u", "origin", "HEAD"]);
+    let default_branch = String::from_utf8_lossy(
+        &Command::new("git")
+            .current_dir(&stale_repo)
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .trim()
+    .to_string();
+
+    run_git(&stale_repo, &["checkout", "-b", "wip"]);
+    fs::write(stale_repo.join("wip.txt"), "wip\n").unwrap();
+    run_git(&stale_repo, &["add", "wip.txt"]);
+    run_git(&stale_repo, &["commit", "-m", "wip"]);
+    run_git(&stale_repo, &["push", "-u", "origin", "wip"]);
+    // Delete wip on bare remote directly so local refs/remotes/origin/wip is stale
+    run_git(&bare_remote, &["update-ref", "-d", "refs/heads/wip"]);
+    run_git(&stale_repo, &["checkout", &default_branch]);
+
+    // 2. Repo where both default branch and secondary branch `feat` are pushed to live remote
+    let pushed_repo = workspace_dir.join("all_branches_pushed");
+    run_git(
+        &workspace_dir,
+        &[
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "all_branches_pushed",
+        ],
+    );
+    run_git(&pushed_repo, &["checkout", "-b", "feat"]);
+    fs::write(pushed_repo.join("feat.txt"), "feat\n").unwrap();
+    run_git(&pushed_repo, &["add", "feat.txt"]);
+    run_git(&pushed_repo, &["commit", "-m", "feat"]);
+    run_git(&pushed_repo, &["push", "-u", "origin", "feat"]);
+    run_git(&pushed_repo, &["checkout", &default_branch]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+
+    assert!(
+        report.blocked.iter().any(|b| {
+            b.path.ends_with("stale_secondary_branch")
+                && b.reasons
+                    .iter()
+                    .any(|r| r == "remote_unverified_or_unpushed")
+        }),
+        "repo with stale deleted secondary branch must be blocked: {:?}",
+        report.blocked
+    );
+    assert!(
+        report
+            .safe_to_prune
+            .iter()
+            .any(|c| c.path.ends_with("all_branches_pushed")),
+        "repo with all branches live-pushed must be safe_to_prune: {:?}",
+        report
+    );
+}
+
+#[test]
+fn orphan_blocks_deep_nested_dirty_repo_beyond_depth_5() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    // 1. Clean pushed outer repo with dirty repo at depth 7
+    let deep_outer = workspace_dir.join("deep_outer");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "deep_outer"],
+    );
+    fs::write(deep_outer.join("README.md"), "hello\n").unwrap();
+    run_git(&deep_outer, &["add", "README.md"]);
+    run_git(&deep_outer, &["commit", "-m", "init"]);
+    run_git(&deep_outer, &["push", "-u", "origin", "HEAD"]);
+
+    let deep_inner = deep_outer.join("d1/d2/d3/d4/d5/d6/inner_dirty");
+    fs::create_dir_all(&deep_inner).unwrap();
+    run_git(&deep_inner, &["init"]);
+    fs::write(deep_inner.join("unsaved.txt"), "unsaved\n").unwrap();
+
+    // 2. Clean outer repo at plan time, then deep dirty nested repo added before execute
+    let deep_after = workspace_dir.join("deep_after_plan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "deep_after_plan"],
+    );
+    fs::write(deep_after.join("README2.md"), "hello2\n").unwrap();
+    run_git(&deep_after, &["add", "README2.md"]);
+    run_git(&deep_after, &["commit", "-m", "init2"]);
+    run_git(&deep_after, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.path.ends_with("deep_outer")),
+        "deep_outer with depth-7 dirty nested repo must be blocked: {:?}",
+        report.blocked
+    );
+    assert!(
+        !report
+            .safe_to_prune
+            .iter()
+            .any(|c| c.path.ends_with("deep_outer")),
+        "deep_outer must not be safe_to_prune"
+    );
+
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: false,
+            include_orphans: true,
+            trash_path_override: None,
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    let item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("deep_after_plan"))
+        .expect("deep_after_plan should be planned while clean");
+
+    let after_inner = deep_after.join("d1/d2/d3/d4/d5/d6/inner_dirty");
+    fs::create_dir_all(&after_inner).unwrap();
+    run_git(&after_inner, &["init"]);
+    fs::write(after_inner.join("unsaved.txt"), "unsaved\n").unwrap();
+
+    let gate = ExecutionGate {
+        execute: true,
+        confirm: true,
+        plan_sha256: plan.plan_sha256.clone(),
+        item_id: item.id.clone(),
+    };
+    assert!(
+        execute_plan_item(&plan, &gate, &ctx).is_err(),
+        "execute_plan_item must block depth-7 dirty nested repo added after plan"
+    );
+    assert!(after_inner.join("unsaved.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn handle_anchored_removal_happy_path_and_symlink_swap_refusal() {
+    use std::os::unix::fs::symlink;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let workspace_dir = root.join("workspaces");
+    let remotes_dir = root.join("remotes");
+    let outside_dir = root.join("outside");
+    fs::create_dir_all(&trash_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&outside_dir).unwrap();
+
+    // Multi-level directory in Trash
+    let trash_nested = trash_dir.join("nested_cache");
+    fs::create_dir_all(trash_nested.join("a/b")).unwrap();
+    fs::write(trash_nested.join("a/b/c.bin"), vec![3u8; 32]).unwrap();
+
+    // Clean pushed orphan worktree
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+    let clean_orphan = workspace_dir.join("clean_orphan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "clean_orphan"],
+    );
+    fs::write(clean_orphan.join("README.md"), "hello\n").unwrap();
+    run_git(&clean_orphan, &["add", "README.md"]);
+    run_git(&clean_orphan, &["commit", "-m", "init"]);
+    run_git(&clean_orphan, &["push", "-u", "origin", "HEAD"]);
+
+    // File and dir in Trash for symlink swap tests
+    let swap_file = trash_dir.join("swap_file.bin");
+    fs::write(&swap_file, vec![4u8; 16]).unwrap();
+    let swap_dir = trash_dir.join("swap_dir");
+    fs::create_dir_all(&swap_dir).unwrap();
+    fs::write(swap_dir.join("inner.txt"), "x").unwrap();
+
+    let victim_file = outside_dir.join("victim.txt");
+    fs::write(&victim_file, "keep me").unwrap();
+    let victim_dir = outside_dir.join("victim_dir");
+    fs::create_dir_all(&victim_dir).unwrap();
+    fs::write(victim_dir.join("keep.txt"), "keep dir").unwrap();
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: true,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+
+    // Happy path: remove multi-level trash dir and clean orphan
+    let trash_nested_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("nested_cache"))
+        .unwrap();
+    execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: trash_nested_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    )
+    .unwrap();
+    assert!(!trash_nested.exists());
+
+    let orphan_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("clean_orphan"))
+        .unwrap();
+    execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: orphan_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    )
+    .unwrap();
+    assert!(!clean_orphan.exists());
+
+    // Symlink swap on file
+    fs::remove_file(&swap_file).unwrap();
+    symlink(&victim_file, &swap_file).unwrap();
+    let swap_file_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("swap_file.bin"))
+        .unwrap();
+    assert!(execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: swap_file_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    )
+    .is_err());
+    assert!(victim_file.exists());
+
+    // Symlink swap on dir
+    fs::remove_dir_all(&swap_dir).unwrap();
+    symlink(&victim_dir, &swap_dir).unwrap();
+    let swap_dir_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("swap_dir"))
+        .unwrap();
+    assert!(execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: swap_dir_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    )
+    .is_err());
+    assert!(victim_dir.join("keep.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn unreadable_directory_fails_closed_before_deleting_siblings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    // Skip cleanly if running as root (uid 0 ignores chmod 0000)
+    let id_out = Command::new("id").arg("-u").output().unwrap();
+    if String::from_utf8_lossy(&id_out.stdout).trim() == "0" {
+        return;
+    }
+
+    struct ChmodGuard(PathBuf, u32);
+    impl Drop for ChmodGuard {
+        fn drop(&mut self) {
+            let _ = fs::set_permissions(&self.0, fs::Permissions::from_mode(self.1));
+        }
+    }
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    fs::create_dir_all(&trash_dir).unwrap();
+
+    // Case A: unreadable root dir
+    let unreadable_root = trash_dir.join("unreadable_root");
+    fs::create_dir_all(&unreadable_root).unwrap();
+    fs::write(unreadable_root.join("hidden.txt"), "secret").unwrap();
+    fs::set_permissions(&unreadable_root, fs::Permissions::from_mode(0o000)).unwrap();
+    let _guard_a = ChmodGuard(unreadable_root.clone(), 0o755);
+
+    // Case B: readable parent containing unreadable child + readable sibling
+    let parent_dir = trash_dir.join("parent_with_locked_child");
+    let locked_child = parent_dir.join("locked_sub");
+    fs::create_dir_all(&locked_child).unwrap();
+    fs::write(locked_child.join("inside.txt"), "inside").unwrap();
+    let sibling = parent_dir.join("sibling.txt");
+    fs::write(&sibling, "sibling").unwrap();
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+
+    // Plan while parent_dir is readable
+    let plan = build_remediation_plan(
+        root,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: false,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    let parent_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("parent_with_locked_child"))
+        .expect("readable parent_dir should be planned")
+        .clone();
+
+    // Now lock locked_child
+    fs::set_permissions(&locked_child, fs::Permissions::from_mode(0o000)).unwrap();
+    let _guard_b = ChmodGuard(locked_child.clone(), 0o755);
+
+    assert!(
+        sj_core::protect::check_dir_descendants_safe(&unreadable_root, &ctx, 100_000).protected,
+        "unreadable root must be denied by check_dir_descendants_safe"
+    );
+    assert!(
+        sj_core::protect::check_dir_descendants_safe(&parent_dir, &ctx, 100_000).protected,
+        "parent with unreadable child must be denied by check_dir_descendants_safe"
+    );
+
+    let trash_report = discover_trash_at(&trash_dir, &ctx).unwrap();
+    assert!(
+        trash_report
+            .protected_items
+            .iter()
+            .any(|i| i.path.ends_with("unreadable_root")),
+        "unreadable_root must be protected in trash report"
+    );
+    assert!(
+        trash_report
+            .protected_items
+            .iter()
+            .any(|i| i.path.ends_with("parent_with_locked_child")),
+        "parent_with_locked_child must be protected in trash report"
+    );
+
+    // Execute on planned parent_item must fail BEFORE deleting readable sibling
+    let res = execute_plan_item_with_roots(
+        &plan,
+        &ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: parent_item.id.clone(),
+        },
+        &ctx,
+        std::slice::from_ref(&trash_dir),
+    );
+    assert!(res.is_err(), "execute must fail closed on unreadable child");
+    assert!(
+        sibling.exists(),
+        "readable sibling must NOT be deleted when child is unreadable"
+    );
+}
+
+#[test]
+fn snapshot_binding_rejects_same_size_replacement_and_git_drift() {
+    use std::io::Write;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let workspace_dir = root.join("workspaces");
+    let remotes_dir = root.join("remotes");
+    fs::create_dir_all(&trash_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&remotes_dir).unwrap();
+
+    // 1. Trash file replaced with same byte size (new inode)
+    let replaced_file = trash_dir.join("replaced.bin");
+    fs::write(&replaced_file, vec![b'A'; 64]).unwrap();
+
+    // 2. Trash file overwritten in-place with same byte size (same inode)
+    let inplace_file = trash_dir.join("inplace.bin");
+    fs::write(&inplace_file, vec![b'C'; 64]).unwrap();
+
+    // 3. Clean pushed orphan worktree that gets a new pushed commit after plan
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+    let drifting_orphan = workspace_dir.join("drifting_orphan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "drifting_orphan"],
+    );
+    fs::write(drifting_orphan.join("README.md"), "hello\n").unwrap();
+    run_git(&drifting_orphan, &["add", "README.md"]);
+    run_git(&drifting_orphan, &["commit", "-m", "init"]);
+    run_git(&drifting_orphan, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: true,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+
+    // Replace file with same size (unlink + create)
+    fs::remove_file(&replaced_file).unwrap();
+    fs::write(&replaced_file, vec![b'B'; 64]).unwrap();
+    let replaced_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("replaced.bin"))
+        .unwrap();
+    assert!(
+        execute_plan_item_with_roots(
+            &plan,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256: plan.plan_sha256.clone(),
+                item_id: replaced_item.id.clone(),
+            },
+            &ctx,
+            std::slice::from_ref(&trash_dir),
+        )
+        .is_err(),
+        "same-size unlink+recreate replacement must fail snapshot check"
+    );
+    assert!(replaced_file.exists());
+
+    // Overwrite file in-place with same size
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&inplace_file)
+            .unwrap();
+        f.write_all(&[b'D'; 64]).unwrap();
+        f.flush().unwrap();
+    }
+    let inplace_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("inplace.bin"))
+        .unwrap();
+    assert!(
+        execute_plan_item_with_roots(
+            &plan,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256: plan.plan_sha256.clone(),
+                item_id: inplace_item.id.clone(),
+            },
+            &ctx,
+            std::slice::from_ref(&trash_dir),
+        )
+        .is_err(),
+        "same-size in-place overwrite must fail snapshot check"
+    );
+    assert!(inplace_file.exists());
+
+    // Re-commit and push drifting_orphan (still clean & pushed, but HEAD/tree changed)
+    fs::write(drifting_orphan.join("README.md"), "world\n").unwrap();
+    run_git(&drifting_orphan, &["add", "README.md"]);
+    run_git(&drifting_orphan, &["commit", "-m", "second"]);
+    run_git(&drifting_orphan, &["push", "origin", "HEAD"]);
+
+    let orphan_item = plan
+        .items
+        .iter()
+        .find(|i| i.path.ends_with("drifting_orphan"))
+        .unwrap();
+    assert!(
+        execute_plan_item_with_roots(
+            &plan,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256: plan.plan_sha256.clone(),
+                item_id: orphan_item.id.clone(),
+            },
+            &ctx,
+            std::slice::from_ref(&trash_dir),
+        )
+        .is_err(),
+        "re-committed orphan_worktree must fail snapshot check"
+    );
+    assert!(drifting_orphan.exists());
+}

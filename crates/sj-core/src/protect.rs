@@ -396,6 +396,12 @@ pub fn check_dir_descendants_safe(
         let Ok(entry) = entry_res else {
             return ProtectionVerdict::deny("unreadable_descendant");
         };
+        if entry.read_children_error.is_some() {
+            return ProtectionVerdict::deny(format!(
+                "unreadable_directory:{}",
+                entry.path().display()
+            ));
+        }
         if entry.depth == 0 {
             continue;
         }

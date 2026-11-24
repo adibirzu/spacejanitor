@@ -2,7 +2,9 @@ use crate::protect::{check_path_protection, ProtectionContext};
 use crate::{SjError, SCHEMA_STORAGE_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::BTreeMap;
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 

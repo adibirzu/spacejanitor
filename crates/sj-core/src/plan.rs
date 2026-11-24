@@ -1,7 +1,6 @@
-use crate::orphans::{inspect_orphans, verify_orphan_safe_to_remove, OrphanOptions};
-use crate::protect::{
-    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
-};
+use crate::orphans::{inspect_orphans, OrphanOptions};
+use crate::protect::ProtectionContext;
+use crate::safe_remove::{capture_target_snapshot, safe_remove_plan_item};
 use crate::trash::{default_trash_paths, discover_trash_at};
 use crate::{SjError, SCHEMA_PROPOSAL_V1};
 use serde::Serialize;
@@ -28,6 +27,20 @@ impl Default for PlanOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct TargetSnapshot {
+    pub entry_type: String,
+    pub dev: Option<u64>,
+    pub ino: Option<u64>,
+    pub size: u64,
+    pub mtime_secs: Option<i64>,
+    pub mtime_nanos: Option<u32>,
+    pub content_or_tree_sha256: String,
+    pub git_head: Option<String>,
+    pub git_tree: Option<String>,
+    pub git_refs_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PlanItem {
     pub id: String,
     pub kind: String,
@@ -35,6 +48,7 @@ pub struct PlanItem {
     pub bytes: u64,
     pub tier: String,
     pub safety_reasons: Vec<String>,
+    pub snapshot: TargetSnapshot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -100,6 +114,7 @@ pub fn build_remediation_plan(
         for tp in trash_paths {
             let report = discover_trash_at(&tp, ctx)?;
             for item in report.items {
+                let snapshot = capture_target_snapshot(Path::new(&item.path), false, ctx)?;
                 items.push(PlanItem {
                     id: deterministic_item_id("trash_item", &item.path),
                     kind: "trash_item".to_string(),
@@ -107,6 +122,7 @@ pub fn build_remediation_plan(
                     bytes: item.bytes,
                     tier: "tier1".to_string(),
                     safety_reasons: vec!["os_trash_item".to_string(), "not_protected".to_string()],
+                    snapshot,
                 });
             }
             for prot in report.protected_items {
@@ -127,6 +143,7 @@ pub fn build_remediation_plan(
             },
         )?;
         for cand in report.safe_to_prune {
+            let snapshot = capture_target_snapshot(Path::new(&cand.path), true, ctx)?;
             items.push(PlanItem {
                 id: deterministic_item_id("orphan_worktree", &cand.path),
                 kind: "orphan_worktree".to_string(),
@@ -138,6 +155,7 @@ pub fn build_remediation_plan(
                     "all_branches_pushed".to_string(),
                     "not_protected".to_string(),
                 ],
+                snapshot,
             });
         }
         for blk in report.blocked {
@@ -220,67 +238,7 @@ pub fn execute_plan_item_with_roots(
             ))
         })?;
 
-    let target = Path::new(&item.path);
-    let prot = check_path_protection(target, ctx);
-    if prot.protected {
-        return Err(SjError::ProtectedPath(prot.reason));
-    }
-
-    let meta = std::fs::symlink_metadata(target)?;
-    if meta.file_type().is_symlink() || is_symlink_path(target)? {
-        return Err(SjError::ProtectedPath(format!(
-            "refusing symlink target: {}",
-            target.display()
-        )));
-    }
-
-    match item.kind.as_str() {
-        "trash_item" => {
-            let canon_target = std::fs::canonicalize(target)?;
-            let in_allowed_root = allowed_trash_roots.iter().any(|root| {
-                if !root.exists() || is_symlink_path(root).unwrap_or(true) {
-                    return false;
-                }
-                std::fs::canonicalize(root)
-                    .map(|canon_root| {
-                        canon_target.starts_with(&canon_root) && canon_target != canon_root
-                    })
-                    .unwrap_or(false)
-            });
-            if !in_allowed_root {
-                return Err(SjError::ExecutionGate(format!(
-                    "refusing trash_item outside verified OS Trash roots: {}",
-                    target.display()
-                )));
-            }
-            if meta.is_dir() {
-                let desc = check_dir_descendants_safe(target, ctx, 100_000);
-                if desc.protected {
-                    return Err(SjError::ProtectedPath(desc.reason));
-                }
-            }
-        }
-        "orphan_worktree" => {
-            if !meta.is_dir() {
-                return Err(SjError::ExecutionGate(format!(
-                    "orphan_worktree target is not a directory: {}",
-                    target.display()
-                )));
-            }
-            verify_orphan_safe_to_remove(target, ctx)?;
-        }
-        other => {
-            return Err(SjError::ExecutionGate(format!(
-                "unsupported plan item kind: {other}"
-            )));
-        }
-    }
-
-    if meta.is_dir() {
-        std::fs::remove_dir_all(target)?;
-    } else {
-        std::fs::remove_file(target)?;
-    }
+    safe_remove_plan_item(&item, ctx, allowed_trash_roots)?;
 
     Ok(item)
 }
