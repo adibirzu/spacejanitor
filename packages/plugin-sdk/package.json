@@ -1,0 +1,14 @@
+{
+  "name": "@spacejanitor/plugin-sdk",
+  "version": "0.1.0",
+  "description": "Declarative plugin SDK for SpaceJanitor rule packs, OS collectors, desktop widgets, and exporters.",
+  "license": "MIT",
+  "type": "module",
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  }
+}

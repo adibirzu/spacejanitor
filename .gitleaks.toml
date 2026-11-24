@@ -1,0 +1,10 @@
+title = "SpaceJanitor OSS Secret Scan Configuration"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Ignore test fixtures using synthetic RFC 5737 / placeholder tokens"
+paths = [
+  '''^packages/core/test/.*''',
+]

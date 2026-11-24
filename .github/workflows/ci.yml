@@ -1,0 +1,55 @@
+name: SpaceJanitor CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  oss-hygiene-and-secrets:
+    name: OSS Hygiene & Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run SpaceJanitor OSS hygiene gate
+        run: node scripts/check-oss-hygiene.mjs
+      - name: Run gitleaks
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  cross-platform-tests:
+    name: Test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest       # Linux x86_64
+          - ubuntu-24.04-arm    # Linux ARM64
+          - macos-15            # macOS Apple Silicon (ARM64)
+          - windows-latest      # Windows x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Run unit tests
+        run: npm test
+      - name: Verify CLI doctor
+        run: node packages/cli/bin/spacejanitor.mjs doctor --json
+
+  # Desktop release build matrix (enabled once ADR-001 shell scaffold lands):
+  #   - macOS Universal (arm64 + x86_64) on macos-15
+  #   - Linux x86_64 (.AppImage / .deb) on ubuntu-latest
+  #   - Linux ARM64 (.AppImage / .deb) on ubuntu-24.04-arm
+  #   - Windows x86_64 (.msi / .exe) on windows-latest
+  #   - Windows ARM64 (.msi / .exe) on windows-11-arm (or native MSVC cross-target)

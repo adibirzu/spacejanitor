@@ -1,0 +1,20 @@
+{
+  "name": "spacejanitor",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cross-platform workstation janitor for storage, orphan work, trash, true memory footprint, and OS-blocker forensics.",
+  "license": "MIT",
+  "type": "module",
+  "workspaces": [
+    "packages/*",
+    "apps/*"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "test": "node --test packages/*/test/*.test.mjs",
+    "hygiene": "node scripts/check-oss-hygiene.mjs",
+    "doctor": "node packages/cli/bin/spacejanitor.mjs doctor --json"
+  }
+}

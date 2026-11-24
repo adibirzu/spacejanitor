@@ -1,0 +1,22 @@
+# Dependencies & build outputs
+node_modules/
+dist/
+build/
+out/
+target/
+coverage/
+
+# Environment & local state
+.env
+.env.*
+!.env.example
+local/
+*.local.*
+
+# Logs & OS junk
+*.log
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo

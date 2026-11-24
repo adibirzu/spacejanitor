@@ -1,0 +1,14 @@
+{
+  "name": "spacejanitor-axi",
+  "version": "0.1.0",
+  "description": "AXI CLI and agent skill for cross-platform storage, orphan work, trash, true memory footprint, and OS-blocker diagnostics.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "spacejanitor": "./bin/spacejanitor.mjs",
+    "spacejanitor-axi": "./bin/spacejanitor.mjs"
+  },
+  "dependencies": {
+    "@spacejanitor/core": "0.1.0"
+  }
+}
