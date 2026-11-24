@@ -1,5 +1,7 @@
-use crate::orphans::{inspect_orphans, OrphanOptions};
-use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
+use crate::orphans::{inspect_orphans, verify_orphan_safe_to_remove, OrphanOptions};
+use crate::protect::{
+    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
+};
 use crate::trash::{default_trash_paths, discover_trash_at};
 use crate::{SjError, SCHEMA_PROPOSAL_V1};
 use serde::Serialize;
@@ -175,6 +177,16 @@ pub fn execute_plan_item(
     gate: &ExecutionGate,
     ctx: &ProtectionContext,
 ) -> Result<PlanItem, SjError> {
+    let allowed = default_trash_paths(&ctx.home_dir);
+    execute_plan_item_with_roots(plan, gate, ctx, &allowed)
+}
+
+pub fn execute_plan_item_with_roots(
+    plan: &RemediationPlan,
+    gate: &ExecutionGate,
+    ctx: &ProtectionContext,
+    allowed_trash_roots: &[PathBuf],
+) -> Result<PlanItem, SjError> {
     if !gate.execute {
         return Err(SjError::ExecutionGate(
             "missing --execute flag (dry-run is default)".to_string(),
@@ -220,6 +232,48 @@ pub fn execute_plan_item(
             "refusing symlink target: {}",
             target.display()
         )));
+    }
+
+    match item.kind.as_str() {
+        "trash_item" => {
+            let canon_target = std::fs::canonicalize(target)?;
+            let in_allowed_root = allowed_trash_roots.iter().any(|root| {
+                if !root.exists() || is_symlink_path(root).unwrap_or(true) {
+                    return false;
+                }
+                std::fs::canonicalize(root)
+                    .map(|canon_root| {
+                        canon_target.starts_with(&canon_root) && canon_target != canon_root
+                    })
+                    .unwrap_or(false)
+            });
+            if !in_allowed_root {
+                return Err(SjError::ExecutionGate(format!(
+                    "refusing trash_item outside verified OS Trash roots: {}",
+                    target.display()
+                )));
+            }
+            if meta.is_dir() {
+                let desc = check_dir_descendants_safe(target, ctx, 100_000);
+                if desc.protected {
+                    return Err(SjError::ProtectedPath(desc.reason));
+                }
+            }
+        }
+        "orphan_worktree" => {
+            if !meta.is_dir() {
+                return Err(SjError::ExecutionGate(format!(
+                    "orphan_worktree target is not a directory: {}",
+                    target.display()
+                )));
+            }
+            verify_orphan_safe_to_remove(target, ctx)?;
+        }
+        other => {
+            return Err(SjError::ExecutionGate(format!(
+                "unsupported plan item kind: {other}"
+            )));
+        }
     }
 
     if meta.is_dir() {

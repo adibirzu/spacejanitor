@@ -99,12 +99,28 @@ pub fn scan_directory(
     ctx: &ProtectionContext,
     opts: &ScanOptions,
 ) -> Result<ScanReport, SjError> {
+    if opts.max_depth == 0 {
+        return Err(SjError::ExecutionGate("max_depth must be >= 1".to_string()));
+    }
+
     let root_meta = std::fs::symlink_metadata(root)?;
     if root_meta.file_type().is_symlink() {
         return Err(SjError::ProtectedPath(format!(
             "refusing symlink scan root: {}",
             root.display()
         )));
+    }
+
+    let root_canon = std::fs::canonicalize(root)?;
+    let home_canon = std::fs::canonicalize(&ctx.home_dir).ok();
+    let is_home_root = home_canon
+        .as_ref()
+        .is_some_and(|hc| *hc == root_canon && hc != Path::new("/"));
+    if !is_home_root {
+        let verdict = check_path_protection(root, ctx);
+        if verdict.protected {
+            return Err(SjError::ProtectedPath(verdict.reason));
+        }
     }
 
     #[cfg(unix)]
@@ -125,7 +141,7 @@ pub fn scan_directory(
     let walker = WalkDir::new(root)
         .follow_links(false)
         .skip_hidden(false)
-        .max_depth(opts.max_depth.max(1))
+        .max_depth(opts.max_depth)
         .process_read_dir(move |depth, _path, _read_dir_state, children| {
             if depth.is_none() {
                 return;

@@ -5,12 +5,12 @@ use sj_core::{
     protect::ProtectionContext,
     scan::{scan_directory, ScanOptions},
     trash::{default_trash_paths, discover_trash_at},
-    SCHEMA_BLOCKERS_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_STORAGE_V1,
-    SCHEMA_TRASH_V1,
+    SjError, SCHEMA_BLOCKERS_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1,
+    SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
 };
 use std::env;
 use std::path::PathBuf;
-use std::process::ExitCode;
+use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
 #[command(name = "sj", version, about = "SpaceJanitor Rust Core CLI")]
@@ -101,28 +101,91 @@ enum Commands {
     },
 }
 
-fn print_doctor(json_mode: bool) {
-    let os = env::consts::OS;
-    let arch = env::consts::ARCH;
-    let version = env!("CARGO_PKG_VERSION");
-    if json_mode {
-        println!(
-            "{{\"schema\":\"spacejanitor.doctor.v1\",\"engine\":\"rust\",\"version\":\"{version}\",\"os\":\"{os}\",\"arch\":\"{arch}\",\"schemas\":[\"{SCHEMA_STORAGE_V1}\",\"{SCHEMA_TRASH_V1}\",\"{SCHEMA_MEMORY_V1}\",\"{SCHEMA_BLOCKERS_V1}\",\"{SCHEMA_ORPHANS_V1}\",\"{SCHEMA_PROPOSAL_V1}\"],\"ready\":true}}"
-        );
-    } else {
-        println!("sj (Rust core) v{version} — {os}/{arch}");
-        println!("schemas: {SCHEMA_STORAGE_V1}, {SCHEMA_TRASH_V1}, {SCHEMA_MEMORY_V1}, {SCHEMA_BLOCKERS_V1}, {SCHEMA_ORPHANS_V1}, {SCHEMA_PROPOSAL_V1}");
-        println!("status: READY");
+enum CliError {
+    Sj(SjError),
+    Usage(String),
+}
+
+impl From<SjError> for CliError {
+    fn from(err: SjError) -> Self {
+        Self::Sj(err)
     }
 }
 
-fn run() -> Result<(), String> {
+fn print_doctor(json_mode: bool) -> Result<(), CliError> {
+    let git_probe = Command::new("git").arg("--version").output();
+    let (git_available, git_version) = match git_probe {
+        Ok(out) if out.status.success() => (
+            true,
+            Some(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        ),
+        _ => (false, None),
+    };
+
+    let home_dir_resolved = env::var_os("HOME")
+        .or_else(|| env::var_os("USERPROFILE"))
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+        .is_some_and(|p| p.is_dir());
+
+    let ready = git_available && home_dir_resolved;
+    let version = env!("CARGO_PKG_VERSION");
+    let os = env::consts::OS;
+    let arch = env::consts::ARCH;
+    let schemas = vec![
+        SCHEMA_STORAGE_V1,
+        SCHEMA_TRASH_V1,
+        SCHEMA_MEMORY_V1,
+        SCHEMA_BLOCKERS_V1,
+        SCHEMA_ORPHANS_V1,
+        SCHEMA_PROPOSAL_V1,
+    ];
+
+    if json_mode {
+        let report = serde_json::json!({
+            "schema": "spacejanitor.doctor.v1",
+            "engine": "rust",
+            "version": version,
+            "os": os,
+            "arch": arch,
+            "schemas": schemas,
+            "git_available": git_available,
+            "git_version": git_version,
+            "home_dir_resolved": home_dir_resolved,
+            "ready": ready,
+        });
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report).map_err(SjError::from)?
+        );
+    } else {
+        println!("sj (Rust core) v{version} — {os}/{arch}");
+        println!("schemas: {}", schemas.join(", "));
+        println!(
+            "git: {} ({})",
+            if git_available { "ok" } else { "missing" },
+            git_version.as_deref().unwrap_or("unavailable")
+        );
+        println!(
+            "home_dir: {}",
+            if home_dir_resolved {
+                "ok"
+            } else {
+                "unresolved"
+            }
+        );
+        println!("status: {}", if ready { "READY" } else { "NOT_READY" });
+    }
+    Ok(())
+}
+
+fn run() -> Result<(), CliError> {
     let cli = Cli::parse();
     let ctx = ProtectionContext::from_env();
 
     match cli.command {
         Commands::Doctor { json } => {
-            print_doctor(json);
+            print_doctor(json)?;
         }
         Commands::Scan {
             path,
@@ -137,11 +200,11 @@ fn run() -> Result<(), String> {
                 same_filesystem: same_fs,
                 ..Default::default()
             };
-            let report = scan_directory(&path, &ctx, &opts).map_err(|e| e.to_string())?;
+            let report = scan_directory(&path, &ctx, &opts)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
                 );
             } else {
                 println!(
@@ -159,13 +222,15 @@ fn run() -> Result<(), String> {
                 None => default_trash_paths(&ctx.home_dir)
                     .into_iter()
                     .next()
-                    .ok_or_else(|| "no default trash path for platform".to_string())?,
+                    .ok_or_else(|| {
+                        CliError::Usage("no default trash path for platform".to_string())
+                    })?,
             };
-            let report = discover_trash_at(&target, &ctx).map_err(|e| e.to_string())?;
+            let report = discover_trash_at(&target, &ctx)?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
                 );
             } else {
                 println!(
@@ -180,12 +245,11 @@ fn run() -> Result<(), String> {
             }
         }
         Commands::Orphans { path, depth, json } => {
-            let report = inspect_orphans(&path, &ctx, &OrphanOptions { max_depth: depth })
-                .map_err(|e| e.to_string())?;
+            let report = inspect_orphans(&path, &ctx, &OrphanOptions { max_depth: depth })?;
             if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&report).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
                 );
             } else {
                 println!(
@@ -215,6 +279,11 @@ fn run() -> Result<(), String> {
             item,
             json,
         } => {
+            if execute && trash_path.is_some() {
+                return Err(CliError::Usage(
+                    "cannot combine --trash-path with --execute; execution is restricted to verified OS Trash roots".to_string(),
+                ));
+            }
             let (inc_trash, inc_orphans) = if !include_trash && !include_orphans {
                 (true, true)
             } else {
@@ -226,7 +295,7 @@ fn run() -> Result<(), String> {
                 trash_path_override: trash_path,
                 orphan_max_depth: depth,
             };
-            let plan = build_remediation_plan(&path, &ctx, &opts).map_err(|e| e.to_string())?;
+            let plan = build_remediation_plan(&path, &ctx, &opts)?;
             if execute {
                 let gate = ExecutionGate {
                     execute,
@@ -234,7 +303,7 @@ fn run() -> Result<(), String> {
                     plan_sha256: plan_sha256.unwrap_or_default(),
                     item_id: item.unwrap_or_default(),
                 };
-                let removed = execute_plan_item(&plan, &gate, &ctx).map_err(|e| e.to_string())?;
+                let removed = execute_plan_item(&plan, &gate, &ctx)?;
                 if json {
                     println!(
                         "{}",
@@ -245,7 +314,7 @@ fn run() -> Result<(), String> {
                             "plan_sha256": plan.plan_sha256,
                             "executed_item": removed,
                         }))
-                        .map_err(|e| e.to_string())?
+                        .map_err(SjError::from)?
                     );
                 } else {
                     println!("executed: {} ({})", removed.id, removed.path);
@@ -253,7 +322,7 @@ fn run() -> Result<(), String> {
             } else if json {
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&plan).map_err(|e| e.to_string())?
+                    serde_json::to_string_pretty(&plan).map_err(SjError::from)?
                 );
             } else {
                 println!(
@@ -278,7 +347,11 @@ fn run() -> Result<(), String> {
 fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
-        Err(err) => {
+        Err(CliError::Sj(SjError::ExecutionGate(msg))) | Err(CliError::Usage(msg)) => {
+            eprintln!("error: {msg}");
+            ExitCode::from(2)
+        }
+        Err(CliError::Sj(err)) => {
             eprintln!("error: {err}");
             ExitCode::from(1)
         }

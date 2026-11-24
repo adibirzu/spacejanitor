@@ -11,6 +11,8 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "/sbin",
     "/etc",
     "/Library",
+    "/private/etc",
+    "/private/var/db",
     "/Windows",
     "C:/Windows",
 ];
@@ -76,16 +78,75 @@ fn normalize_separators(raw: &str) -> String {
     }
 }
 
+fn normalize_lexical(raw: &str) -> String {
+    let norm = normalize_separators(raw);
+    if norm.is_empty() {
+        return String::new();
+    }
+
+    let bytes = norm.as_bytes();
+    let has_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let (prefix, is_abs, rest) = if has_drive {
+        let drive = &norm[..2];
+        let after = &norm[2..];
+        let abs = after.starts_with('/');
+        (Some(drive), abs, after.trim_start_matches('/'))
+    } else if let Some(after) = norm.strip_prefix('/') {
+        (None, true, after)
+    } else {
+        (None, false, norm.as_str())
+    };
+
+    let mut stack: Vec<&str> = Vec::new();
+    for seg in rest.split('/') {
+        if seg.is_empty() || seg == "." {
+            continue;
+        }
+        if seg == ".." {
+            if let Some(&last) = stack.last() {
+                if last != ".." {
+                    stack.pop();
+                    continue;
+                }
+            }
+            if !is_abs {
+                stack.push("..");
+            }
+        } else {
+            stack.push(seg);
+        }
+    }
+
+    match (prefix, is_abs) {
+        (Some(d), true) => {
+            if stack.is_empty() {
+                format!("{d}/")
+            } else {
+                format!("{d}/{}", stack.join("/"))
+            }
+        }
+        (Some(d), false) => {
+            if stack.is_empty() {
+                d.to_string()
+            } else {
+                format!("{d}/{}", stack.join("/"))
+            }
+        }
+        (None, true) => format!("/{}", stack.join("/")),
+        (None, false) => stack.join("/"),
+    }
+}
+
 fn expand_home(raw: &str, home_dir: &str) -> String {
-    let home = normalize_separators(home_dir);
+    let home = normalize_lexical(home_dir);
     let norm = normalize_separators(raw);
     if norm == "~" {
         return home;
     }
     if let Some(rest) = norm.strip_prefix("~/") {
-        return format!("{home}/{rest}");
+        return normalize_lexical(&format!("{home}/{rest}"));
     }
-    norm
+    normalize_lexical(&norm)
 }
 
 fn is_protected_filename(name: &str) -> Option<String> {
@@ -118,45 +179,67 @@ pub fn is_protected_path(
     home_dir: &str,
     exact_paths: &[&str],
 ) -> ProtectionVerdict {
-    let home_norm = normalize_separators(home_dir);
-    let cand = expand_home(candidate, &home_norm);
+    let home_norm = normalize_lexical(home_dir);
+    let mut cand = expand_home(candidate, &home_norm);
     if cand.is_empty() {
         return ProtectionVerdict::deny("empty_path");
+    }
+
+    // macOS APFS Data volume mounts under /System/Volumes/Data/...; strip prefix and
+    // re-evaluate remainder against system roots and all other protection rules.
+    loop {
+        let low = cand.to_ascii_lowercase();
+        if low == "/system/volumes/data" {
+            cand = "/".to_string();
+        } else if low.starts_with("/system/volumes/data/") {
+            cand = cand["/system/volumes/data".len()..].to_string();
+        } else {
+            break;
+        }
     }
 
     if cand == "/" || (!home_norm.is_empty() && cand == home_norm) {
         return ProtectionVerdict::deny("protected_root");
     }
 
+    let cand_low = cand.to_ascii_lowercase();
+
     for sys_root in PROTECTED_SYSTEM_ROOTS {
-        let root_norm = normalize_separators(sys_root);
+        let root_norm = normalize_lexical(sys_root);
         let root_low = root_norm.to_ascii_lowercase();
-        let cand_low = cand.to_ascii_lowercase();
         if cand_low == root_low || cand_low.starts_with(&format!("{root_low}/")) {
-            // macOS APFS Data volume mounts user data under /System/Volumes/Data/...
-            if root_low == "/system" && cand_low.starts_with("/system/volumes/data/") {
-                continue;
-            }
             return ProtectionVerdict::deny(format!("protected_system:{sys_root}"));
         }
     }
 
     if !home_norm.is_empty() && home_norm != "/" {
+        let home_low = home_norm.to_ascii_lowercase();
         for sub in PROTECTED_HOME_SUBPATHS {
-            let full = format!("{home_norm}/{sub}");
-            if cand == full || cand.starts_with(&format!("{full}/")) {
+            let full_low = format!("{home_low}/{sub}").to_ascii_lowercase();
+            if cand_low == full_low || cand_low.starts_with(&format!("{full_low}/")) {
                 return ProtectionVerdict::deny(format!("protected_credential_store:~/{sub}"));
             }
         }
     }
 
-    // Also protect any path segment matching credential store directories (e.g. inside a scanned root)
+    // Also protect any path segment matching credential store directories (case-insensitive)
+    let mut prev_seg_low: Option<String> = None;
     for component in Path::new(&cand).components() {
         if let Component::Normal(os_str) = component {
             if let Some(seg) = os_str.to_str() {
-                if matches!(seg, ".ssh" | ".gnupg" | ".aws" | ".kube" | ".claude") {
+                let seg_low = seg.to_ascii_lowercase();
+                if matches!(
+                    seg_low.as_str(),
+                    ".ssh" | ".gnupg" | ".aws" | ".kube" | ".claude"
+                ) {
                     return ProtectionVerdict::deny(format!("protected_credential_dir:{seg}"));
                 }
+                if prev_seg_low.as_deref() == Some(".config") && seg_low == "gh" {
+                    return ProtectionVerdict::deny("protected_credential_dir:.config/gh");
+                }
+                prev_seg_low = Some(seg_low);
+            } else {
+                prev_seg_low = None;
             }
         }
     }
@@ -194,17 +277,35 @@ pub fn check_path_protection(candidate: &Path, ctx: &ProtectionContext) -> Prote
         .collect();
     let exact_refs: Vec<&str> = exact_strs.iter().map(String::as_str).collect();
 
-    let cand_str = candidate.to_string_lossy();
+    let raw_str = candidate.to_string_lossy();
+    let trimmed = raw_str.trim();
+    let bytes = trimmed.as_bytes();
+    let is_windows_drive = bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':';
+    let resolved_candidate =
+        if trimmed == "~" || trimmed.starts_with("~/") || trimmed.starts_with("~\\") {
+            PathBuf::from(expand_home(trimmed, &home_str))
+        } else if is_windows_drive {
+            candidate.to_path_buf()
+        } else if candidate.is_relative() {
+            match std::env::current_dir() {
+                Ok(cwd) => cwd.join(candidate),
+                Err(_) => return ProtectionVerdict::deny("unresolvable_current_dir"),
+            }
+        } else {
+            candidate.to_path_buf()
+        };
+
+    let cand_str = resolved_candidate.to_string_lossy();
     let lexical = is_protected_path(&cand_str, &home_str, &exact_refs);
     if lexical.protected {
         return lexical;
     }
 
-    // Walk ancestors from candidate up to root
+    // Walk ancestors from resolved_candidate up to root
     let mut deepest_existing: Option<(PathBuf, Vec<std::ffi::OsString>)> = None;
     let mut trailing: Vec<std::ffi::OsString> = Vec::new();
 
-    for anc in candidate.ancestors() {
+    for anc in resolved_candidate.ancestors() {
         if anc.as_os_str().is_empty() {
             continue;
         }
@@ -278,4 +379,40 @@ pub fn check_path_protection(candidate: &Path, ctx: &ProtectionContext) -> Prote
 pub fn is_symlink_path(path: &Path) -> Result<bool, std::io::Error> {
     let meta = std::fs::symlink_metadata(path)?;
     Ok(meta.file_type().is_symlink())
+}
+
+/// Bounded recursive non-following check ensuring no descendant inside `dir` is protected,
+/// a symlink, or unreadable. Fails closed on any error or when `max_entries` is exceeded.
+pub fn check_dir_descendants_safe(
+    dir: &Path,
+    ctx: &ProtectionContext,
+    max_entries: usize,
+) -> ProtectionVerdict {
+    let mut seen: usize = 0;
+    for entry_res in jwalk::WalkDir::new(dir)
+        .follow_links(false)
+        .skip_hidden(false)
+    {
+        let Ok(entry) = entry_res else {
+            return ProtectionVerdict::deny("unreadable_descendant");
+        };
+        if entry.depth == 0 {
+            continue;
+        }
+        seen += 1;
+        if seen > max_entries {
+            return ProtectionVerdict::deny("descendant_check_limit_exceeded");
+        }
+        if entry.file_type().is_symlink() {
+            return ProtectionVerdict::deny(format!(
+                "symlink_descendant:{}",
+                entry.path().display()
+            ));
+        }
+        let v = check_path_protection(&entry.path(), ctx);
+        if v.protected {
+            return ProtectionVerdict::deny(format!("protected_descendant:{}", v.reason));
+        }
+    }
+    ProtectionVerdict::safe()
 }

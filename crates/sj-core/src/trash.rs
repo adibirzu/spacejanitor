@@ -1,4 +1,6 @@
-use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
+use crate::protect::{
+    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
+};
 use crate::{SjError, SCHEMA_TRASH_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
@@ -123,11 +125,20 @@ pub fn discover_trash_at(
         total_bytes = total_bytes.saturating_add(bytes);
 
         let verdict = check_path_protection(&path, ctx);
-        if is_sym || verdict.protected {
+        let desc_verdict = if !is_sym && !verdict.protected && meta.is_dir() {
+            Some(check_dir_descendants_safe(&path, ctx, 100_000))
+        } else {
+            None
+        };
+        if is_sym || verdict.protected || desc_verdict.as_ref().is_some_and(|v| v.protected) {
             let reason = if is_sym {
                 "symlink_in_trash".to_string()
-            } else {
+            } else if verdict.protected {
                 verdict.reason
+            } else {
+                desc_verdict
+                    .map(|v| v.reason)
+                    .unwrap_or_else(|| "protected_descendant".to_string())
             };
             protected_items.push(TrashItem {
                 path: path.to_string_lossy().into_owned(),

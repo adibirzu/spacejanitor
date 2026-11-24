@@ -83,7 +83,7 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
     assert_eq!(plan_json["mutated"], false);
     assert!(trash_dir.join("cache.tar").exists());
 
-    // plan --execute without confirmation must fail and not mutate
+    // plan --execute without confirmation must fail with exit code 2 and not mutate
     let exec_fail = Command::new(sj_bin())
         .args([
             "plan",
@@ -95,6 +95,39 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
         ])
         .output()
         .unwrap();
-    assert_ne!(exec_fail.status.code(), Some(0));
+    assert_eq!(exec_fail.status.code(), Some(2));
     assert!(trash_dir.join("cache.tar").exists());
+
+    // plan --trash-path <arbitrary> --execute --confirm must fail with exit code 2 and not mutate
+    let plan_id = plan_json["items"][0]["id"].as_str().unwrap();
+    let plan_sha = plan_json["plan_sha256"].as_str().unwrap();
+    let exec_arbitrary = Command::new(sj_bin())
+        .args([
+            "plan",
+            root.to_str().unwrap(),
+            "--include-trash",
+            "--trash-path",
+            trash_dir.to_str().unwrap(),
+            "--execute",
+            "--confirm",
+            "--plan-sha256",
+            plan_sha,
+            "--item",
+            plan_id,
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(exec_arbitrary.status.code(), Some(2));
+    assert!(trash_dir.join("cache.tar").exists());
+
+    // scan --depth 0 must fail with exit code 2
+    let scan_zero = Command::new(sj_bin())
+        .args(["scan", root.to_str().unwrap(), "--depth", "0"])
+        .output()
+        .unwrap();
+    assert_eq!(scan_zero.status.code(), Some(2));
+
+    // doctor --json includes real probe fields
+    assert!(doc_json.get("git_available").is_some());
+    assert!(doc_json.get("home_dir_resolved").is_some());
 }

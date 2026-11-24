@@ -1,8 +1,11 @@
-use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
+use crate::protect::{
+    check_dir_descendants_safe, check_path_protection, is_symlink_path, ProtectionContext,
+};
 use crate::{SjError, SCHEMA_ORPHANS_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
 use std::collections::BTreeSet;
+use std::io::ErrorKind;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
@@ -52,6 +55,41 @@ fn run_git(repo: &Path, args: &[&str]) -> Result<(bool, String), SjError> {
     Ok((out.status.success(), stdout))
 }
 
+fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), String> {
+    let commondir_file = gitdir.join("commondir");
+    match std::fs::symlink_metadata(&commondir_file) {
+        Err(e) if e.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err("unreadable_commondir_metadata".to_string()),
+        Ok(meta) => {
+            if meta.file_type().is_symlink() {
+                return Err("symlink_commondir_file".to_string());
+            }
+        }
+    }
+    let common_raw =
+        std::fs::read_to_string(&commondir_file).map_err(|_| "unreadable_commondir".to_string())?;
+    let common_trimmed = common_raw.trim();
+    if common_trimmed.is_empty() {
+        return Err("empty_commondir".to_string());
+    }
+    let common_path = {
+        let p = PathBuf::from(common_trimmed);
+        if p.is_absolute() {
+            p
+        } else {
+            gitdir.join(p)
+        }
+    };
+    if is_symlink_path(&common_path).unwrap_or(true) {
+        return Err("symlink_or_missing_commondir".to_string());
+    }
+    let common_verdict = check_path_protection(&common_path, ctx);
+    if common_verdict.protected {
+        return Err(format!("protected_commondir:{}", common_verdict.reason));
+    }
+    Ok(())
+}
+
 fn validate_gitdir_pointer(
     worktree: &Path,
     dot_git_file: &Path,
@@ -83,30 +121,7 @@ fn validate_gitdir_pointer(
         return Err(format!("protected_gitdir:{}", verdict.reason));
     }
 
-    let commondir_file = target.join("commondir");
-    if commondir_file.exists() {
-        if is_symlink_path(&commondir_file).unwrap_or(true) {
-            return Err("symlink_commondir_file".to_string());
-        }
-        let common_raw = std::fs::read_to_string(&commondir_file)
-            .map_err(|_| "unreadable_commondir".to_string())?;
-        let common_trimmed = common_raw.trim();
-        let common_path = {
-            let p = PathBuf::from(common_trimmed);
-            if p.is_absolute() {
-                p
-            } else {
-                target.join(p)
-            }
-        };
-        if is_symlink_path(&common_path).unwrap_or(true) {
-            return Err("symlink_or_missing_commondir".to_string());
-        }
-        let common_verdict = check_path_protection(&common_path, ctx);
-        if common_verdict.protected {
-            return Err(format!("protected_commondir:{}", common_verdict.reason));
-        }
-    }
+    validate_commondir(&target, ctx)?;
 
     Ok(())
 }
@@ -156,6 +171,11 @@ fn validate_single_repo(
     let is_worktree = dot_git_meta.is_file();
     if is_worktree {
         if let Err(reason) = validate_gitdir_pointer(repo, &dot_git, ctx) {
+            reasons.push(reason);
+            return Err(reasons);
+        }
+    } else if dot_git_meta.is_dir() {
+        if let Err(reason) = validate_commondir(&dot_git, ctx) {
             reasons.push(reason);
             return Err(reasons);
         }
@@ -211,6 +231,61 @@ fn validate_single_repo(
         reasons.push("unpushed_commits".to_string());
     }
 
+    let mut remote_verified = false;
+    if let Some(ref sym_ref) = branch {
+        let short_branch = sym_ref.strip_prefix("refs/heads/").unwrap_or(sym_ref);
+        let remote_cfg = run_git(
+            repo,
+            &["config", "--get", &format!("branch.{short_branch}.remote")],
+        )
+        .ok()
+        .filter(|(ok, out)| *ok && !out.is_empty())
+        .map(|(_, out)| out);
+        let merge_cfg = run_git(
+            repo,
+            &["config", "--get", &format!("branch.{short_branch}.merge")],
+        )
+        .ok()
+        .filter(|(ok, out)| *ok && !out.is_empty())
+        .map(|(_, out)| out);
+
+        let upstream_remote_and_ref = if let Some(rem) = remote_cfg {
+            let rref = merge_cfg.unwrap_or_else(|| format!("refs/heads/{short_branch}"));
+            Some((rem, rref))
+        } else if let Ok((true, upstream)) = run_git(
+            repo,
+            &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
+        ) {
+            upstream
+                .split_once('/')
+                .map(|(rem, br)| (rem.to_string(), format!("refs/heads/{br}")))
+        } else {
+            None
+        };
+
+        if let Some((remote_name, remote_ref)) = upstream_remote_and_ref {
+            if let Ok((true, ls_out)) = run_git(repo, &["ls-remote", &remote_name, &remote_ref]) {
+                let remote_sha = ls_out
+                    .lines()
+                    .next()
+                    .and_then(|l| l.split_whitespace().next());
+                if let Some(rsha) = remote_sha {
+                    if !head_before.is_empty()
+                        && (rsha == head_before
+                            || run_git(repo, &["merge-base", "--is-ancestor", &head_before, rsha])
+                                .map(|(ok, _)| ok)
+                                .unwrap_or(false))
+                    {
+                        remote_verified = true;
+                    }
+                }
+            }
+        }
+    }
+    if !remote_verified {
+        reasons.push("remote_unverified_or_unpushed".to_string());
+    }
+
     let (head_after_ok, head_after) =
         run_git(repo, &["rev-parse", "--verify", "HEAD"]).unwrap_or((false, String::new()));
     if head_ok && (!head_after_ok || head_after != head_before) {
@@ -243,11 +318,15 @@ pub fn inspect_orphans(
     }
 
     let mut candidates: BTreeSet<PathBuf> = BTreeSet::new();
+    let ctx_clone = ctx.clone();
     let walker = WalkDir::new(root)
         .follow_links(false)
         .skip_hidden(false)
         .max_depth(opts.max_depth.saturating_add(1))
-        .process_read_dir(|_depth, _path, _state, children| {
+        .process_read_dir(move |depth, _path, _state, children| {
+            if depth.is_none() {
+                return;
+            }
             children.retain(|res| {
                 let Ok(entry) = res else {
                     return false;
@@ -255,7 +334,10 @@ pub fn inspect_orphans(
                 if entry.file_name() == ".git" {
                     return false;
                 }
-                !entry.file_type().is_symlink()
+                if entry.file_type().is_symlink() {
+                    return false;
+                }
+                !check_path_protection(&entry.path(), &ctx_clone).protected
             });
         });
 
@@ -265,7 +347,7 @@ pub fn inspect_orphans(
         };
         if entry.file_type().is_dir() {
             let p = entry.path();
-            if p.join(".git").exists() {
+            if std::fs::symlink_metadata(p.join(".git")).is_ok() {
                 candidates.insert(p);
             }
         }
@@ -318,4 +400,29 @@ pub fn inspect_orphans(
         safe_to_prune,
         blocked,
     })
+}
+
+/// Fail-closed pre-removal verification for an orphan worktree/repo directory.
+pub fn verify_orphan_safe_to_remove(repo: &Path, ctx: &ProtectionContext) -> Result<(), SjError> {
+    let prot = check_path_protection(repo, ctx);
+    if prot.protected {
+        return Err(SjError::ProtectedPath(prot.reason));
+    }
+    if let Err(reasons) = validate_single_repo(repo, ctx) {
+        return Err(SjError::ExecutionGate(format!(
+            "orphan validation failed: {}",
+            reasons.join(",")
+        )));
+    }
+    let nested = inspect_orphans(repo, ctx, &OrphanOptions { max_depth: 5 })?;
+    if !nested.blocked.is_empty() {
+        return Err(SjError::ExecutionGate(
+            "orphan has unsafe nested repository".to_string(),
+        ));
+    }
+    let desc = check_dir_descendants_safe(repo, ctx, 100_000);
+    if desc.protected {
+        return Err(SjError::ProtectedPath(desc.reason));
+    }
+    Ok(())
 }

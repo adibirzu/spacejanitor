@@ -1,6 +1,9 @@
 use sj_core::{
     orphans::{inspect_orphans, OrphanOptions},
-    plan::{build_remediation_plan, execute_plan_item, ExecutionGate, PlanOptions},
+    plan::{
+        build_remediation_plan, execute_plan_item, execute_plan_item_with_roots, ExecutionGate,
+        PlanOptions,
+    },
     protect::{check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions, ScanStatus, ScanThresholds},
     trash::discover_trash_at,
@@ -400,7 +403,359 @@ fn remediation_plan_is_deterministic_dry_run_and_fail_closed() {
         plan_sha256: plan1.plan_sha256.clone(),
         item_id: plan1.items[0].id.clone(),
     };
-    execute_plan_item(&plan1, &good_gate, &ctx).unwrap();
+    execute_plan_item_with_roots(&plan1, &good_gate, &ctx, &[trash_dir]).unwrap();
     assert!(!stale_file.exists());
     assert!(protected_file.exists());
+}
+
+#[test]
+fn protect_normalizes_traversal_case_relative_and_system_volumes_data() {
+    let home = Path::new("/home/developer");
+    let ctx = ProtectionContext::new(home.to_path_buf(), vec![]);
+
+    // 1. Lexical . / .. normalization
+    assert!(
+        check_path_protection(Path::new("/tmp/safe/../.ssh/id_rsa"), &ctx).protected,
+        "traversal to .ssh/id_rsa must be protected"
+    );
+    assert!(
+        check_path_protection(Path::new("/home/developer/foo/../.env"), &ctx).protected,
+        "traversal to .env must be protected"
+    );
+    assert!(
+        check_path_protection(Path::new("/tmp/foo/../../etc/passwd"), &ctx).protected,
+        "traversal to /etc/passwd must be protected"
+    );
+
+    // 2. Case-insensitive protected segments
+    for p in [
+        "/home/developer/.SSH/id_rsa",
+        "/home/developer/.CLAUDE/settings.json",
+        "/home/developer/.CONFIG/GH/hosts.yml",
+        "/tmp/work/.AWS/credentials",
+    ] {
+        assert!(
+            check_path_protection(Path::new(p), &ctx).protected,
+            "case-insensitive path {p} must be protected"
+        );
+    }
+
+    // 3. Relative path resolution against current_dir
+    let tmp = tempdir().unwrap();
+    let work = tmp.path().join("rel_test");
+    fs::create_dir_all(&work).unwrap();
+    let prev_cwd = std::env::current_dir().unwrap();
+    std::env::set_current_dir(&work).unwrap();
+    let rel_verdict = check_path_protection(Path::new("sub/../.env"), &ctx);
+    std::env::set_current_dir(&prev_cwd).unwrap();
+    assert!(
+        rel_verdict.protected,
+        "relative traversal to .env must be protected"
+    );
+
+    // 4. /System/Volumes/Data prefix bypass
+    for sys_data in [
+        "/System/Volumes/Data/Library/Preferences",
+        "/System/Volumes/Data/private/etc/hosts",
+        "/System/Volumes/Data/private/var/db/something",
+        "/System/Volumes/Data/System/Library",
+    ] {
+        assert!(
+            check_path_protection(Path::new(sys_data), &ctx).protected,
+            "{sys_data} must stay protected"
+        );
+    }
+    assert!(
+        !check_path_protection(
+            Path::new("/System/Volumes/Data/Users/developer/.cache/npm"),
+            &ctx
+        )
+        .protected,
+        "user cache under /System/Volumes/Data should be allowed"
+    );
+}
+
+#[test]
+fn trash_and_plan_reject_directories_with_protected_descendants_or_symlinks() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = sj_core::trash::default_trash_paths(root)
+        .into_iter()
+        .next()
+        .unwrap();
+    fs::create_dir_all(&trash_dir).unwrap();
+
+    // Folder in Trash containing a .env file
+    let dir_with_env = trash_dir.join("old-backup");
+    fs::create_dir_all(dir_with_env.join("nested")).unwrap();
+    fs::write(dir_with_env.join("nested").join(".env"), "SECRET=1").unwrap();
+
+    // Folder in Trash containing a symlink
+    #[cfg(unix)]
+    let dir_with_sym = {
+        let d = trash_dir.join("sym-backup");
+        fs::create_dir_all(&d).unwrap();
+        std::os::unix::fs::symlink(root, d.join("escape")).unwrap();
+        d
+    };
+
+    // Clean folder in Trash
+    let clean_dir = trash_dir.join("clean-cache");
+    fs::create_dir_all(&clean_dir).unwrap();
+    fs::write(clean_dir.join("blob.bin"), vec![1u8; 64]).unwrap();
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = discover_trash_at(&trash_dir, &ctx).unwrap();
+
+    assert!(
+        report
+            .protected_items
+            .iter()
+            .any(|i| i.path.ends_with("old-backup")),
+        "dir containing .env must be marked protected: {:?}",
+        report
+    );
+    assert!(
+        !report.items.iter().any(|i| i.path.ends_with("old-backup")),
+        "dir containing .env must not be reclaimable"
+    );
+
+    #[cfg(unix)]
+    {
+        assert!(
+            report
+                .protected_items
+                .iter()
+                .any(|i| i.path.ends_with("sym-backup")),
+            "dir containing symlink must be marked protected"
+        );
+        let _ = dir_with_sym;
+    }
+
+    assert!(
+        report.items.iter().any(|i| i.path.ends_with("clean-cache")),
+        "clean dir should be reclaimable"
+    );
+}
+
+#[test]
+fn execute_plan_item_rejects_arbitrary_trash_path_outside_os_defaults() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let arbitrary_dir = root.join("not_os_trash");
+    fs::create_dir_all(&arbitrary_dir).unwrap();
+    let target = arbitrary_dir.join("important.tar");
+    fs::write(&target, vec![9u8; 128]).unwrap();
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let opts = PlanOptions {
+        include_trash: true,
+        include_orphans: false,
+        trash_path_override: Some(arbitrary_dir.clone()),
+        orphan_max_depth: 5,
+    };
+    let plan = build_remediation_plan(root, &ctx, &opts).unwrap();
+    assert_eq!(plan.items.len(), 1);
+
+    let gate = ExecutionGate {
+        execute: true,
+        confirm: true,
+        plan_sha256: plan.plan_sha256.clone(),
+        item_id: plan.items[0].id.clone(),
+    };
+    let res = execute_plan_item(&plan, &gate, &ctx);
+    assert!(
+        res.is_err(),
+        "execute_plan_item must refuse trash_item outside default OS trash roots"
+    );
+    assert!(target.exists(), "file outside OS trash must not be deleted");
+}
+
+#[test]
+fn execute_plan_item_revalidates_orphan_worktree_before_removal() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+
+    let clean_repo = workspace_dir.join("clean_wt");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "clean_wt"],
+    );
+    fs::write(clean_repo.join("README.md"), "hello\n").unwrap();
+    run_git(&clean_repo, &["add", "README.md"]);
+    run_git(&clean_repo, &["commit", "-m", "init"]);
+    run_git(&clean_repo, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let opts = PlanOptions {
+        include_trash: false,
+        include_orphans: true,
+        trash_path_override: None,
+        orphan_max_depth: 5,
+    };
+    let plan = build_remediation_plan(&workspace_dir, &ctx, &opts).unwrap();
+    assert_eq!(plan.items.len(), 1);
+
+    // Mutate repo after planning (dirty file) -> execute must fail closed!
+    fs::write(clean_repo.join("dirty.txt"), "unsaved\n").unwrap();
+    let gate = ExecutionGate {
+        execute: true,
+        confirm: true,
+        plan_sha256: plan.plan_sha256.clone(),
+        item_id: plan.items[0].id.clone(),
+    };
+    let res = execute_plan_item(&plan, &gate, &ctx);
+    assert!(
+        res.is_err(),
+        "execute_plan_item must re-validate orphan and refuse if dirtied after plan"
+    );
+    assert!(clean_repo.exists());
+}
+
+#[test]
+fn orphans_hardening_commondir_dangling_dotgit_protected_prune_and_remote_verify() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = home.join("workspaces");
+    let ssh_dir = home.join(".ssh");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&ssh_dir).unwrap();
+
+    // Put a fake .git repo inside .ssh to ensure orphan walker prunes .ssh
+    let ssh_repo = ssh_dir.join("secret_repo");
+    fs::create_dir_all(&ssh_repo).unwrap();
+    run_git(&ssh_repo, &["init"]);
+
+    // 1. Directory-form .git with commondir pointing to protected .ssh
+    let evil_commondir_repo = workspace_dir.join("evil_commondir");
+    fs::create_dir_all(&evil_commondir_repo).unwrap();
+    run_git(&evil_commondir_repo, &["init"]);
+    fs::write(
+        evil_commondir_repo.join(".git").join("commondir"),
+        ssh_dir.to_str().unwrap(),
+    )
+    .unwrap();
+
+    // 2. Dangling .git symlink must be caught in blocked
+    #[cfg(unix)]
+    {
+        let dangling_repo = workspace_dir.join("dangling_dotgit");
+        fs::create_dir_all(&dangling_repo).unwrap();
+        std::os::unix::fs::symlink(root.join("nonexistent_gitdir"), dangling_repo.join(".git"))
+            .unwrap();
+    }
+
+    // 3. Deleted remote must fail closed as remote_unverified_or_unpushed
+    let bare_remote = remotes_dir.join("deleted_origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+    let deleted_remote_repo = workspace_dir.join("deleted_remote_repo");
+    run_git(
+        &workspace_dir,
+        &[
+            "clone",
+            bare_remote.to_str().unwrap(),
+            "deleted_remote_repo",
+        ],
+    );
+    fs::write(deleted_remote_repo.join("README.md"), "hello\n").unwrap();
+    run_git(&deleted_remote_repo, &["add", "README.md"]);
+    run_git(&deleted_remote_repo, &["commit", "-m", "init"]);
+    run_git(&deleted_remote_repo, &["push", "-u", "origin", "HEAD"]);
+    fs::remove_dir_all(&bare_remote).unwrap();
+
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+    let report = inspect_orphans(&home, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+
+    assert!(
+        !report.safe_to_prune.iter().any(|c| c.path.contains(".ssh"))
+            && !report.blocked.iter().any(|b| b.path.contains(".ssh")),
+        ".ssh must be pruned before orphan inspection: {:?}",
+        report
+    );
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.path.ends_with("evil_commondir")
+                && b.reasons.iter().any(|r| r.contains("commondir"))),
+        "directory-form .git commondir to .ssh must be blocked: {:?}",
+        report.blocked
+    );
+    #[cfg(unix)]
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.path.ends_with("dangling_dotgit")),
+        "dangling .git symlink must be reported in blocked: {:?}",
+        report.blocked
+    );
+    assert!(
+        report
+            .blocked
+            .iter()
+            .any(|b| b.path.ends_with("deleted_remote_repo")
+                && b.reasons
+                    .iter()
+                    .any(|r| r == "remote_unverified_or_unpushed")),
+        "deleted remote must fail closed as remote_unverified_or_unpushed: {:?}",
+        report.blocked
+    );
+}
+
+#[test]
+fn scan_rejects_protected_roots_and_zero_depth_but_allows_home() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let ssh_dir = home.join(".ssh");
+    let work_dir = home.join("work");
+    fs::create_dir_all(&ssh_dir).unwrap();
+    fs::create_dir_all(&work_dir).unwrap();
+    fs::write(ssh_dir.join("id_rsa"), vec![0u8; 500]).unwrap();
+    fs::write(work_dir.join("data.bin"), vec![0u8; 100]).unwrap();
+
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+
+    // Reject max_depth == 0
+    let zero_depth = scan_directory(
+        &work_dir,
+        &ctx,
+        &ScanOptions {
+            max_depth: 0,
+            ..Default::default()
+        },
+    );
+    assert!(zero_depth.is_err(), "max_depth == 0 must be rejected");
+
+    // Reject protected credential directory as root
+    assert!(
+        scan_directory(&ssh_dir, &ctx, &ScanOptions::default()).is_err(),
+        "scanning ~/.ssh directly must be rejected"
+    );
+
+    // Reject system root
+    assert!(
+        scan_directory(Path::new("/etc"), &ctx, &ScanOptions::default()).is_err(),
+        "scanning /etc directly must be rejected"
+    );
+
+    // Allow scanning ~ itself while skipping .ssh inside it
+    let home_report = scan_directory(&home, &ctx, &ScanOptions::default()).unwrap();
+    assert_eq!(home_report.total_bytes, 100);
+    assert!(home_report
+        .skipped_protected
+        .iter()
+        .any(|p| p.ends_with(".ssh")));
 }

@@ -34,7 +34,23 @@ pub enum SjError {
     Json(#[from] serde_json::Error),
 }
 
-/// Redacts common `--flag=secret` and `Bearer <token>` segments from CLI strings before reporting.
+fn redact_url_userinfo(token: &str) -> String {
+    if let Some(scheme_idx) = token.find("://") {
+        let after_scheme = &token[scheme_idx + 3..];
+        let auth_end = after_scheme
+            .find(['/', '?', '#'])
+            .unwrap_or(after_scheme.len());
+        let authority = &after_scheme[..auth_end];
+        if let Some(at_idx) = authority.rfind('@') {
+            let prefix = &token[..scheme_idx + 3];
+            let host_and_rest = &after_scheme[at_idx + 1..];
+            return format!("{prefix}<REDACTED>@{host_and_rest}");
+        }
+    }
+    token.to_string()
+}
+
+/// Redacts common `--flag=secret`, `Bearer`/`Basic <token>`, and URL userinfo segments before reporting.
 pub fn redact_secrets(input: &str) -> String {
     let sensitive_flags = [
         "--api-key=",
@@ -42,6 +58,7 @@ pub fn redact_secrets(input: &str) -> String {
         "--secret=",
         "--password=",
         "--auth-token=",
+        "--auth=",
     ];
     let mut tokens: Vec<String> = Vec::new();
     let mut redact_next = false;
@@ -59,13 +76,20 @@ pub fn redact_secrets(input: &str) -> String {
         }
         if matches!(
             low.as_str(),
-            "--api-key" | "--token" | "--secret" | "--password" | "--auth-token" | "bearer"
+            "--api-key"
+                | "--token"
+                | "--secret"
+                | "--password"
+                | "--auth-token"
+                | "--auth"
+                | "bearer"
+                | "basic"
         ) {
             tokens.push(part.to_string());
             redact_next = true;
             continue;
         }
-        tokens.push(part.to_string());
+        tokens.push(redact_url_userinfo(part));
     }
 
     tokens.join(" ")
@@ -94,5 +118,21 @@ mod tests {
         assert!(!out.contains("secret_456"));
         assert!(out.contains("--api-key=<REDACTED>"));
         assert!(out.contains("--token <REDACTED>"));
+    }
+
+    #[test]
+    fn redacts_auth_basic_and_url_userinfo() {
+        let out = redact_secrets(
+            "curl --auth=tok_abc --auth tok_def -H Authorization: Basic bXlfdG9rZW4= https://alice:s3cr3t@example.com/repo.git https://example.com/@org/pkg",
+        );
+        assert!(!out.contains("tok_abc"));
+        assert!(!out.contains("tok_def"));
+        assert!(!out.contains("bXlfdG9rZW4="));
+        assert!(!out.contains("s3cr3t"));
+        assert!(out.contains("--auth=<REDACTED>"));
+        assert!(out.contains("--auth <REDACTED>"));
+        assert!(out.contains("Basic <REDACTED>"));
+        assert!(out.contains("https://<REDACTED>@example.com/repo.git"));
+        assert!(out.contains("https://example.com/@org/pkg"));
     }
 }
