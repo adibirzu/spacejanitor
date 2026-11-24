@@ -1,127 +1,48 @@
-//! SpaceJanitor Rust core safety invariants, secret redaction, and schema contracts.
+//! SpaceJanitor Rust core safety invariants, disk scanner, trash discovery,
+//! orphan git validator, and deterministic dry-run remediation planner.
 
-use std::path::Path;
+pub mod orphans;
+pub mod plan;
+pub mod protect;
+pub mod scan;
+pub mod trash;
+
+use thiserror::Error;
 
 pub const SCHEMA_STORAGE_V1: &str = "spacejanitor.storage.v1";
 pub const SCHEMA_MEMORY_V1: &str = "spacejanitor.memory.v1";
 pub const SCHEMA_BLOCKERS_V1: &str = "spacejanitor.blockers.v1";
 pub const SCHEMA_ORPHANS_V1: &str = "spacejanitor.orphans.v1";
+pub const SCHEMA_TRASH_V1: &str = "spacejanitor.trash.v1";
 pub const SCHEMA_PROPOSAL_V1: &str = "spacejanitor.proposal.v1";
 
-pub const PROTECTED_HOME_SUBPATHS: &[&str] = &[
-    ".ssh",
-    ".gnupg",
-    ".aws",
-    ".kube",
-    ".config/gh",
-];
+pub use protect::{
+    is_protected_path, ProtectionVerdict, PROTECTED_HOME_SUBPATHS, PROTECTED_SYSTEM_ROOTS,
+};
 
-pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
-    "/System",
-    "/Windows",
-    "C:/Windows",
-];
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProtectionVerdict {
-    pub protected: bool,
-    pub reason: String,
-}
-
-fn normalize_separators(raw: &str) -> String {
-    let trimmed = raw.trim().replace('\\', "/");
-    if trimmed.len() > 1 {
-        trimmed.trim_end_matches('/').to_string()
-    } else {
-        trimmed
-    }
-}
-
-fn expand_home(raw: &str, home_dir: &str) -> String {
-    let home = normalize_separators(home_dir);
-    let norm = normalize_separators(raw);
-    if norm == "~" {
-        return home;
-    }
-    if let Some(rest) = norm.strip_prefix("~/") {
-        return format!("{home}/{rest}");
-    }
-    norm
-}
-
-/// Evaluates whether `candidate` is protected by immutable built-in safety rules or user exact paths.
-pub fn is_protected_path(candidate: &str, home_dir: &str, exact_paths: &[&str]) -> ProtectionVerdict {
-    let home_norm = normalize_separators(home_dir);
-    let cand = expand_home(candidate, &home_norm);
-    if cand.is_empty() {
-        return ProtectionVerdict {
-            protected: true,
-            reason: "empty_path".to_string(),
-        };
-    }
-
-    if cand == "/" || cand == home_norm {
-        return ProtectionVerdict {
-            protected: true,
-            reason: "protected_root".to_string(),
-        };
-    }
-
-    for sys_root in PROTECTED_SYSTEM_ROOTS {
-        let root_norm = normalize_separators(sys_root);
-        if cand == root_norm || cand.starts_with(&format!("{root_norm}/")) {
-            return ProtectionVerdict {
-                protected: true,
-                reason: format!("protected_system:{sys_root}"),
-            };
-        }
-    }
-
-    for sub in PROTECTED_HOME_SUBPATHS {
-        let full = format!("{home_norm}/{sub}");
-        if cand == full || cand.starts_with(&format!("{full}/")) {
-            return ProtectionVerdict {
-                protected: true,
-                reason: format!("protected_credential_store:~/{sub}"),
-            };
-        }
-    }
-
-    for exact in exact_paths {
-        let exact_norm = expand_home(exact, &home_norm);
-        if exact_norm == "/" || exact_norm == home_norm {
-            if cand == exact_norm {
-                return ProtectionVerdict {
-                    protected: true,
-                    reason: format!("protected_exact:{exact}"),
-                };
-            }
-        } else if cand == exact_norm || cand.starts_with(&format!("{exact_norm}/")) {
-            return ProtectionVerdict {
-                protected: true,
-                reason: format!("protected_exact:{exact}"),
-            };
-        }
-    }
-
-    if let Some(name) = Path::new(&cand).file_name().and_then(|s| s.to_str()) {
-        if name.contains(".private.") {
-            return ProtectionVerdict {
-                protected: true,
-                reason: "protected_glob:*.private.*".to_string(),
-            };
-        }
-    }
-
-    ProtectionVerdict {
-        protected: false,
-        reason: String::new(),
-    }
+#[derive(Debug, Error)]
+pub enum SjError {
+    #[error("I/O error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("protected path refused: {0}")]
+    ProtectedPath(String),
+    #[error("invalid execution gate: {0}")]
+    ExecutionGate(String),
+    #[error("git command error: {0}")]
+    Git(String),
+    #[error("serialization error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 /// Redacts common `--flag=secret` and `Bearer <token>` segments from CLI strings before reporting.
 pub fn redact_secrets(input: &str) -> String {
-    let sensitive_flags = ["--api-key=", "--token=", "--secret=", "--password=", "--auth-token="];
+    let sensitive_flags = [
+        "--api-key=",
+        "--token=",
+        "--secret=",
+        "--password=",
+        "--auth-token=",
+    ];
     let mut tokens: Vec<String> = Vec::new();
     let mut redact_next = false;
 
@@ -136,7 +57,10 @@ pub fn redact_secrets(input: &str) -> String {
             tokens.push(format!("{flag}<REDACTED>"));
             continue;
         }
-        if matches!(low.as_str(), "--api-key" | "--token" | "--secret" | "--password" | "--auth-token" | "bearer") {
+        if matches!(
+            low.as_str(),
+            "--api-key" | "--token" | "--secret" | "--password" | "--auth-token" | "bearer"
+        ) {
             tokens.push(part.to_string());
             redact_next = true;
             continue;
