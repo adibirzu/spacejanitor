@@ -1,9 +1,13 @@
 //! SpaceJanitor Rust core safety invariants, disk scanner, trash discovery,
 //! orphan git validator, and deterministic dry-run remediation planner.
 
+pub mod blockers;
+pub mod mcp_audit;
+pub mod memory;
 pub mod orphans;
 pub mod plan;
 pub mod protect;
+pub mod reap;
 pub(crate) mod safe_remove;
 pub mod scan;
 pub mod trash;
@@ -11,12 +15,15 @@ pub mod trash;
 use thiserror::Error;
 
 pub const SCHEMA_STORAGE_V1: &str = "spacejanitor.storage.v1";
+pub const SCHEMA_DISK_V1: &str = "spacejanitor.disk.v1";
 pub const SCHEMA_MEMORY_V1: &str = "spacejanitor.memory.v1";
 pub const SCHEMA_BLOCKERS_V1: &str = "spacejanitor.blockers.v1";
 pub const SCHEMA_ORPHANS_V1: &str = "spacejanitor.orphans.v1";
 pub const SCHEMA_TRASH_V1: &str = "spacejanitor.trash.v1";
 pub const SCHEMA_PROPOSAL_V1: &str = "spacejanitor.proposal.v1";
 pub const SCHEMA_PROTECT_V1: &str = "spacejanitor.protect.v1";
+pub const SCHEMA_MCP_AUDIT_V1: &str = "spacejanitor.mcp_audit.v1";
+pub const SCHEMA_REAP_V1: &str = "spacejanitor.reap.v1";
 
 pub use protect::{
     is_protected_path, ProtectionVerdict, PROTECTED_HOME_SUBPATHS, PROTECTED_SYSTEM_ROOTS,

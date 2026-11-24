@@ -2949,3 +2949,51 @@ fn execute_selection_removes_only_the_confirmed_items_and_refuses_when_the_selec
     assert!(!trash.join("a.bin").exists() && !trash.join("c.bin").exists());
     assert!(trash.join("b.bin").exists(), "unselected item must survive");
 }
+#[test]
+fn protect_cross_platform_posix_and_windows_roots() {
+    let ctx = ProtectionContext::new(PathBuf::from("/home/developer"), vec![]);
+
+    for posix_root in [
+        "/",
+        "/foo/..",
+        "/var/../etc/passwd",
+        "\\etc\\passwd",
+        "\\foo\\..",
+    ] {
+        assert!(
+            check_path_protection(Path::new(posix_root), &ctx).protected,
+            "POSIX root/traversal {posix_root} must be protected"
+        );
+    }
+
+    for win_root in [
+        "C:\\",
+        "C:/",
+        "c:\\foo\\..",
+        "C:\\Windows",
+        "C:\\Windows\\System32",
+        "c:/windows/system32/drivers/etc/hosts",
+        "C:\\Program Files",
+        "c:/program files/SomeApp",
+        "C:\\Program Files (x86)",
+        "c:/program files (x86)/SomeApp",
+        "C:\\ProgramData",
+        "c:/programdata/Microsoft",
+        "C:\\Temp\\..\\Windows\\System32",
+        "C:\\Users\\alice\\..\\..\\Windows\\System32",
+    ] {
+        assert!(
+            check_path_protection(Path::new(win_root), &ctx).protected,
+            "Windows system root {win_root} must be protected"
+        );
+    }
+
+    assert!(
+        !check_path_protection(
+            Path::new("C:\\Users\\alice\\AppData\\Local\\Temp\\work"),
+            &ctx
+        )
+        .protected,
+        "Non-protected Windows user temp path should not be blocked"
+    );
+}

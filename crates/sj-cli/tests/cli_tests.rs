@@ -1033,4 +1033,133 @@ fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it
     assert_eq!(planned(&["--include-trash"]), 1);
     assert_eq!(planned(&["--include-orphans"]), 0, "documented sj semantics: orphans INSTEAD of trash");
     assert_eq!(planned(&["--include-trash", "--include-orphans"]), 1, "trash plus orphans keeps the trash item");
+#[test]
+fn cli_memory_blockers_mcp_audit_and_reap_end_to_end() {
+    let tmp = tempdir().unwrap();
+    let cfg_dir = tmp.path().join("mcp-configs");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("mcp.json"),
+        r#"{"mcpServers":{"sample-mcp":{"command":"npx","args":["-y","sample-mcp"]}}}"#,
+    )
+    .unwrap();
+
+    // memory --top 5 --json
+    let mem = Command::new(sj_bin())
+        .args(["memory", "--top", "5", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(mem.status.code(), Some(0));
+    let mem_json: serde_json::Value = serde_json::from_slice(&mem.stdout).unwrap();
+    assert_eq!(mem_json["schema"], "spacejanitor.memory.v1");
+
+    // blockers --json
+    let blk = Command::new(sj_bin())
+        .args(["blockers", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(blk.status.code(), Some(0));
+    let blk_json: serde_json::Value = serde_json::from_slice(&blk.stdout).unwrap();
+    assert_eq!(blk_json["schema"], "spacejanitor.blockers.v1");
+
+    // mcp-audit --config-dir <dir> --json
+    let mcp = Command::new(sj_bin())
+        .args([
+            "mcp-audit",
+            "--config-dir",
+            cfg_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mcp.status.code(), Some(0));
+    let mcp_json: serde_json::Value = serde_json::from_slice(&mcp.stdout).unwrap();
+    assert_eq!(mcp_json["schema"], "spacejanitor.mcp_audit.v1");
+    assert_eq!(mcp_json["configured_servers"].as_array().unwrap().len(), 1);
+
+    // reap --dry-run --json
+    let reap_dry = Command::new(sj_bin())
+        .args(["reap", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(reap_dry.status.code(), Some(0));
+    let reap_json: serde_json::Value = serde_json::from_slice(&reap_dry.stdout).unwrap();
+    assert_eq!(reap_json["schema"], "spacejanitor.reap.v1");
+    assert_eq!(reap_json["mode"], "dry-run");
+    assert_eq!(reap_json["mutated"], false);
+
+    // reap --execute without confirm/plan-sha256 must fail closed with exit code 2
+    let reap_bad = Command::new(sj_bin())
+        .args(["reap", "--execute", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(reap_bad.status.code(), Some(2));
+}
+
+#[test]
+fn cli_serve_stdio_json_rpc_round_trip_and_error_handling() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"memory","params":{{"top":3}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"blockers","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(stdin, r#"{{not-valid-json"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":"req-unknown","method":"no_such_method","params":{{}}}}"#
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        5,
+        "expected 5 JSON-RPC responses, got: {stdout}"
+    );
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(r1["id"], 1);
+    assert_eq!(r1["result"]["schema"], "spacejanitor.doctor.v1");
+
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["id"], 2);
+    assert_eq!(r2["result"]["schema"], "spacejanitor.memory.v1");
+
+    let r3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(r3["id"], 3);
+    assert_eq!(r3["result"]["schema"], "spacejanitor.blockers.v1");
+
+    let r4: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+    assert_eq!(r4["id"], serde_json::Value::Null);
+    assert_eq!(r4["error"]["code"], -32700);
+
+    let r5: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+    assert_eq!(r5["id"], "req-unknown");
+    assert_eq!(r5["error"]["code"], -32601);
 }
