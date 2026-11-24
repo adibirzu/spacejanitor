@@ -9,4 +9,3 @@ members = [
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-description = "Cross-platform workstation janitor (Rust core + Electron UI + AXI CLI) for storage, orphan work, trash, true memory footprint, and OS-blocker forensics."

@@ -117,6 +117,7 @@ function walkFiles(rootDir) {
     }
     entries.sort((a, b) => a.name.localeCompare(b.name));
     for (const ent of entries) {
+      if (ent.name === ".git") continue;
       if (ent.isSymbolicLink()) continue;
       const full = path.join(curr, ent.name);
       if (ent.isDirectory()) {
