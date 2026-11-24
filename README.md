@@ -13,6 +13,10 @@
 
 ---
 
+> **Project Status (M1 Shipped vs. M2–M7 Planned):**
+> - **Shipped today (`M1`):** Rust core engine (`sj-core`) and CLI (`sj-cli`: `doctor`, `scan`, `trash`, `orphans`, `plan`), deterministic SHA-256 `spacejanitor.proposal.v1` execution gate, `protect.rs` denylist, and `spacejanitor-axi doctor` (from source).
+> - **In Progress / Planned (`M2`–`M7`):** `sj memory` and `sj blockers` (`M2`), `sj mcp-audit` and `sj reap` (`M3`), `sj serve-stdio` and full `spacejanitor-axi` collectors (`M4`), Electron Desktop Tray App (`M5`), Local SLM Advisor (`M6`), and signed/checksum-verified GitHub Releases (`M7`).
+
 ## Why SpaceJanitor?
 
 Standard utilities like `df` and `ps` mislead developers and AI-workstation users right before a machine freezes:
@@ -34,9 +38,9 @@ Standard utilities like `df` and `ps` mislead developers and AI-workstation user
 | **Storage & Orphan Hygiene** | Bounded parallel disk scans, OS Trash / Recycle Bin audit, and recursive `.git` clean/pushed proof for abandoned worktrees | M1 (shipped) |
 | **True Memory Footprint** | Attributes Resident + Compressed + Swap memory by logical owner group (`MCP Fleet`, `VMs`, `Agent CLIs`, `OS Daemons`) | M2 |
 | **Kernel & VFS Blockers** | Inspects macOS vnodes/`fseventsd`/Mach ports, Linux `file-nr`/`inotify`/`D`-state, and Windows handles/pagefile | M2 |
-| **MCP Fleet & Secret Audit** | Detects duplicated stdio MCP servers across agent configs and redacts inline `--api-key`, bearer, and URL credentials | M2 |
+| **MCP Fleet & Secret Audit** | Detects duplicated stdio MCP servers across agent configs and redacts inline `--api-key`, bearer, and URL credentials | M3 |
 | **Safe `PPID=1` Reaper** | Identifies orphaned `PPID=1` processes and stages dry-run reaping with exact PID + start-time re-verification | M3 |
-| **AXI CLI for AI Agents** | `npx spacejanitor-axi` emits compact TOON output by default and versioned `spacejanitor.*.v1` JSON with `--json` | M4 / M7 |
+| **AXI CLI for AI Agents** | `spacejanitor-axi` (`npx spacejanitor-axi` once published to npm; `doctor` shipped in M1, collectors in M4) emits compact TOON output by default and versioned `spacejanitor.*.v1` JSON with `--json` | M1 (`doctor`) / M4 / M7 |
 | **Optional Local SLM Advisor** | On-demand `127.0.0.1`-only local LLM (0.5B–1.5B GGUF / Ollama) for plain-English plan explanations (`0 MiB` idle) | M6 |
 | **Multi-OS Desktop Tray App** | Electron tray utility (`macOS`, `Linux`, `Windows` on `x64` & `arm64`) that destroys `BrowserWindow` on close | M5 / M7 |
 
@@ -58,7 +62,8 @@ flowchart LR
 > **Immutable Protected Never-Touch Denylist**
 >
 > Enforced in Rust (`crates/sj-core/src/protect.rs`) across all built-in rules, plugins, and optional SLM suggestions:
-> - **Credential & Agent Stores:** `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`, `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`
+> - **Credential & Agent Stores:** `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`, `.env`, `.env.*`, `*.env`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*`
+>   *(Note: custom suffix names without a dot, such as `id_rsa_work` or `.envrc`, are not matched by the default filename rule unless placed inside a protected directory such as `~/.ssh`.)*
 > - **VM & Disk Images:** `*.vmdk`, `*.qcow2`, `*.vhdx`, `*.vdi`, `*.raw`, `*.img`
 > - **OS System Roots & Home:** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows`, and `$HOME`
 > - **Symlink & Traversal Defense:** Canonicalizes ancestors and fails closed on dangling symlinks or symlinks pointing into protected targets.
@@ -70,11 +75,11 @@ flowchart LR
 | Scenario | Read-Only Entry Point | Guide |
 |---|---|---|
 | **1. Runaway Disk Exhaustion** | `sj scan` / `sj orphans` / `sj trash` | [Use Case 1](./docs/USE_CASES.md#1-runaway-disk-exhaustion) |
-| **2. Hidden Memory & Swap Thrashing** | `sj memory --top 15` | [Use Case 2](./docs/USE_CASES.md#2-hidden-memory--swap-thrashing) |
-| **3. Kernel & VFS OS Blockers** | `sj blockers` | [Use Case 3](./docs/USE_CASES.md#3-kernel--vfs-os-blockers) |
-| **4. AI Agent MCP Sprawl & Inline Secret Leaks** | `sj mcp-audit` | [Use Case 4](./docs/USE_CASES.md#4-ai-agent-mcp-server-sprawl--inline-secret-leaks) |
-| **5. Safe `PPID=1` Orphan Process Reaping** | `sj reap --dry-run` | [Use Case 5](./docs/USE_CASES.md#5-safe-ppid1-orphan-process-reaping) |
-| **6. Agent-First Automation (AXI) & Local SLM Advisor** | `npx spacejanitor-axi summary` | [Use Case 6](./docs/USE_CASES.md#6-agent-first-automation-axi--optional-local-slm-advisor) |
+| **2. Hidden Memory & Swap Thrashing** *(M2)* | `sj memory --top 15` | [Use Case 2](./docs/USE_CASES.md#2-hidden-memory--swap-thrashing) |
+| **3. Kernel & VFS OS Blockers** *(M2)* | `sj blockers` | [Use Case 3](./docs/USE_CASES.md#3-kernel--vfs-os-blockers) |
+| **4. AI Agent MCP Sprawl & Inline Secret Leaks** *(M3)* | `sj mcp-audit` | [Use Case 4](./docs/USE_CASES.md#4-ai-agent-mcp-server-sprawl--inline-secret-leaks) |
+| **5. Safe `PPID=1` Orphan Process Reaping** *(M3)* | `sj reap --dry-run` | [Use Case 5](./docs/USE_CASES.md#5-safe-ppid1-orphan-process-reaping) |
+| **6. Agent-First Automation (AXI) & Local SLM Advisor** *(M1 `doctor` / M4 / M6)* | `node packages/cli/bin/spacejanitor.mjs doctor` *(or `spacejanitor-axi summary` once M4 + npm publish land)* | [Use Case 6](./docs/USE_CASES.md#6-agent-first-automation-axi--optional-local-slm-advisor) |
 
 ---
 
@@ -97,7 +102,7 @@ For process boundaries, IPC allowlists, and the cross-platform collector matrix,
 
 ### Desktop App (GitHub Releases — M5 / M7)
 
-Download signed/checksum-verified installers from [GitHub Releases](https://github.com/adibirzu/spacejanitor/releases):
+Download checksum-verified installers (unsigned until code signing & notarization are enabled; Planned M7) from [GitHub Releases](https://github.com/adibirzu/spacejanitor/releases):
 
 - **macOS Universal (`arm64` + `x64`):** `.dmg`, `.zip`
 - **Linux (`x64` & `arm64`):** `.AppImage`, `.deb`
@@ -121,11 +126,12 @@ cargo build --release --workspace
 ### AXI CLI & Agent Skill (`spacejanitor-axi`)
 
 ```bash
-# Compact TOON output for AI agents & terminals
-npx spacejanitor-axi doctor
-
-# Machine-readable JSON contract
+# Run from source today (M1: doctor is live; other collectors return scaffold until M4)
+node packages/cli/bin/spacejanitor.mjs doctor
 node packages/cli/bin/spacejanitor.mjs doctor --json
+
+# Compact TOON output via npx (once published to npm)
+npx spacejanitor-axi doctor
 ```
 
 See [docs/INSTALL.md](./docs/INSTALL.md) for checksum verification and platform-specific notes, and [docs/USAGE.md](./docs/USAGE.md) for the full command reference.
@@ -151,8 +157,8 @@ See [docs/INSTALL.md](./docs/INSTALL.md) for checksum verification and platform-
 | Milestone | Scope | Status |
 |---|---|---|
 | **M1** | Rust Core (`sj-core`, `sj-cli`): protection denylist, `scan`, `trash`, `orphans`, `plan`, `doctor` | Shipped |
-| **M2** | True Memory Footprint (`sj memory`), Kernel/VFS Blockers (`sj blockers`), MCP Fleet & Secret Audit (`sj mcp-audit`) | In Progress |
-| **M3** | Safe `PPID=1` Orphan Process Reaper (`sj reap`) with PID + start-time re-verification | Planned |
+| **M2** | True Memory Footprint (`sj memory`), Kernel/VFS Blockers (`sj blockers`) | In Progress |
+| **M3** | MCP Fleet & Secret Audit (`sj mcp-audit`), Safe `PPID=1` Orphan Process Reaper (`sj reap`) with PID + start-time re-verification | Planned |
 | **M4** | NDJSON JSON-RPC 2.0 sidecar (`sj serve-stdio`) & full `spacejanitor-axi` collector wiring | Planned |
 | **M5** | Electron Desktop Tray App (`apps/desktop`, `apps/ui`) for macOS, Linux, Windows (`x64` + `arm64`) | Planned |
 | **M6** | Optional Loopback Local SLM Advisor (`0.5B`–`1.5B` GGUF / Ollama) with grammar constraints | Planned |

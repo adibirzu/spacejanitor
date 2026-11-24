@@ -26,7 +26,7 @@ xattr -cr /Applications/SpaceJanitor.app
   chmod +x SpaceJanitor-*-x86_64.AppImage
   ./SpaceJanitor-*-x86_64.AppImage
   ```
-  > **FUSE Note:** AppImage requires `libfuse2` (`sudo apt install libfuse2` on Ubuntu 22.04+/Debian). If FUSE is unavailable (e.g., inside containers), extract and run with `--appimage-extract-and-run`.
+  > **FUSE Note:** AppImage requires `libfuse2t64` (`sudo apt install libfuse2t64` on Ubuntu 24.04+) or `libfuse2` (`sudo apt install libfuse2` on Ubuntu 22.04/Debian). If FUSE is unavailable (e.g., inside containers), extract and run with `--appimage-extract-and-run`.
 - **Debian / Ubuntu (`.deb`):**
   ```bash
   sudo apt install ./SpaceJanitor-*_amd64.deb
@@ -120,10 +120,10 @@ Requires **Rust (stable)** and **Node.js 22**:
 ```bash
 git clone https://github.com/adibirzu/spacejanitor.git
 cd spacejanitor
-npm ci
+npm install # lockfile arrives with M4/M5
 cargo build --release --workspace
-npm run desktop:build
-npm run desktop:pack
+npm run desktop:build # [M5 / M7]
+npm run desktop:pack  # [M5 / M7]
 ```
 
 > Note: On branches before M5 lands, `cargo test --workspace`, `npm test`, and `npm run hygiene` validate the core engine and CLI packages.
