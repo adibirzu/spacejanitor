@@ -14,7 +14,7 @@ All `sj` commands are **read-only by default** and support `--json` for machine-
 | `sj scan [path]` | `[--depth N] [--top N] [--same-fs] [--json]` | `spacejanitor.storage.v1` | M1 (shipped) |
 | `sj trash` | `[--path <dir>] [--json]` | `spacejanitor.trash.v1` | M1 (shipped) |
 | `sj orphans [path]` | `[--depth N] [--json]` | `spacejanitor.orphans.v1` | M1 (shipped) |
-| `sj plan [path]` | `[--include-trash] [--include-orphans] [--trash-path <dir>] [--depth N] [--execute --confirm --plan-sha256 <sha> --item <id>] [--json]` | `spacejanitor.proposal.v1` | M1 (shipped) |
+| `sj plan [path]` | `[--include-trash] [--include-orphans] [--trash-path <dir>] [--depth N] [--execute --confirm --plan-sha256 <sha> --item <id>] [--json]` | `spacejanitor.proposal.v1` | M1 (shipped; `--execute` Unix-only: macOS & Linux) |
 | `sj memory` | `[--top N] [--json]` | `spacejanitor.memory.v1` *(Planned M2)* | M2 (planned) |
 | `sj blockers` | `[--json]` | `spacejanitor.blockers.v1` *(Planned M2)* | M2 (planned) |
 | `sj mcp-audit` | `[--config-dir <path>...] [--json]` | `spacejanitor.mcp_audit.v1` *(Planned M3)* | M3 (planned) |
@@ -109,8 +109,8 @@ SpaceJanitor refuses to stage or delete:
 ### Troubleshooting FAQ
 
 - **Why was my worktree marked `BLOCKED` in `sj orphans`?**
-  `sj orphans` requires a clean working tree (`git status --porcelain` empty), at least one configured remote, no git stashes (`has_stashes`), and zero unpushed commits across all branches—including nested sub-repositories. Commit and push your work (and clear or review any stashes), or inspect the tree manually.
+  `sj orphans` enforces all seven safety gates in `crates/sj-core/src/orphans.rs` across the repository and any nested sub-repositories: (1) clean working tree (`dirty_or_untracked`), (2) at least one configured remote (`no_remote`), (3) no git stashes (`has_stashes`), (4) no unpushed commits across all branches, (5) no ignored files present (`ignored_files_present`), (6) not in detached HEAD (`detached_head`), and (7) not an unborn HEAD (`unborn_head`). Note that ignored build artifacts such as `target/` or `node_modules/` trigger `BLOCKED [ignored_files_present]`—which is **not** cleared by committing or pushing—so clean or remove ignored artifacts (and commit/push changes or clear stashes) before pruning.
 - **Why does `sj plan --execute` exit with code `2`?**
-  Execution requires all four gates: `--execute`, `--confirm`, `--plan-sha256 <exact_sha>`, and `--item <exact_id>` (and `--trash-path` cannot be combined with `--execute`).
+  Execution requires all four CLI gates: `--execute`, `--confirm`, `--plan-sha256 <exact_sha>`, and `--item <exact_id>` (and `--trash-path` cannot be combined with `--execute`). Additionally, M1 `sj plan --execute` handle-anchored safe execution is **Unix-only (macOS and Linux)**: on non-Unix platforms (Windows), `crates/sj-core/src/safe_remove.rs` returns an `ExecutionGate` refusal (exit `2`)—dry-run planning only is supported on Windows in M1.
 - **Why did the Local SLM Advisor fall back to deterministic rules?**
   Either no loopback endpoint is configured, or available system RAM is below `2.5 GiB`, triggering the memory-pressure self-guard so the advisor never worsens swap thrashing.

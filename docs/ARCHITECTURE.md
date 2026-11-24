@@ -96,7 +96,7 @@ sequenceDiagram
 
 | Domain | macOS (`darwin` `arm64`/`x64`) | Linux (`linux` `x64`/`arm64`) | Windows (`win32` `x64`/`arm64`) |
 |---|---|---|---|
-| **Storage & Trash (`[M1]`; `tmutil` `[M2]`)** | `df -k`, `jwalk` inode-deduped scan, `~/.Trash` (`[M1]`); `tmutil listlocalsnapshots` (`[M2]`) | `df -k` / `statvfs`, `jwalk`, `$XDG_DATA_HOME/Trash` (`[M1]`); `/var/log/journal` (`[M2]`) | Win32 volume free space, `jwalk`, `$Recycle.Bin` (`[M1]`); `%LOCALAPPDATA%\Temp`, WSL2 `.vhdx` (`[M2]`) |
+| **Storage & Trash (`[M1]` / `[M2]`)** | `jwalk` inode-deduped scan, `~/.Trash` (`[M1]`); `df -k`, `tmutil listlocalsnapshots` (`[M2]`) | `jwalk` scan, `$XDG_DATA_HOME/Trash` (`[M1]`); `df -k` / `statvfs`, `/var/log/journal` (`[M2]`) | `jwalk` scan, `$Recycle.Bin` (`[M1]`); Win32 volume free space, `%LOCALAPPDATA%\Temp`, WSL2 `.vhdx` (`[M2]`) |
 | **True Memory Footprint (`[M2]`)** | `top -l 1` (`MEM` + `CMPRS` + `#PORTS`), `vm_stat`, `sysctl vm.swapusage` | `/proc/<pid>/smaps_rollup` (`Pss` + `SwapPss`), `/proc/meminfo`, `swapon --show` | `Win32_Process` (`WorkingSetSize`, `PrivatePageCount`, `HandleCount`), pagefile, WSL2 `Vmmem` |
 | **Kernel / VFS Blockers (`[M2]`)** | `kern.num_vnodes`/`maxvnodes`, `kern.num_files`, `fseventsd`, Mach ports, `U`-state | `fs.inotify.max_user_watches`, `/proc/sys/fs/file-nr`, `D`-state/zombies, journald | Handle spikes, NonPaged/Paged pool, Defender/Search exclusions, pagefile saturation |
 | **Orphan Work (`[M1]`) & Processes (`[M3]`)** | Recursive `.git` proof (`[M1]`); `PPID=1` + non-recursive `lsof -Fn -d cwd` (`[M3]`, never `lsof +D`) | Recursive `.git` proof (`[M1]`); `PPID=1` + `/proc/<pid>/cwd` non-blocking check (`[M3]`) | Recursive `.git` proof (`[M1]`); WMI parent PID tree + non-recursive handle CWD check (`[M3]`) |

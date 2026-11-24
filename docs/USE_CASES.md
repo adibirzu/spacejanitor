@@ -30,13 +30,13 @@ scan: /Users/<you>/dev (84210944000 bytes, 148230 files, status=Ok)
    14205110272  /Users/<you>/dev/worktrees/feature-old (dir)
 trash: /Users/<you>/.Trash (exists=true, items=42, total=9812031488B, reclaimable=9812031488B, protected=0)
 orphans: /Users/<you>/dev (scanned=18, safe=1, blocked=2)
-  SAFE    /Users/<you>/dev/worktrees/feature-old (14205110272B)
+  SAFE    /Users/<you>/dev/worktrees/feature-old (48234496B)   # clean, pushed, attached branch with no ignored artifacts
   BLOCKED /Users/<you>/dev/worktrees/wip-branch [dirty_or_untracked]
   BLOCKED /Users/<you>/dev/scratch-notes [no_remote]
 ```
 
 ### How SpaceJanitor Solves It Safely
-- **Recursive Git Proof (`M1`):** `sj orphans` verifies that a candidate tree has a valid `.git`, zero uncommitted/untracked files (`git status --porcelain` empty), at least one remote, no stashes (`has_stashes`), and zero unpushed branch commits across all branches—including nested sub-repositories. Anything dirty or unpushed is listed under `BLOCKED` and excluded.
+- **Recursive Git Proof (`M1`):** `sj orphans` enforces all seven safety gates in `crates/sj-core/src/orphans.rs` across the repository and any nested sub-repositories: (1) clean working tree (`dirty_or_untracked`), (2) configured remote (`no_remote`), (3) no stashes (`has_stashes`), (4) no unpushed commits across all branches, (5) no ignored files present (`ignored_files_present`), (6) not detached HEAD (`detached_head`), and (7) not unborn HEAD (`unborn_head`). Ignored build artifacts such as `target/` or `node_modules/` cause `BLOCKED [ignored_files_present]` (not cleared by committing or pushing), so only a clean, pushed, attached branch checkout with no ignored artifacts is marked `SAFE`.
 - **Protected Path Enforcement (`M1`):** Even if Trash or a scan root contains `.ssh`, `.env`, or VM images (`*.qcow2`, `*.vmdk`), `sj-core` excludes them deterministically via `ProtectionContext::from_env()` (default home and built-in rules in `M1`; custom user-configured protected-path CLI flags are a planned enhancement).
 - **APFS & Snapshot Awareness *(Planned `M2`)*:** Reporting APFS snapshot-held space via `tmutil` as informational rather than generating unsafe deletions is a planned `M2` enhancement.
 

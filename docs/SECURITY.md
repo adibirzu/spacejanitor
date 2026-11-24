@@ -3,7 +3,7 @@
 SpaceJanitor inspects local filesystems, git repositories, running process arguments, and kernel counters, and optionally cleans operator-approved targets. Because a workstation janitor operates on sensitive local state, security invariants are enforced deterministically in `crates/sj-core`.
 
 > **Implementation Status:**
-> - **Shipped today (`M1`):** `crates/sj-core/src/protect.rs` (Protected Never-Touch Denylist, APFS `/System/Volumes/Data` prefix stripping, symlink traversal defense, `.sj-stage-*` quarantine protection), `spacejanitor.proposal.v1` SHA-256 two-step execution gate, Trash/orphan TOCTOU re-verification, and the `redact_secrets()` helper in `crates/sj-core/src/lib.rs`.
+> - **Shipped today (`M1`):** `crates/sj-core/src/protect.rs` (Protected Never-Touch Denylist, APFS `/System/Volumes/Data` prefix stripping, symlink traversal defense, `.sj-stage-*` quarantine protection), `spacejanitor.proposal.v1` SHA-256 two-step execution gate (with handle-anchored `sj plan --execute` safe execution in `crates/sj-core/src/safe_remove.rs` **Unix-only on macOS and Linux**; non-Unix platforms return an `ExecutionGate` refusal / exit `2`, so Windows is dry-run planning only in `M1`), Trash/orphan TOCTOU re-verification, and the `redact_secrets()` helper in `crates/sj-core/src/lib.rs`.
 > - **Planned (`M2`–`M6`):** `memory` / `blockers` (`M2`), `mcp-audit` and `reap` PID + start-time re-verification (`M3`), collector integration of `redact_secrets()` (`M2` / `M3`), Electron sandbox & 2-step UI confirmation (`M5`), and Local SLM loopback guard (`M6`).
 
 ---
