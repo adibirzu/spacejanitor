@@ -53,28 +53,6 @@ struct GitExecContext {
     alternate_object_dirs: Option<OsString>,
 }
 
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    let mut out = PathBuf::new();
-    for comp in path.components() {
-        match comp {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                if matches!(out.components().next_back(), Some(Component::Normal(_))) {
-                    out.pop();
-                } else if !out.has_root() {
-                    out.push("..");
-                }
-            }
-            other => out.push(other.as_os_str()),
-        }
-    }
-    if out.as_os_str().is_empty() {
-        PathBuf::from(".")
-    } else {
-        out
-    }
-}
-
 fn anchor_to_cwd(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
         Ok(path.to_path_buf())
@@ -97,11 +75,35 @@ fn resolve_relative_from_dir(base_dir: &Path, rel: &Path) -> PathBuf {
             break;
         }
         if let Ok(canon) = std::fs::canonicalize(anc) {
-            let mut resolved_base = canon;
-            for seg in missing.into_iter().rev() {
-                resolved_base.push(seg);
+            let mut out = canon;
+            let mut pending_missing: Vec<OsString> = missing.into_iter().rev().collect();
+            let mut comps = rel.components();
+            while !pending_missing.is_empty() {
+                match comps.next() {
+                    None => break,
+                    Some(Component::CurDir) => {}
+                    Some(Component::ParentDir) => {
+                        pending_missing.pop();
+                    }
+                    Some(Component::Normal(s)) => {
+                        pending_missing.push(s.to_os_string());
+                    }
+                    Some(other) => {
+                        for seg in pending_missing.drain(..) {
+                            out.push(seg);
+                        }
+                        out.push(other.as_os_str());
+                        break;
+                    }
+                }
             }
-            return normalize_lexical_path(&resolved_base.join(rel));
+            for seg in pending_missing {
+                out.push(seg);
+            }
+            for rest in comps {
+                out.push(rest.as_os_str());
+            }
+            return out;
         }
         if let Some(comp) = anc.components().next_back() {
             match comp {
@@ -111,7 +113,7 @@ fn resolve_relative_from_dir(base_dir: &Path, rel: &Path) -> PathBuf {
             }
         }
     }
-    normalize_lexical_path(&base_dir.join(rel))
+    base_dir.join(rel)
 }
 
 fn run_git_raw_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
@@ -956,6 +958,32 @@ mod tests {
         let resolved_missing =
             resolve_relative_from_dir(&missing_base, Path::new("../../../shared"));
         assert_eq!(resolved_missing, canon_shared);
+
+        // Missing/moved base dir consumes '..' only against missing tail segments and preserves
+        // remaining components verbatim so symlink + '..' inside rel is resolved by the OS.
+        let ws = root.join("ws");
+        let remotes_origin = real_dir.join("remotes").join("origin.git");
+        std::fs::create_dir_all(&ws).expect("create ws");
+        std::fs::create_dir_all(&remotes_origin).expect("create remotes/origin.git");
+        std::os::unix::fs::symlink(&sub, ws.join("link")).expect("create ws/link");
+
+        let moved_checkout = ws.join("moved_checkout");
+        let resolved_rel_symlink =
+            resolve_relative_from_dir(&moved_checkout, Path::new("../link/../remotes/origin.git"));
+        assert_eq!(
+            resolved_rel_symlink,
+            std::fs::canonicalize(&ws)
+                .expect("canonicalize ws")
+                .join("link")
+                .join("..")
+                .join("remotes")
+                .join("origin.git")
+        );
+        assert_eq!(
+            std::fs::canonicalize(&resolved_rel_symlink)
+                .expect("canonicalize resolved symlink remote"),
+            std::fs::canonicalize(&remotes_origin).expect("canonicalize origin.git")
+        );
 
         // Absolute rel is returned unchanged.
         let resolved_abs = resolve_relative_from_dir(&existing_base, &shared);

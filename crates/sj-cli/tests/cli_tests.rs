@@ -401,3 +401,220 @@ fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let real_dir = home.join("real");
+    let sub = real_dir.join("sub");
+    let remote = real_dir.join("remotes").join("origin.git");
+    let ws = home.join("ws");
+    let checkout = ws.join("checkout");
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&checkout).unwrap();
+    std::os::unix::fs::symlink(&sub, ws.join("link")).unwrap();
+
+    run_git(&remote, &["init", "--bare"]);
+    run_git(&checkout, &["init"]);
+    run_git(&checkout, &["checkout", "-b", "main"]);
+    fs::write(checkout.join("README.md"), "hello\n").unwrap();
+    run_git(&checkout, &["add", "README.md"]);
+    run_git(&checkout, &["commit", "-m", "initial"]);
+    run_git(
+        &checkout,
+        &["remote", "add", "origin", "../link/../remotes/origin.git"],
+    );
+    run_git(&checkout, &["push", "-u", "origin", "main"]);
+
+    let orphans_out = Command::new(sj_bin())
+        .env("HOME", home)
+        .args(["orphans", ws.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        orphans_out.status.code(),
+        Some(0),
+        "sj orphans failed: {}",
+        String::from_utf8_lossy(&orphans_out.stderr)
+    );
+    let orphans_json: serde_json::Value = serde_json::from_slice(&orphans_out.stdout).unwrap();
+    let safe = orphans_json["safe_to_prune"].as_array().unwrap();
+    let blocked = orphans_json["blocked"].as_array().unwrap();
+    assert_eq!(
+        safe.len(),
+        1,
+        "expected 1 safe_to_prune, got: {orphans_json}"
+    );
+    assert!(
+        blocked.is_empty(),
+        "expected empty blocked, got: {orphans_json}"
+    );
+    assert!(
+        safe[0]["path"].as_str().unwrap().ends_with("checkout"),
+        "expected checkout in safe_to_prune, got: {orphans_json}"
+    );
+
+    let plan_out = Command::new(sj_bin())
+        .env("HOME", home)
+        .args(["plan", ws.to_str().unwrap(), "--include-orphans", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(
+        plan_out.status.code(),
+        Some(0),
+        "sj plan failed: {}",
+        String::from_utf8_lossy(&plan_out.stderr)
+    );
+    let plan_json: serde_json::Value = serde_json::from_slice(&plan_out.stdout).unwrap();
+    let items = plan_json["items"].as_array().unwrap();
+    assert_eq!(items.len(), 1, "expected 1 plan item, got: {plan_json}");
+    let plan_sha = plan_json["plan_sha256"].as_str().unwrap();
+    let item_id = items[0]["id"].as_str().unwrap();
+
+    let exec_out = Command::new(sj_bin())
+        .env("HOME", home)
+        .args([
+            "plan",
+            ws.to_str().unwrap(),
+            "--include-orphans",
+            "--execute",
+            "--confirm",
+            "--plan-sha256",
+            plan_sha,
+            "--item",
+            item_id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(
+        exec_out.status.code(),
+        Some(0),
+        "sj plan --execute failed: {}",
+        String::from_utf8_lossy(&exec_out.stderr)
+    );
+    let exec_json: serde_json::Value = serde_json::from_slice(&exec_out.stdout).unwrap();
+    assert_eq!(exec_json["mutated"], true);
+    assert!(
+        !checkout.exists(),
+        "checkout should be removed after execute"
+    );
+    let stage_leftovers: Vec<_> = fs::read_dir(&ws)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+        .collect();
+    assert!(
+        stage_leftovers.is_empty(),
+        "expected zero .sj-stage-* residue in ws, found: {stage_leftovers:?}"
+    );
+
+    // Confirm an unpushed checkout using the same ../link/../remotes/origin.git remote
+    // is blocked and fails closed with rollback and zero residue.
+    let unpushed_checkout = ws.join("unpushed_checkout");
+    fs::create_dir_all(&unpushed_checkout).unwrap();
+    run_git(&unpushed_checkout, &["init"]);
+    run_git(&unpushed_checkout, &["checkout", "-b", "feature"]);
+    fs::write(unpushed_checkout.join("README.md"), "hello\n").unwrap();
+    run_git(&unpushed_checkout, &["add", "README.md"]);
+    run_git(&unpushed_checkout, &["commit", "-m", "initial"]);
+    run_git(
+        &unpushed_checkout,
+        &["remote", "add", "origin", "../link/../remotes/origin.git"],
+    );
+    run_git(&unpushed_checkout, &["push", "-u", "origin", "feature"]);
+
+    let ctx = sj_core::protect::ProtectionContext::new(home.to_path_buf(), Vec::new());
+    let pre_plan = sj_core::plan::build_remediation_plan(
+        &ws,
+        &ctx,
+        &sj_core::plan::PlanOptions {
+            include_trash: false,
+            include_orphans: true,
+            trash_path_override: None,
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(pre_plan.items.len(), 1);
+    let pre_item_id = pre_plan.items[0].id.clone();
+
+    fs::write(unpushed_checkout.join("unpushed.txt"), "local only\n").unwrap();
+    run_git(&unpushed_checkout, &["add", "unpushed.txt"]);
+    run_git(&unpushed_checkout, &["commit", "-m", "unpushed"]);
+
+    let blocked_orphans = Command::new(sj_bin())
+        .env("HOME", home)
+        .args(["orphans", ws.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_orphans.status.code(), Some(0));
+    let blocked_json: serde_json::Value = serde_json::from_slice(&blocked_orphans.stdout).unwrap();
+    assert!(blocked_json["safe_to_prune"].as_array().unwrap().is_empty());
+    let blocked_arr = blocked_json["blocked"].as_array().unwrap();
+    assert_eq!(blocked_arr.len(), 1);
+    assert!(blocked_arr[0]["reasons"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r == "remote_unverified_or_unpushed"));
+
+    let blocked_plan = Command::new(sj_bin())
+        .env("HOME", home)
+        .args(["plan", ws.to_str().unwrap(), "--include-orphans", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_plan.status.code(), Some(0));
+    let blocked_plan_json: serde_json::Value =
+        serde_json::from_slice(&blocked_plan.stdout).unwrap();
+    assert!(blocked_plan_json["items"].as_array().unwrap().is_empty());
+
+    let blocked_exec = Command::new(sj_bin())
+        .env("HOME", home)
+        .args([
+            "plan",
+            ws.to_str().unwrap(),
+            "--include-orphans",
+            "--execute",
+            "--confirm",
+            "--plan-sha256",
+            &pre_plan.plan_sha256,
+            "--item",
+            &pre_item_id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(blocked_exec.status.code(), Some(2));
+    assert!(unpushed_checkout.exists());
+    assert!(unpushed_checkout.join("unpushed.txt").exists());
+
+    let rollback_err = sj_core::plan::execute_plan_item(
+        &pre_plan,
+        &sj_core::plan::ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: pre_plan.plan_sha256.clone(),
+            item_id: pre_item_id,
+        },
+        &ctx,
+    );
+    assert!(
+        matches!(rollback_err, Err(sj_core::SjError::ExecutionGate(_))),
+        "expected ExecutionGate error on unpushed checkout, got: {rollback_err:?}"
+    );
+    assert!(unpushed_checkout.exists());
+    assert!(unpushed_checkout.join("unpushed.txt").exists());
+    let rollback_leftovers: Vec<_> = fs::read_dir(&ws)
+        .unwrap()
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+        .collect();
+    assert!(
+        rollback_leftovers.is_empty(),
+        "expected zero .sj-stage-* residue after rollback, found: {rollback_leftovers:?}"
+    );
+}
