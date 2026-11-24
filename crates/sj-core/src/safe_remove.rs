@@ -10,7 +10,6 @@ const LARGE_FILE_THRESHOLD: u64 = 64 * 1024 * 1024;
 const LARGE_FILE_CHUNK: usize = 1024 * 1024;
 #[cfg(unix)]
 const MAX_DIR_DEPTH: usize = 256;
-#[cfg(unix)]
 const MAX_DIR_ENTRIES: usize = 100_000;
 
 fn sha256_to_hex(digest: impl AsRef<[u8]>) -> String {
@@ -373,6 +372,16 @@ mod unix_impl {
                     &name_c,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )?;
+                let sub_st = fstat_fd(&sub_fd)?;
+                if (sub_st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                    || (sub_st.st_dev as u64) != state.root_dev
+                    || !stat_matches_dev_ino(&sub_st, &child_st)
+                {
+                    return Err(SjError::ExecutionGate(format!(
+                        "subdirectory fd identity mismatch: {}",
+                        child_full_path.display()
+                    )));
+                }
                 inspect_dir_fd_recursive(&sub_fd, &child_full_path, &rel_path, depth + 1, state)?;
             } else if mode == libc::S_IFREG {
                 if !in_dot_git {
@@ -449,6 +458,15 @@ mod unix_impl {
                     &name_c,
                     libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
                 )?;
+                let sub_st = fstat_fd(&sub_fd)?;
+                if (sub_st.st_mode & libc::S_IFMT) != libc::S_IFDIR
+                    || (sub_st.st_dev as u64) != root_dev
+                    || !stat_matches_dev_ino(&sub_st, &child_st)
+                {
+                    return Err(SjError::ExecutionGate(
+                        "subdirectory fd identity mismatch during deletion".to_string(),
+                    ));
+                }
                 delete_dir_fd_post_order(&sub_fd, root_dev, depth + 1)?;
                 drop(sub_fd);
                 let rc = unsafe {
@@ -746,17 +764,6 @@ mod unix_impl {
         }
 
         let root_dev = st_root.st_dev as u64;
-        let mut state = InspectState {
-            root_dev,
-            seen: 0,
-            skip_dot_git: is_orphan,
-            ctx,
-            records: Vec::new(),
-        };
-        inspect_dir_fd_recursive(&target_dir_fd, &canon_target, "", 1, &mut state)?;
-        state.records.sort();
-        let tree_hash = hash_dir_tree_records(&state.records);
-
         let (git_head, git_tree, git_refs_sha256) = if is_orphan {
             let st_lstat_before = lstat_path(&canon_target)?;
             let st_at_before = fstatat_nofollow(&parent_fd, &leaf_c)?;
@@ -794,6 +801,17 @@ mod unix_impl {
         } else {
             (None, None, None)
         };
+
+        let mut state = InspectState {
+            root_dev,
+            seen: 0,
+            skip_dot_git: is_orphan,
+            ctx,
+            records: Vec::new(),
+        };
+        inspect_dir_fd_recursive(&target_dir_fd, &canon_target, "", 1, &mut state)?;
+        state.records.sort();
+        let tree_hash = hash_dir_tree_records(&state.records);
 
         let (ms, mn) = stat_mtime(&st_root);
         let live_snapshot = TargetSnapshot {
@@ -833,6 +851,179 @@ mod unix_impl {
     }
 }
 
+fn metadata_mtime(meta: &std::fs::Metadata) -> (Option<i64>, Option<u32>) {
+    match meta.modified() {
+        Ok(st) => match st.duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => (Some(d.as_secs() as i64), Some(d.subsec_nanos())),
+            Err(e) => {
+                let d = e.duration();
+                let secs = d.as_secs() as i64;
+                let nanos = d.subsec_nanos();
+                if nanos == 0 {
+                    (Some(-secs), Some(0))
+                } else {
+                    (Some(-secs - 1), Some(1_000_000_000 - nanos))
+                }
+            }
+        },
+        Err(_) => (None, None),
+    }
+}
+
+pub fn capture_snapshot_portable(
+    target: &Path,
+    is_orphan: bool,
+    ctx: &ProtectionContext,
+) -> Result<TargetSnapshot, SjError> {
+    if is_symlink_path(target)? {
+        return Err(SjError::ProtectedPath(format!(
+            "refusing symlink target: {}",
+            target.display()
+        )));
+    }
+    let prot = check_path_protection(target, ctx);
+    if prot.protected {
+        return Err(SjError::ProtectedPath(prot.reason));
+    }
+
+    let meta = std::fs::symlink_metadata(target)?;
+    if meta.file_type().is_symlink() {
+        return Err(SjError::ProtectedPath(format!(
+            "refusing symlink target: {}",
+            target.display()
+        )));
+    }
+    let (mtime_secs, mtime_nanos) = metadata_mtime(&meta);
+
+    if meta.is_file() {
+        let mut file = std::fs::File::open(target)?;
+        let size = meta.len();
+        let content_hash = hash_file_reader(&mut file, size)?;
+        Ok(TargetSnapshot {
+            entry_type: "file".to_string(),
+            dev: None,
+            ino: None,
+            size,
+            mtime_secs,
+            mtime_nanos,
+            content_or_tree_sha256: content_hash,
+            git_head: None,
+            git_tree: None,
+            git_refs_sha256: None,
+        })
+    } else if meta.is_dir() {
+        let mut seen: usize = 0;
+        let mut records: Vec<DirTreeRecord> = Vec::new();
+        let walker = jwalk::WalkDir::new(target)
+            .follow_links(false)
+            .skip_hidden(false);
+
+        for entry_res in walker {
+            let entry = entry_res.map_err(|e| {
+                SjError::ExecutionGate(format!("portable snapshot walk failed: {e}"))
+            })?;
+            if entry.read_children_error.is_some() {
+                return Err(SjError::ExecutionGate(format!(
+                    "unreadable directory during snapshot: {}",
+                    entry.path().display()
+                )));
+            }
+            if entry.depth == 0 {
+                continue;
+            }
+            seen += 1;
+            if seen > MAX_DIR_ENTRIES {
+                return Err(SjError::ExecutionGate(format!(
+                    "directory entry limit ({MAX_DIR_ENTRIES}) exceeded"
+                )));
+            }
+            let entry_path = entry.path();
+            if entry.file_type.is_symlink() || is_symlink_path(&entry_path)? {
+                return Err(SjError::ProtectedPath(format!(
+                    "symlink_descendant:{}",
+                    entry_path.display()
+                )));
+            }
+            let prot = check_path_protection(&entry_path, ctx);
+            if prot.protected {
+                return Err(SjError::ProtectedPath(format!(
+                    "protected_descendant:{}",
+                    prot.reason
+                )));
+            }
+            let rel = entry_path.strip_prefix(target).map_err(|_| {
+                SjError::ExecutionGate(format!(
+                    "entry {} outside target {}",
+                    entry_path.display(),
+                    target.display()
+                ))
+            })?;
+            let rel_path = rel
+                .components()
+                .map(|c| c.as_os_str().to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+                .join("/");
+            let in_dot_git = is_orphan && (rel_path == ".git" || rel_path.starts_with(".git/"));
+            if in_dot_git {
+                continue;
+            }
+
+            let child_meta = std::fs::symlink_metadata(&entry_path)?;
+            if child_meta.file_type().is_symlink() {
+                return Err(SjError::ProtectedPath(format!(
+                    "symlink_descendant:{}",
+                    entry_path.display()
+                )));
+            }
+            let entry_type = if child_meta.is_dir() {
+                "dir"
+            } else if child_meta.is_file() {
+                "file"
+            } else {
+                return Err(SjError::ProtectedPath(format!(
+                    "refusing special file descendant: {}",
+                    entry_path.display()
+                )));
+            };
+            let (ms, mn) = metadata_mtime(&child_meta);
+            records.push((
+                rel_path,
+                entry_type.to_string(),
+                None,
+                None,
+                child_meta.len(),
+                ms,
+                mn,
+            ));
+        }
+        records.sort();
+        let tree_hash = hash_dir_tree_records(&records);
+        let (git_head, git_tree, git_refs_sha256) = if is_orphan {
+            let (h, t, r) = capture_git_snapshot_identity(target)?;
+            (Some(h), Some(t), Some(r))
+        } else {
+            (None, None, None)
+        };
+        Ok(TargetSnapshot {
+            entry_type: "dir".to_string(),
+            dev: None,
+            ino: None,
+            size: meta.len(),
+            mtime_secs,
+            mtime_nanos,
+            content_or_tree_sha256: tree_hash,
+            git_head,
+            git_tree,
+            git_refs_sha256,
+        })
+    } else {
+        Err(SjError::ProtectedPath(format!(
+            "refusing non-file/non-dir target: {}",
+            target.display()
+        )))
+    }
+}
+
 pub fn capture_target_snapshot(
     target: &Path,
     is_orphan: bool,
@@ -844,11 +1035,7 @@ pub fn capture_target_snapshot(
     }
     #[cfg(not(unix))]
     {
-        let _ = (target, is_orphan, ctx);
-        Err(SjError::ExecutionGate(
-            "safe handle-anchored execution is not supported on this platform; dry-run planning only"
-                .to_string(),
-        ))
+        capture_snapshot_portable(target, is_orphan, ctx)
     }
 }
 

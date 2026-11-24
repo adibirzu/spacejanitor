@@ -551,9 +551,11 @@ pub fn discover_nested_repos_exhaustive(
         if seen > max_entries {
             return Err("nested_scan_budget_exceeded".to_string());
         }
-        if entry.depth > 0 && entry.file_name() == ".git" {
+        if entry.depth > 1 && entry.file_name() == ".git" {
             if let Some(parent) = entry.path().parent() {
-                repos.insert(parent.to_path_buf());
+                if parent != repo {
+                    repos.insert(parent.to_path_buf());
+                }
             }
         }
     }

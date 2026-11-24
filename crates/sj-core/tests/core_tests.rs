@@ -1,10 +1,11 @@
 use sj_core::{
-    orphans::{inspect_orphans, OrphanOptions},
+    orphans::{discover_nested_repos_exhaustive, inspect_orphans, OrphanOptions},
     plan::{
         build_remediation_plan, execute_plan_item, execute_plan_item_with_roots, ExecutionGate,
         PlanOptions,
     },
     protect::{check_path_protection, ProtectionContext},
+    safe_remove::capture_snapshot_portable,
     scan::{scan_directory, ScanOptions, ScanStatus, ScanThresholds},
     trash::discover_trash_at,
     SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
@@ -1413,4 +1414,83 @@ fn snapshot_binding_rejects_same_size_replacement_and_git_drift() {
         "re-committed orphan_worktree must fail snapshot check"
     );
     assert!(drifting_orphan.exists());
+}
+
+#[test]
+fn capture_snapshot_portable_covers_regular_file_and_clean_orphan_deterministically() {
+    let dir = tempdir().unwrap();
+    let root = dir.path();
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+
+    let file_path = root.join("sample.txt");
+    fs::write(&file_path, b"hello portable\n").unwrap();
+
+    let snap1 = capture_snapshot_portable(&file_path, false, &ctx).unwrap();
+    let snap2 = capture_snapshot_portable(&file_path, false, &ctx).unwrap();
+    assert_eq!(snap1, snap2);
+    assert_eq!(snap1.entry_type, "file");
+    assert_eq!(snap1.dev, None);
+    assert_eq!(snap1.ino, None);
+    assert_eq!(snap1.size, 15);
+    assert!(!snap1.content_or_tree_sha256.is_empty());
+    assert_eq!(snap1.git_head, None);
+    assert_eq!(snap1.git_tree, None);
+    assert_eq!(snap1.git_refs_sha256, None);
+
+    let remote_dir = root.join("remote.git");
+    fs::create_dir_all(&remote_dir).unwrap();
+    run_git(&remote_dir, &["init", "--bare"]);
+
+    let orphan_dir = root.join("orphan_repo");
+    fs::create_dir_all(&orphan_dir).unwrap();
+    run_git(&orphan_dir, &["init"]);
+    fs::write(orphan_dir.join("README.md"), "portable snapshot\n").unwrap();
+    run_git(&orphan_dir, &["add", "README.md"]);
+    run_git(&orphan_dir, &["commit", "-m", "init"]);
+    run_git(
+        &orphan_dir,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    run_git(&orphan_dir, &["push", "-u", "origin", "HEAD"]);
+
+    let dir_snap1 = capture_snapshot_portable(&orphan_dir, true, &ctx).unwrap();
+    let dir_snap2 = capture_snapshot_portable(&orphan_dir, true, &ctx).unwrap();
+    assert_eq!(dir_snap1, dir_snap2);
+    assert_eq!(dir_snap1.entry_type, "dir");
+    assert_eq!(dir_snap1.dev, None);
+    assert_eq!(dir_snap1.ino, None);
+    assert!(!dir_snap1.content_or_tree_sha256.is_empty());
+    assert!(dir_snap1.git_head.as_deref().is_some_and(|s| !s.is_empty()));
+    assert!(dir_snap1.git_tree.as_deref().is_some_and(|s| !s.is_empty()));
+    assert!(dir_snap1
+        .git_refs_sha256
+        .as_deref()
+        .is_some_and(|s| !s.is_empty()));
+}
+
+#[test]
+fn discover_nested_repos_exhaustive_excludes_outer_repo_and_finds_children() {
+    let dir = tempdir().unwrap();
+    let outer = dir.path().join("outer");
+    fs::create_dir_all(&outer).unwrap();
+    run_git(&outer, &["init"]);
+    fs::write(outer.join("README.md"), "outer\n").unwrap();
+    run_git(&outer, &["add", "README.md"]);
+    run_git(&outer, &["commit", "-m", "init outer"]);
+
+    let empty = discover_nested_repos_exhaustive(&outer, 100_000).unwrap();
+    assert!(
+        empty.is_empty(),
+        "outer repo itself must not be returned as nested: {empty:?}"
+    );
+
+    let child = outer.join("packages").join("child");
+    fs::create_dir_all(&child).unwrap();
+    run_git(&child, &["init"]);
+    fs::write(child.join("lib.rs"), "pub fn ok() {}\n").unwrap();
+    run_git(&child, &["add", "lib.rs"]);
+    run_git(&child, &["commit", "-m", "init child"]);
+
+    let nested = discover_nested_repos_exhaustive(&outer, 100_000).unwrap();
+    assert_eq!(nested, vec![child]);
 }
