@@ -11,21 +11,23 @@ All `sj` commands are **read-only by default** and support `--json` for machine-
 | Command | Flags | JSON Schema | Status |
 |---|---|---|---|
 | `sj doctor` | `[--json]` | `spacejanitor.doctor.v1` | M1 (shipped) |
-| `sj scan [path]` | `[--depth N] [--top N] [--same-fs] [--json]` | `spacejanitor.storage.v1` / `spacejanitor.disk.v1` | M1 (shipped) |
+| `sj scan [path]` | `[--depth N] [--top N] [--same-fs] [--json]` | `spacejanitor.storage.v1` | M1 (shipped) |
 | `sj trash` | `[--path <dir>] [--json]` | `spacejanitor.trash.v1` | M1 (shipped) |
 | `sj orphans [path]` | `[--depth N] [--json]` | `spacejanitor.orphans.v1` | M1 (shipped) |
-| `sj plan [path]` | `[--include-trash] [--include-orphans] [--trash-path <dir>] [--depth N] [--execute --confirm --plan-sha256 <sha> --item <id>] [--json]` | `spacejanitor.proposal.v1` / `spacejanitor.plan.v1` | M1 (shipped) |
-| `sj memory` | `[--top N] [--json]` | `spacejanitor.memory.v1` | M2 |
-| `sj blockers` | `[--json]` | `spacejanitor.blockers.v1` | M2 |
-| `sj mcp-audit` | `[--config-dir <path>...] [--json]` | `spacejanitor.mcp_audit.v1` | M2 |
-| `sj reap` | `[--min-age-mins 30] [--dry-run] [--execute --confirm <phrase> --plan-sha256 <sha>] [--json]` | `spacejanitor.reap.v1` | M3 |
-| `sj serve-stdio` | *(NDJSON JSON-RPC 2.0 on stdin/stdout)* | `spacejanitor.*.v1` | M4 |
+| `sj plan [path]` | `[--include-trash] [--include-orphans] [--trash-path <dir>] [--depth N] [--execute --confirm --plan-sha256 <sha> --item <id>] [--json]` | `spacejanitor.proposal.v1` | M1 (shipped) |
+| `sj memory` | `[--top N] [--json]` | `spacejanitor.memory.v1` *(Planned M2)* | M2 (planned) |
+| `sj blockers` | `[--json]` | `spacejanitor.blockers.v1` *(Planned M2)* | M2 (planned) |
+| `sj mcp-audit` | `[--config-dir <path>...] [--json]` | `spacejanitor.mcp_audit.v1` *(Planned M3)* | M3 (planned) |
+| `sj reap` | `[--min-age-mins 30] [--dry-run] [--execute --confirm <phrase> --plan-sha256 <sha>] [--json]` | `spacejanitor.reap.v1` *(Planned M3)* | M3 (planned) |
+| `sj serve-stdio` | *(NDJSON JSON-RPC 2.0 on stdin/stdout)* | `spacejanitor.*.v1` | M4 (planned) |
+
+> **Schema Contracts:** Shipped M1 schemas are `spacejanitor.doctor.v1`, `spacejanitor.storage.v1`, `spacejanitor.trash.v1`, `spacejanitor.orphans.v1`, and `spacejanitor.proposal.v1`. Target contracts `spacejanitor.memory.v1`, `spacejanitor.blockers.v1`, `spacejanitor.mcp_audit.v1`, and `spacejanitor.reap.v1` are **Planned (M2/M3)**.
 
 ### Exit Codes
 
 - `0`: Success (healthy or dry-run completed cleanly).
 - `1`: Operational/runtime error (I/O error, git error, JSON serialization error, or protected path refusal).
-- `2`: Usage or invalid execution gate error (e.g., `--execute` without `--confirm` / matching `--plan-sha256` / `--item`), or threshold breach when `--fail-on-alert` is set.
+- `2`: Usage or invalid execution gate error (e.g., `--execute` without `--confirm` / matching `--plan-sha256` / `--item`), or threshold breach when `--fail-on-alert` *(Planned, ADR-003 — not yet a shipped flag on `sj scan`)* is set.
 
 ### Examples
 
@@ -56,19 +58,26 @@ sj plan ~/dev --include-trash --include-orphans \
 
 `spacejanitor-axi` is designed for AI coding agents and terminal operators. It prints compact **TOON** tables by default to minimize token usage, and emits `spacejanitor.*.v1` JSON with `--json`.
 
+> **Current Status (`main` / M1):** Only `doctor` is implemented today; all other collector subcommands (`disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`) currently return `{"status": "scaffold", ...}` until M4 wires them to `sj serve-stdio`. Run from source today via `node packages/cli/bin/spacejanitor.mjs`, or via `npx spacejanitor-axi` *(once published to npm)*.
+
 ```bash
+# Run from source today (M1)
+node packages/cli/bin/spacejanitor.mjs doctor [--json]
+
+# Via npx (once published to npm)
 npx spacejanitor-axi <command> [--json]
 ```
 
-Supported subcommands:
-- `summary` — Combined health overview across storage, memory, blockers, and orphans
-- `disk` — Storage capacity and tiered cleanup candidates
-- `memory` — True memory footprint (`RSS + Compressed + Swap`) by owner group
-- `blockers` — Kernel vnode, `inotify`, handle, and VFS lock diagnostics
-- `mcp-audit` — MCP server fan-out and redacted secret audit
-- `orphans` — Clean/pushed vs dirty git worktrees
-- `remediate` — Dry-run preview (never mutates without explicit confirmation flags)
-- `doctor` — Platform readiness and contract versions
+Subcommands in `packages/cli/bin/spacejanitor.mjs`:
+- `doctor` *(M1 shipped)* — Platform readiness and contract versions (`spacejanitor.doctor.v1`)
+- `disk` *(scaffold; M4)* — Storage capacity and tiered cleanup candidates
+- `memory` *(scaffold; M4)* — True memory footprint (`RSS + Compressed + Swap`) by owner group
+- `blockers` *(scaffold; M4)* — Kernel vnode, `inotify`, handle, and VFS lock diagnostics
+- `orphans` *(scaffold; M4)* — Clean/pushed vs dirty git worktrees
+- `trash` *(scaffold; M4)* — OS Trash / Recycle Bin reclamation candidates
+- `mcp-audit` *(scaffold; M4)* — MCP server fan-out and redacted secret audit
+- `remediate` *(scaffold; M4)* — Dry-run preview (never mutates without explicit confirmation flags)
+- `summary` *(Planned M4 — not in current CLI)* — Combined health overview across storage, memory, blockers, and orphans
 
 > **Agent Safety Rule:** Agents must **never** pass `--execute` automatically. Use read-only diagnostics or dry-run previews and present the plan to the human operator.
 
@@ -93,15 +102,15 @@ Supported subcommands:
 SpaceJanitor refuses to stage or delete:
 - System roots (`/`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows`) and `$HOME`
 - Credential & agent directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`)
-- Secret & key files (`.env`, `.env.*`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`, `id_ecdsa*`, `id_dsa*`)
+- Secret & key files (`.env`, `.env.*`, `*.env`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*` — custom suffix names without a dot such as `id_rsa_work` or `.envrc` are **not** matched by the default filename rule unless placed inside a protected directory such as `~/.ssh`)
 - VM disk images (`*.vmdk`, `*.qcow2`, `*.vhdx`, `*.vdi`, `*.raw`, `*.img`)
 - Any path containing a `.sj-stage-*` quarantine staging segment or dangling/unresolvable symlinks
 
 ### Troubleshooting FAQ
 
 - **Why was my worktree marked `BLOCKED` in `sj orphans`?**
-  `sj orphans` requires a clean working tree (`git status --porcelain` empty), at least one configured remote, and zero unpushed commits across all branches—including nested sub-repositories. Commit/push or stash your work, or inspect it manually.
+  `sj orphans` requires a clean working tree (`git status --porcelain` empty), at least one configured remote, no git stashes (`has_stashes`), and zero unpushed commits across all branches—including nested sub-repositories. Commit and push your work (and clear or review any stashes), or inspect the tree manually.
 - **Why does `sj plan --execute` exit with code `2`?**
-  Execution requires all three gates: `--execute`, `--confirm`, `--plan-sha256 <exact_sha>`, and `--item <exact_id>` (and `--trash-path` cannot be combined with `--execute`).
+  Execution requires all four gates: `--execute`, `--confirm`, `--plan-sha256 <exact_sha>`, and `--item <exact_id>` (and `--trash-path` cannot be combined with `--execute`).
 - **Why did the Local SLM Advisor fall back to deterministic rules?**
   Either no loopback endpoint is configured, or available system RAM is below `2.5 GiB`, triggering the memory-pressure self-guard so the advisor never worsens swap thrashing.

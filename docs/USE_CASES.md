@@ -31,14 +31,14 @@ scan: /Users/<you>/dev (84210944000 bytes, 148230 files, status=Ok)
 trash: /Users/<you>/.Trash (exists=true, items=42, total=9812031488B, reclaimable=9812031488B, protected=0)
 orphans: /Users/<you>/dev (scanned=18, safe=1, blocked=2)
   SAFE    /Users/<you>/dev/worktrees/feature-old (14205110272B)
-  BLOCKED /Users/<you>/dev/worktrees/wip-branch [dirty_working_tree]
-  BLOCKED /Users/<you>/dev/scratch-notes [missing_remote]
+  BLOCKED /Users/<you>/dev/worktrees/wip-branch [dirty_or_untracked]
+  BLOCKED /Users/<you>/dev/scratch-notes [no_remote]
 ```
 
 ### How SpaceJanitor Solves It Safely
-- **Recursive Git Proof:** `sj orphans` verifies that a candidate tree has a valid `.git`, zero uncommitted/untracked files (`git status --porcelain` empty), at least one remote, and zero unpushed branch commits—including nested sub-repositories. Anything dirty or unpushed is listed under `BLOCKED` and excluded.
-- **Protected Path Enforcement:** Even if Trash or a scan root contains `.ssh`, `.env`, VM images (`*.qcow2`, `*.vmdk`), or user-configured protected paths, `sj-core` excludes them deterministically.
-- **APFS & Snapshot Awareness:** SpaceJanitor flags snapshot-held space as informational rather than generating unsafe deletions.
+- **Recursive Git Proof (`M1`):** `sj orphans` verifies that a candidate tree has a valid `.git`, zero uncommitted/untracked files (`git status --porcelain` empty), at least one remote, no stashes (`has_stashes`), and zero unpushed branch commits across all branches—including nested sub-repositories. Anything dirty or unpushed is listed under `BLOCKED` and excluded.
+- **Protected Path Enforcement (`M1`):** Even if Trash or a scan root contains `.ssh`, `.env`, or VM images (`*.qcow2`, `*.vmdk`), `sj-core` excludes them deterministically via `ProtectionContext::from_env()` (default home and built-in rules in `M1`; custom user-configured protected-path CLI flags are a planned enhancement).
+- **APFS & Snapshot Awareness *(Planned `M2`)*:** Reporting APFS snapshot-held space via `tmutil` as informational rather than generating unsafe deletions is a planned `M2` enhancement.
 
 ### Verification
 
@@ -123,7 +123,7 @@ Run `sj blockers --json` after stopping a runaway watcher or raising `fs.inotify
 ### Symptom
 Running multiple AI editors and CLI agents spawns dozens or hundreds of duplicate stdio MCP servers (`npx` -> `npm exec` -> `node`, or `uvx` -> `python`). Worse, some MCP configs pass API keys or bearer tokens as CLI flags (`--api-key=...`, `--token=...`), exposing them in `ps` output.
 
-### Read-Only Command *(M2)*
+### Read-Only Command *(M3)*
 
 ```bash
 sj mcp-audit --config-dir ~/.config --config-dir ~/.cursor
@@ -184,20 +184,24 @@ AI coding agents waste thousands of context tokens parsing verbose `du`/`top`/`p
 
 ### Read-Only Commands
 
-```bash
-# Compact TOON output for coding agents (low token overhead)
-npx spacejanitor-axi summary
+> **Current Status (`main` / M1):** In `spacejanitor-axi`, only `doctor` is implemented today; all other collector subcommands (`disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`) currently return `{"status": "scaffold", ...}` until M4 ships (`summary` is Planned M4). Run from source today via `node packages/cli/bin/spacejanitor.mjs`, or via `npx spacejanitor-axi` *(once published to npm)*.
 
-# Machine-readable v1 JSON contract
+```bash
+# Run from source today (M1) — compact TOON output or --json
+node packages/cli/bin/spacejanitor.mjs doctor
+node packages/cli/bin/spacejanitor.mjs doctor --json
+
+# Via npx (once published to npm; collector wiring lands in M4)
+npx spacejanitor-axi doctor --json
 npx spacejanitor-axi memory --json
 
-# Optional local SLM advisor (M6, strictly 127.0.0.1 / offline GGUF, 0 MiB idle)
-sj advise --plan-json plan.json
+# Optional local SLM advisor (Planned M6, strictly 127.0.0.1 / offline GGUF, 0 MiB idle)
+spacejanitor advise
 ```
 
 ### How SpaceJanitor Solves It Safely
 - **AXI Contract:** `spacejanitor-axi` defaults to compact line-oriented TOON tables and supports `--json` for `spacejanitor.*.v1` schemas. Agent skills ([skills/spacejanitor-axi/SKILL.md](../skills/spacejanitor-axi/SKILL.md)) enforce never passing `--execute` automatically.
-- **Zero-Cloud, Zero-Idle SLM:** When enabled, the optional Local SLM Advisor (`0.5B`–`1.5B` GGUF or local `127.0.0.1` Ollama) runs only on explicit request, receives only redacted metadata, checks that free RAM is `>= 2.5 GiB`, and has **zero execution capability**—every suggestion is re-validated by `sj-core` and requires standard two-step human confirmation.
+- **Zero-Cloud, Zero-Idle SLM (`M6`):** When enabled, the optional Local SLM Advisor (`0.5B`–`1.5B` GGUF or local `127.0.0.1` Ollama) runs only on explicit request, receives only redacted metadata, checks that free RAM is `>= 2.5 GiB`, and has **zero execution capability**—every suggestion is re-validated by `sj-core` and requires standard two-step human confirmation.
 
 ### Verification
-Run `npx spacejanitor-axi doctor --json` to confirm `safetyMode: "dry-run-default"` and verify local contract readiness.
+Run `node packages/cli/bin/spacejanitor.mjs doctor --json` (or `npx spacejanitor-axi doctor --json` once published to npm) to confirm `safetyMode: "dry-run-default"` and verify local contract readiness.
