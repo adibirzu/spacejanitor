@@ -52,19 +52,32 @@ pub fn parse_size_token(raw: &str) -> Option<u64> {
     if cleaned.is_empty() || cleaned == "-" || cleaned.eq_ignore_ascii_case("n/a") {
         return Some(0);
     }
-    let last = cleaned.chars().last()?;
-    let (num_str, mult): (&str, f64) = match last {
-        'B' | 'b' => (&cleaned[..cleaned.len() - 1], 1.0),
-        'K' | 'k' => (&cleaned[..cleaned.len() - 1], 1024.0),
-        'M' | 'm' => (&cleaned[..cleaned.len() - 1], 1024.0 * 1024.0),
-        'G' | 'g' => (&cleaned[..cleaned.len() - 1], 1024.0 * 1024.0 * 1024.0),
-        'T' | 't' => (
-            &cleaned[..cleaned.len() - 1],
-            1024.0 * 1024.0 * 1024.0 * 1024.0,
-        ),
-        '0'..='9' => (cleaned, 1.0),
-        _ => return None,
-    };
+    let low = cleaned.to_ascii_lowercase();
+    let unit_table: &[(&str, f64)] = &[
+        ("kib", 1024.0),
+        ("mib", 1024.0 * 1024.0),
+        ("gib", 1024.0 * 1024.0 * 1024.0),
+        ("tib", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("ki", 1024.0),
+        ("mi", 1024.0 * 1024.0),
+        ("gi", 1024.0 * 1024.0 * 1024.0),
+        ("ti", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("kb", 1024.0),
+        ("mb", 1024.0 * 1024.0),
+        ("gb", 1024.0 * 1024.0 * 1024.0),
+        ("tb", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+        ("b", 1.0),
+        ("k", 1024.0),
+        ("m", 1024.0 * 1024.0),
+        ("g", 1024.0 * 1024.0 * 1024.0),
+        ("t", 1024.0 * 1024.0 * 1024.0 * 1024.0),
+    ];
+    let (num_str, mult) =
+        if let Some((suffix, m)) = unit_table.iter().find(|(s, _)| low.ends_with(s)) {
+            (&cleaned[..cleaned.len() - suffix.len()], *m)
+        } else {
+            (cleaned, 1.0)
+        };
     let val: f64 = num_str.trim().parse().ok()?;
     if val.is_sign_negative() || !val.is_finite() {
         return None;
@@ -212,7 +225,8 @@ pub fn parse_macos_top(top_out: &str) -> Vec<ProcessMemoryEntry> {
         let resident_bytes = parse_size_token(mem_tok).unwrap_or(0);
         let compressed_bytes = parse_size_token(cmprs_tok).unwrap_or(0);
         let ports_count = ports_tok.trim_end_matches(['+', '-']).parse::<u32>().ok();
-        let true_footprint_bytes = resident_bytes.saturating_add(compressed_bytes);
+        // macOS `top`'s MEM column already includes compressed footprint.
+        let true_footprint_bytes = resident_bytes.max(compressed_bytes);
 
         entries.push(ProcessMemoryEntry {
             pid,
@@ -454,7 +468,11 @@ pub fn parse_windows_memory_json(
                 .get("PrivatePageCount")
                 .and_then(|v| v.as_u64())
                 .unwrap_or(ws);
-            let page_file = p.get("PageFileUsage").and_then(|v| v.as_u64()).unwrap_or(0);
+            let page_file = p
+                .get("PageFileUsage")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0)
+                .saturating_mul(1024);
             let handles = p
                 .get("HandleCount")
                 .and_then(|v| v.as_u64())
@@ -507,7 +525,7 @@ fn finalize_memory_report(
 #[cfg(target_os = "macos")]
 fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError> {
     let mut warnings = Vec::new();
-    let hw_mem = Command::new("sysctl")
+    let hw_mem = Command::new("/usr/sbin/sysctl")
         .args(["-n", "hw.memsize"])
         .output()
         .ok()
@@ -519,7 +537,7 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
                 .ok()
         });
 
-    let vm_out = Command::new("vm_stat").output();
+    let vm_out = Command::new("/usr/bin/vm_stat").output();
     let mut system = match vm_out {
         Ok(o) if o.status.success() => {
             parse_macos_vm_stat(&String::from_utf8_lossy(&o.stdout), hw_mem)
@@ -539,7 +557,10 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
         }
     };
 
-    if let Ok(o) = Command::new("sysctl").args(["vm.swapusage"]).output() {
+    if let Ok(o) = Command::new("/usr/sbin/sysctl")
+        .args(["vm.swapusage"])
+        .output()
+    {
         if o.status.success() {
             let (st, su) = parse_macos_swapusage(&String::from_utf8_lossy(&o.stdout));
             system.swap_total_bytes = st;
@@ -554,7 +575,7 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
         }
     }
 
-    let mut processes = match Command::new("top")
+    let mut processes = match Command::new("/usr/bin/top")
         .args(["-l", "1", "-stats", "pid,ppid,command,mem,cmprs,ports"])
         .output()
     {
@@ -564,7 +585,7 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
 
     if processes.is_empty() {
         warnings.push("top unavailable or empty; fell back to ps".to_string());
-        if let Ok(o) = Command::new("ps")
+        if let Ok(o) = Command::new("/bin/ps")
             .args(["-axo", "pid=,ppid=,rss=,comm="])
             .output()
         {
@@ -592,6 +613,12 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
     }
     let system = parse_linux_meminfo(&meminfo);
     let mut processes = Vec::new();
+    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    let page_size = if page_size > 0 {
+        page_size as u64
+    } else {
+        4096
+    };
 
     if let Ok(entries) = std::fs::read_dir("/proc") {
         for ent in entries.flatten() {
@@ -603,7 +630,8 @@ fn collect_platform_memory(opts: &MemoryOptions) -> Result<MemoryReport, SjError
             let Ok(stat_line) = std::fs::read_to_string(proc_dir.join("stat")) else {
                 continue;
             };
-            let Some((_, ppid, comm, stat_rss)) = parse_linux_proc_stat(&stat_line, 4096) else {
+            let Some((_, ppid, comm, stat_rss)) = parse_linux_proc_stat(&stat_line, page_size)
+            else {
                 continue;
             };
             let cmdline = std::fs::read(proc_dir.join("cmdline"))
@@ -759,9 +787,9 @@ PID    PPID  COMMAND          MEM      CMPRS    PORTS
         assert!(procs[0].command.contains("--token=<REDACTED>"));
         assert_eq!(procs[0].resident_bytes, 512 * 1024 * 1024);
         assert_eq!(procs[0].compressed_bytes, 256 * 1024 * 1024);
-        assert_eq!(procs[0].true_footprint_bytes, 768 * 1024 * 1024);
+        assert_eq!(procs[0].true_footprint_bytes, 512 * 1024 * 1024);
         assert_eq!(procs[0].ports_count, Some(42));
-        assert_eq!(procs[1].true_footprint_bytes, (1024 + 128) * 1024 * 1024);
+        assert_eq!(procs[1].true_footprint_bytes, 1024 * 1024 * 1024);
     }
 
     #[test]
@@ -817,7 +845,7 @@ SwapPss:           32000 kB
                     "CommandLine": "node.exe mcp.js --api-key=secret_xyz",
                     "WorkingSetSize": 268435456,
                     "PrivatePageCount": 536870912,
-                    "PageFileUsage": 67108864,
+                    "PageFileUsage": 65536,
                     "HandleCount": 640
                 }
             ]
@@ -830,7 +858,7 @@ SwapPss:           32000 kB
         assert_eq!(procs[0].pid, 9001);
         assert!(!procs[0].command.contains("secret_xyz"));
         assert!(procs[0].command.contains("--api-key=<REDACTED>"));
-        assert_eq!(procs[0].true_footprint_bytes, 536_870_912 + 67_108_864);
+        assert_eq!(procs[0].true_footprint_bytes, 536_870_912 + 65_536 * 1024);
         assert_eq!(procs[0].ports_count, Some(640));
     }
 
@@ -842,5 +870,21 @@ SwapPss:           32000 kB
         for w in report.processes.windows(2) {
             assert!(w[0].true_footprint_bytes >= w[1].true_footprint_bytes);
         }
+    }
+
+    #[test]
+    fn parse_size_token_supports_iec_and_si_units() {
+        assert_eq!(parse_size_token("512Ki"), Some(512 * 1024));
+        assert_eq!(parse_size_token("512KiB"), Some(512 * 1024));
+        assert_eq!(parse_size_token("512KB"), Some(512 * 1024));
+        assert_eq!(parse_size_token("2Mi"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_token("2MiB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_token("2MB"), Some(2 * 1024 * 1024));
+        assert_eq!(parse_size_token("1Gi"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_token("1GiB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_token("1GB"), Some(1024 * 1024 * 1024));
+        assert_eq!(parse_size_token("1Ti"), Some(1024_u64.pow(4)));
+        assert_eq!(parse_size_token("1TiB"), Some(1024_u64.pow(4)));
+        assert_eq!(parse_size_token("1TB"), Some(1024_u64.pow(4)));
     }
 }

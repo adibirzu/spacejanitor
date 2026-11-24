@@ -154,7 +154,7 @@ pub fn evaluate_macos_blockers(
     let status = overall_status(&blockers);
     BlockersReport {
         schema: SCHEMA_BLOCKERS_V1.to_string(),
-        os: "darwin".to_string(),
+        os: "macos".to_string(),
         status,
         metrics: BlockerMetrics {
             vnodes_used,
@@ -342,7 +342,7 @@ pub fn parse_windows_blockers_json(raw_json: &str) -> Result<BlockersReport, SjE
 
 #[cfg(target_os = "macos")]
 fn sysctl_u64(key: &str) -> Option<u64> {
-    Command::new("sysctl")
+    Command::new("/usr/sbin/sysctl")
         .args(["-n", key])
         .output()
         .ok()
@@ -366,7 +366,7 @@ fn collect_platform_blockers() -> Result<BlockersReport, SjError> {
     let mut fseventsd_rss = None;
     let mut warnings = Vec::new();
 
-    match Command::new("ps")
+    match Command::new("/bin/ps")
         .args(["-axo", "state=,rss=,comm="])
         .output()
     {
@@ -485,6 +485,7 @@ mod tests {
             vec![],
         );
         assert_eq!(ok.schema, SCHEMA_BLOCKERS_V1);
+        assert_eq!(ok.os, "macos");
         assert_eq!(ok.status, "OK");
         assert!(ok.blockers.is_empty());
 

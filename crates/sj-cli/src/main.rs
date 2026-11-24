@@ -527,43 +527,70 @@ fn dispatch_rpc_method(
 
 fn run_serve_stdio(ctx: &ProtectionContext) -> Result<(), CliError> {
     let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
     let mut stdout = std::io::stdout();
+    let mut buf = Vec::new();
 
-    for line_res in stdin.lock().lines() {
-        let line = line_res.map_err(SjError::from)?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
+    loop {
+        buf.clear();
+        let n = lock.read_until(b'\n', &mut buf).map_err(SjError::from)?;
+        if n == 0 {
+            break;
         }
-        let resp = match serde_json::from_str::<serde_json::Value>(trimmed) {
-            Err(err) => jsonrpc_error(
+        let resp_opt = match std::str::from_utf8(&buf) {
+            Err(err) => Some(jsonrpc_error(
                 serde_json::Value::Null,
                 -32700,
-                &format!("parse error: {err}"),
-            ),
-            Ok(req) => {
-                let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
-                let method = req.get("method").and_then(|v| v.as_str());
-                let params = req
-                    .get("params")
-                    .cloned()
-                    .unwrap_or_else(|| serde_json::json!({}));
-                match method {
-                    None => jsonrpc_error(id, -32600, "invalid request: missing method"),
-                    Some(m) => match dispatch_rpc_method(m, &params, ctx) {
-                        Ok(result) => serde_json::json!({
-                            "jsonrpc": "2.0",
-                            "id": id,
-                            "result": result,
-                        }),
-                        Err((code, msg)) => jsonrpc_error(id, code, &msg),
-                    },
+                &format!("parse error: invalid utf-8: {err}"),
+            )),
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Err(err) => Some(jsonrpc_error(
+                        serde_json::Value::Null,
+                        -32700,
+                        &format!("parse error: {err}"),
+                    )),
+                    Ok(req) => {
+                        let has_id = req.is_object() && req.get("id").is_some();
+                        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let method = req.get("method").and_then(|v| v.as_str());
+                        let params = req
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        if !has_id {
+                            if let Some(m) = method {
+                                let _ = dispatch_rpc_method(m, &params, ctx);
+                            }
+                            None
+                        } else {
+                            Some(match method {
+                                None => {
+                                    jsonrpc_error(id, -32600, "invalid request: missing method")
+                                }
+                                Some(m) => match dispatch_rpc_method(m, &params, ctx) {
+                                    Ok(result) => serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": result,
+                                    }),
+                                    Err((code, msg)) => jsonrpc_error(id, code, &msg),
+                                },
+                            })
+                        }
+                    }
                 }
             }
         };
-        let encoded = serde_json::to_string(&resp).map_err(SjError::from)?;
-        writeln!(stdout, "{encoded}").map_err(SjError::from)?;
-        stdout.flush().map_err(SjError::from)?;
+        if let Some(resp) = resp_opt {
+            let encoded = serde_json::to_string(&resp).map_err(SjError::from)?;
+            writeln!(stdout, "{encoded}").map_err(SjError::from)?;
+            stdout.flush().map_err(SjError::from)?;
+        }
     }
 
     Ok(())

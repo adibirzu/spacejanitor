@@ -2997,3 +2997,74 @@ fn protect_cross_platform_posix_and_windows_roots() {
         "Non-protected Windows user temp path should not be blocked"
     );
 }
+
+#[test]
+fn protect_handles_windows_extended_prefixes_driveless_roots_and_unix_backslash_leaf() {
+    use sj_core::is_protected_path;
+
+    let win_home = "C:\\Users\\alice";
+    let exact = ["C:\\Users\\alice\\Documents\\tax"];
+
+    for protected_cand in [
+        "\\\\?\\C:\\Windows\\System32",
+        "\\\\.\\C:\\Windows",
+        "\\\\?\\C:\\",
+        "D:\\",
+        "\\Program Files\\App",
+        "\\ProgramData\\x",
+        "\\Users\\alice",
+        "\\Users\\alice\\Documents\\tax",
+        "C:\\Windows.\\System32",
+        "C:\\PROGRA~1\\App",
+        "C:\\PROGRA~2\\App",
+        "\\\\?\\UNC\\server\\share\\..\\..\\Windows\\System32",
+    ] {
+        assert!(
+            is_protected_path(protected_cand, win_home, &exact).protected,
+            "expected {protected_cand} to be protected"
+        );
+    }
+
+    // Also via check_path_protection for extended prefixes and driveless Windows roots
+    let win_ctx = ProtectionContext::new(
+        PathBuf::from(win_home),
+        vec![PathBuf::from("C:\\Users\\alice\\Documents\\tax")],
+    );
+    for protected_cand in [
+        "\\\\?\\C:\\Windows\\System32",
+        "\\\\.\\C:\\Windows",
+        "\\\\?\\C:\\",
+        "D:\\",
+        "\\Program Files\\App",
+        "\\ProgramData\\x",
+        "\\Users\\alice",
+        "C:\\Windows.\\System32",
+    ] {
+        assert!(
+            check_path_protection(Path::new(protected_cand), &win_ctx).protected,
+            "check_path_protection expected {protected_cand} to be protected"
+        );
+    }
+
+    // Unix: relative leaf name starting with '\' inside ~/.ssh must stay relative to ~/.ssh
+    #[cfg(unix)]
+    {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        #[allow(clippy::join_absolute_paths)]
+        let leaf_in_ssh = ssh_dir.join("\\newfile");
+        std::fs::write(&leaf_in_ssh, "dummy").unwrap();
+        let ctx = ProtectionContext::new(home, vec![]);
+        assert!(
+            check_path_protection(&leaf_in_ssh, &ctx).protected,
+            "leaf starting with backslash inside ~/.ssh must be protected"
+        );
+        // Also when evaluated via is_protected_path relative to cwd or check_dir_descendants_safe
+        assert!(
+            sj_core::protect::check_dir_descendants_safe(&ssh_dir, &ctx, 100).protected,
+            "descendant \\newfile inside ~/.ssh must be protected"
+        );
+    }
+}

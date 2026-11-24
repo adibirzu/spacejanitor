@@ -1,4 +1,6 @@
-use crate::mcp_audit::{list_observed_processes, ObservedProcess};
+use crate::mcp_audit::{
+    list_observed_processes, list_observed_processes_with_warnings, ObservedProcess,
+};
 use crate::{redact_secrets, SjError, SCHEMA_REAP_V1};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -11,7 +13,7 @@ pub struct ReapTarget {
     pub start_time: String,
     pub elapsed_secs: u64,
     pub command: String,
-    pub raw_command: String,
+    pub command_sha256: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -31,6 +33,8 @@ pub struct ReapPlan {
     pub confirm_phrase: String,
     pub targets: Vec<ReapTarget>,
     pub excluded: Vec<ReapExcluded>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -63,12 +67,16 @@ const PROTECTED_PROCESS_NAMES: &[&str] = &[
     "init",
     "launchd",
     "systemd",
+    "systemd-journald",
     "kernel_task",
     "windowserver",
     "loginwindow",
+    "opendirectoryd",
     "finder",
     "dock",
+    "safari",
     "sshd",
+    "ssh-agent",
     "zsh",
     "bash",
     "fish",
@@ -100,12 +108,44 @@ fn extract_binary_name(command: &str) -> String {
         .and_then(|s| s.to_str())
         .unwrap_or(clean)
         .trim_start_matches('-')
+        .trim_end_matches(':')
         .to_ascii_lowercase()
+}
+
+fn is_system_binary_path(command: &str) -> bool {
+    let low = command.to_ascii_lowercase();
+    let first = low.split_whitespace().next().unwrap_or("");
+    let first_clean = first.trim_matches(|c| c == '"' || c == '\'');
+    first_clean.starts_with("/system/")
+        || first_clean.starts_with("/usr/libexec/")
+        || first_clean.starts_with("/usr/sbin/")
+        || first_clean.starts_with("/usr/lib/systemd/")
+        || first_clean.starts_with("/lib/systemd/")
+        || (first_clean.starts_with("/applications/")
+            && first_clean.contains(".app/contents/macos/"))
+}
+
+fn is_reapable_mcp_or_agent_worker(command: &str) -> bool {
+    let bin = extract_binary_name(command);
+    if matches!(
+        bin.as_str(),
+        "npx" | "uvx" | "node" | "deno" | "bun" | "python" | "python3"
+    ) || bin.starts_with("python3.")
+        || bin.starts_with("python2.")
+        || bin.contains("mcp")
+    {
+        return true;
+    }
+    let low = command.to_ascii_lowercase();
+    low.contains("@modelcontextprotocol") || low.contains("mcp-server") || low.contains("--mcp")
 }
 
 pub fn is_protected_process(pid: u32, command: &str) -> Option<&'static str> {
     if pid <= 1 {
         return Some("protected_pid_0_or_1");
+    }
+    if is_system_binary_path(command) {
+        return Some("protected_system_binary_path");
     }
     let bin = extract_binary_name(command);
     if PROTECTED_PROCESS_NAMES.contains(&bin.as_str()) {
@@ -131,13 +171,31 @@ pub fn compute_reap_plan_sha256(
     targets: &[ReapTarget],
 ) -> Result<String, SjError> {
     #[derive(Serialize)]
+    struct StableTargetHashInput<'a> {
+        pid: u32,
+        ppid: u32,
+        start_time: &'a str,
+        command: &'a str,
+        command_sha256: &'a str,
+    }
+    #[derive(Serialize)]
     struct HashInput<'a> {
         min_age_mins: u64,
-        targets: &'a [ReapTarget],
+        targets: Vec<StableTargetHashInput<'a>>,
     }
+    let stable_targets = targets
+        .iter()
+        .map(|t| StableTargetHashInput {
+            pid: t.pid,
+            ppid: t.ppid,
+            start_time: &t.start_time,
+            command: &t.command,
+            command_sha256: &t.command_sha256,
+        })
+        .collect();
     let bytes = serde_json::to_vec(&HashInput {
         min_age_mins,
-        targets,
+        targets: stable_targets,
     })?;
     Ok(sha256_hex(&bytes))
 }
@@ -150,6 +208,8 @@ pub fn build_reap_plan_from_processes(
     let min_age_secs = min_age_mins.saturating_mul(60);
     let mut targets = Vec::new();
     let mut excluded = Vec::new();
+    #[cfg(unix)]
+    let current_uid = unsafe { libc::geteuid() };
 
     for p in processes {
         if p.ppid != 1 {
@@ -163,11 +223,30 @@ pub fn build_reap_plan_from_processes(
             });
             continue;
         }
+        #[cfg(unix)]
+        if let Some(proc_uid) = p.uid {
+            if proc_uid != current_uid || (proc_uid == 0 && current_uid != 0) {
+                excluded.push(ReapExcluded {
+                    pid: p.pid,
+                    command: redact_secrets(&p.command),
+                    reason: "foreign_uid".to_string(),
+                });
+                continue;
+            }
+        }
         if let Some(reason) = is_protected_process(p.pid, &p.command) {
             excluded.push(ReapExcluded {
                 pid: p.pid,
                 command: redact_secrets(&p.command),
                 reason: reason.to_string(),
+            });
+            continue;
+        }
+        if !is_reapable_mcp_or_agent_worker(&p.command) {
+            excluded.push(ReapExcluded {
+                pid: p.pid,
+                command: redact_secrets(&p.command),
+                reason: "non_mcp_or_non_worker_process".to_string(),
             });
             continue;
         }
@@ -185,7 +264,7 @@ pub fn build_reap_plan_from_processes(
             start_time: p.start_time.clone(),
             elapsed_secs: p.elapsed_secs,
             command: redact_secrets(&p.command),
-            raw_command: p.command.clone(),
+            command_sha256: sha256_hex(p.command.as_bytes()),
         });
     }
 
@@ -204,12 +283,18 @@ pub fn build_reap_plan_from_processes(
         confirm_phrase,
         targets,
         excluded,
+        warnings: Vec::new(),
     })
 }
 
 pub fn build_reap_plan(min_age_mins: u64) -> Result<ReapPlan, SjError> {
-    let procs = list_observed_processes();
-    build_reap_plan_from_processes(min_age_mins, &procs, std::process::id())
+    let (procs, warnings) = list_observed_processes_with_warnings();
+    for w in &warnings {
+        eprintln!("warning: {w}");
+    }
+    let mut plan = build_reap_plan_from_processes(min_age_mins, &procs, std::process::id())?;
+    plan.warnings = warnings;
+    Ok(plan)
 }
 
 pub fn validate_reap_gate(plan: &ReapPlan, gate: &ReapExecutionGate) -> Result<(), SjError> {
@@ -248,7 +333,7 @@ pub fn verify_target_unchanged(
     if live.ppid != 1 {
         return Err(format!("ppid_drifted:{}", live.ppid));
     }
-    if live.command != target.raw_command {
+    if sha256_hex(live.command.as_bytes()) != target.command_sha256 {
         return Err("command_drifted".to_string());
     }
     if live.start_time != target.start_time {
@@ -307,12 +392,12 @@ pub fn execute_reap_plan(
 ) -> Result<ReapExecutionReport, SjError> {
     validate_reap_gate(plan, gate)?;
 
-    let live_processes = list_observed_processes();
     let mut outcomes = Vec::new();
     let mut terminated_count = 0usize;
     let mut skipped_count = 0usize;
 
     for target in &plan.targets {
+        let live_processes = list_observed_processes();
         if let Err(reason) = verify_target_unchanged(target, &live_processes) {
             skipped_count += 1;
             outcomes.push(ReapOutcomeItem {
@@ -371,6 +456,7 @@ mod tests {
             ObservedProcess {
                 pid: 1,
                 ppid: 0,
+                uid: None,
                 start_time: "Mon Nov 24 00:00:00 2026".to_string(),
                 elapsed_secs: 99999,
                 command: "/sbin/launchd".to_string(),
@@ -378,6 +464,7 @@ mod tests {
             ObservedProcess {
                 pid: 101,
                 ppid: 1,
+                uid: None,
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/bin/zsh".to_string(),
@@ -385,6 +472,7 @@ mod tests {
             ObservedProcess {
                 pid: 202,
                 ppid: 1,
+                uid: None,
                 start_time: "Mon Nov 24 02:00:00 2026".to_string(),
                 elapsed_secs: 600, // 10 mins < 30
                 command: "node fresh-worker.js".to_string(),
@@ -392,6 +480,7 @@ mod tests {
             ObservedProcess {
                 pid: 303,
                 ppid: 1,
+                uid: None,
                 start_time: "Mon Nov 24 01:10:00 2026".to_string(),
                 elapsed_secs: 3600,
                 command: "node stale-mcp.js --token=secret_123".to_string(),
@@ -399,6 +488,7 @@ mod tests {
             ObservedProcess {
                 pid: 404,
                 ppid: 101, // not PPID=1
+                uid: None,
                 start_time: "Mon Nov 24 01:10:00 2026".to_string(),
                 elapsed_secs: 3600,
                 command: "node active-child.js".to_string(),
@@ -486,5 +576,98 @@ mod tests {
             verify_target_unchanged(target, &drifted_start),
             Err("start_time_drifted".to_string())
         );
+    }
+
+    #[test]
+    fn reap_plan_never_serializes_raw_command_or_secrets_and_hash_is_stable() {
+        let mut procs = vec![ObservedProcess {
+            pid: 505,
+            ppid: 1,
+            uid: None,
+            start_time: "Mon Nov 24 01:10:00 2026".to_string(),
+            elapsed_secs: 1800,
+            command: "node stale-mcp.js --token=PROBE_REAP_EQ --api-key PROBE_REAP_SP".to_string(),
+        }];
+        let plan_a = build_reap_plan_from_processes(30, &procs, 999).unwrap();
+        let json = serde_json::to_string(&plan_a).unwrap();
+        assert!(
+            !json.contains("PROBE_REAP_EQ"),
+            "leaked PROBE_REAP_EQ: {json}"
+        );
+        assert!(
+            !json.contains("PROBE_REAP_SP"),
+            "leaked PROBE_REAP_SP: {json}"
+        );
+        assert!(
+            !json.contains("raw_command"),
+            "raw_command field must not be serialized: {json}"
+        );
+
+        // F5: plan_sha256 must be identical when elapsed_secs increases
+        procs[0].elapsed_secs = 1805;
+        let plan_b = build_reap_plan_from_processes(30, &procs, 999).unwrap();
+        assert_eq!(plan_a.plan_sha256, plan_b.plan_sha256);
+    }
+
+    #[test]
+    fn reap_excludes_system_daemons_gui_apps_and_non_mcp_processes() {
+        let procs = vec![
+            ObservedProcess {
+                pid: 101,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "/usr/libexec/opendirectoryd".to_string(),
+            },
+            ObservedProcess {
+                pid: 102,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "/Applications/Safari.app/Contents/MacOS/Safari".to_string(),
+            },
+            ObservedProcess {
+                pid: 103,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "sshd: /usr/sbin/sshd -D [listener]".to_string(),
+            },
+            ObservedProcess {
+                pid: 104,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "/usr/lib/systemd/systemd-journald".to_string(),
+            },
+            ObservedProcess {
+                pid: 105,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "/usr/bin/ssh-agent -l".to_string(),
+            },
+            ObservedProcess {
+                pid: 106,
+                ppid: 1,
+                uid: None,
+                start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+                elapsed_secs: 7200,
+                command: "npx -y @modelcontextprotocol/server-filesystem /tmp".to_string(),
+            },
+        ];
+        let plan = build_reap_plan_from_processes(30, &procs, 999).unwrap();
+        assert_eq!(
+            plan.targets.len(),
+            1,
+            "expected only pid 106, got: {:?}",
+            plan.targets
+        );
+        assert_eq!(plan.targets[0].pid, 106);
     }
 }

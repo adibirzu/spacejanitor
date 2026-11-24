@@ -1,5 +1,5 @@
 use crate::protect::ProtectionContext;
-use crate::{redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
+use crate::{is_sensitive_flag_name, redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -15,6 +15,8 @@ pub struct McpAuditOptions {
 pub struct ObservedProcess {
     pub pid: u32,
     pub ppid: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub uid: Option<u32>,
     pub start_time: String,
     pub elapsed_secs: u64,
     pub command: String,
@@ -98,38 +100,74 @@ fn looks_like_secret_value(val: &str) -> bool {
         || low.starts_with("sk_")
         || low.starts_with("ghp_")
         || low.starts_with("github_pat_")
+        || low.starts_with("glpat-")
         || low.starts_with("akia")
+        || low.starts_with("aiza")
         || low.starts_with("xoxb-")
         || low.starts_with("xoxp-")
         || low.starts_with("bearer ")
         || low.starts_with("basic ")
 }
 
-fn redact_secret_preview(val: &str) -> String {
-    let t = val.trim();
-    if t.len() >= 4 {
-        let prefix: String = t.chars().take(3).collect();
-        format!("{prefix}***REDACTED***")
-    } else {
-        "***REDACTED***".to_string()
+fn redact_secret_preview(_val: &str) -> String {
+    "[REDACTED]".to_string()
+}
+
+fn safe_arg_key_name(arg: &str) -> String {
+    if let Some(scheme_idx) = arg.find("://") {
+        let after = &arg[scheme_idx + 3..];
+        let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
+        if after[..auth_end].contains('@') {
+            return "url-credentials".to_string();
+        }
+        if arg.contains('?') {
+            return "url-query-param".to_string();
+        }
+        return "url-secret".to_string();
     }
+    if arg.starts_with('-') {
+        let flag = arg.split('=').next().unwrap_or("--flag").trim();
+        if flag.eq_ignore_ascii_case("-h") || flag.eq_ignore_ascii_case("--header") {
+            return "--header".to_string();
+        }
+        if !flag.contains(['/', ':', '?', '@', ' ']) {
+            return flag.to_string();
+        }
+        return "cli-flag".to_string();
+    }
+    if let Some((hdr, _)) = arg.split_once(':') {
+        let hdr_low = hdr.trim().to_ascii_lowercase();
+        if matches!(
+            hdr_low.as_str(),
+            "authorization" | "x-api-key" | "x-auth-token" | "cookie" | "proxy-authorization"
+        ) {
+            return format!("header:{hdr_low}");
+        }
+    }
+    if let Some((k, _)) = arg.split_once('=') {
+        if !k.is_empty() && !k.contains(['/', ':', '?', '@', ' ']) {
+            return k.to_string();
+        }
+    }
+    "inline-secret".to_string()
 }
 
 fn redact_arg_token(arg: &str) -> (String, Option<(String, String)>) {
     let redacted = redact_secrets(arg);
     if redacted != arg {
-        let key = arg
-            .split('=')
-            .next()
-            .unwrap_or("arg")
-            .trim_start_matches('-')
-            .to_string();
-        return (redacted, Some((key, "***REDACTED***".to_string())));
+        return (
+            redacted,
+            Some((safe_arg_key_name(arg), "[REDACTED]".to_string())),
+        );
     }
     if let Some((k, v)) = arg.split_once('=') {
-        if is_sensitive_env_key(k) || looks_like_secret_value(v) {
-            let preview = redact_secret_preview(v);
-            return (format!("{k}=<REDACTED>"), Some((k.to_string(), preview)));
+        if (is_sensitive_env_key(k) || looks_like_secret_value(v))
+            && !k.contains(['/', ':', '?', '@'])
+        {
+            return (
+                format!("{k}=<REDACTED>"),
+                Some((k.to_string(), redact_secret_preview(v))),
+            );
         }
     }
     if looks_like_secret_value(arg) {
@@ -152,6 +190,22 @@ fn sanitize_args(
 
     for arg in args {
         if let Some(flag_name) = redact_next_flag.take() {
+            if flag_name == "--header" {
+                let (clean_hdr, _) = redact_arg_token(arg);
+                findings.push(SecretFinding {
+                    server_name: server_name.to_string(),
+                    source_file: source_file.to_string(),
+                    location: "args".to_string(),
+                    key_name: flag_name,
+                    redacted_preview: redact_secret_preview(arg),
+                });
+                out.push(if clean_hdr != *arg {
+                    clean_hdr
+                } else {
+                    "<REDACTED>".to_string()
+                });
+                continue;
+            }
             findings.push(SecretFinding {
                 server_name: server_name.to_string(),
                 source_file: source_file.to_string(),
@@ -163,11 +217,13 @@ fn sanitize_args(
             continue;
         }
         let low = arg.to_ascii_lowercase();
-        if matches!(
-            low.as_str(),
-            "--api-key" | "--token" | "--secret" | "--password" | "--auth-token" | "--auth"
-        ) {
-            redact_next_flag = Some(arg.trim_start_matches('-').to_string());
+        if matches!(low.as_str(), "-h" | "--header") {
+            redact_next_flag = Some("--header".to_string());
+            out.push(arg.clone());
+            continue;
+        }
+        if !arg.contains('=') && is_sensitive_flag_name(&low, false) {
+            redact_next_flag = Some(arg.clone());
             out.push(arg.clone());
             continue;
         }
@@ -598,23 +654,63 @@ fn is_supervised_daemon_leader(command: &str) -> bool {
     )
 }
 
-pub fn list_observed_processes() -> Vec<ObservedProcess> {
+pub fn parse_bsd_etime(raw: &str) -> Option<u64> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (days, rest) = match trimmed.split_once('-') {
+        Some((d, r)) => (d.parse::<u64>().ok()?, r),
+        None => (0, trimmed),
+    };
+    let parts: Vec<&str> = rest.split(':').collect();
+    let hms_secs = match parts.as_slice() {
+        [ss] => ss.parse::<u64>().ok()?,
+        [mm, ss] => {
+            let m = mm.parse::<u64>().ok()?;
+            let s = ss.parse::<u64>().ok()?;
+            m.saturating_mul(60).saturating_add(s)
+        }
+        [hh, mm, ss] => {
+            let h = hh.parse::<u64>().ok()?;
+            let m = mm.parse::<u64>().ok()?;
+            let s = ss.parse::<u64>().ok()?;
+            h.saturating_mul(3600)
+                .saturating_add(m.saturating_mul(60))
+                .saturating_add(s)
+        }
+        _ => return None,
+    };
+    Some(days.saturating_mul(86_400).saturating_add(hms_secs))
+}
+
+pub fn list_observed_processes_with_warnings() -> (Vec<ObservedProcess>, Vec<String>) {
     #[cfg(unix)]
     {
-        let Ok(out) = Command::new("ps")
-            .args(["-axo", "pid=,ppid=,etimes=,lstart=,args="])
+        let mut warnings = Vec::new();
+        let out = match Command::new("/bin/ps")
+            .args(["-axo", "pid=,ppid=,uid=,etime=,lstart=,args="])
             .output()
-        else {
-            return Vec::new();
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warnings.push(format!("/bin/ps failed to execute: {e}"));
+                return (Vec::new(), warnings);
+            }
         };
         if !out.status.success() {
-            return Vec::new();
+            let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+            warnings.push(format!(
+                "/bin/ps exited with status {}: {stderr}",
+                out.status
+            ));
+            return (Vec::new(), warnings);
         }
         let mut procs = Vec::new();
         for line in String::from_utf8_lossy(&out.stdout).lines() {
             let parts: Vec<&str> = line.split_whitespace().collect();
-            // pid, ppid, etimes, lstart (5 tokens: Day Mon DD HH:MM:SS YYYY), args...
-            if parts.len() < 9 {
+            // pid, ppid, uid, etime, lstart (5 tokens: Day Mon DD HH:MM:SS YYYY), args...
+            if parts.len() < 10 {
                 continue;
             }
             let Ok(pid) = parts[0].parse::<u32>() else {
@@ -623,33 +719,48 @@ pub fn list_observed_processes() -> Vec<ObservedProcess> {
             let Ok(ppid) = parts[1].parse::<u32>() else {
                 continue;
             };
-            let elapsed_secs = parts[2].parse::<u64>().unwrap_or(0);
-            let start_time = parts[3..8].join(" ");
-            let command = parts[8..].join(" ");
+            let uid = parts[2].parse::<u32>().ok();
+            let elapsed_secs = parse_bsd_etime(parts[3]).unwrap_or(0);
+            let start_time = parts[4..9].join(" ");
+            let command = parts[9..].join(" ");
             procs.push(ObservedProcess {
                 pid,
                 ppid,
+                uid,
                 start_time,
                 elapsed_secs,
                 command,
             });
         }
-        procs
+        if procs.is_empty() {
+            warnings.push("/bin/ps returned zero parseable processes".to_string());
+        }
+        (procs, warnings)
     }
     #[cfg(windows)]
     {
+        let mut warnings = Vec::new();
         let ps_script = "Get-CimInstance Win32_Process | Select-Object ProcessId,ParentProcessId,CreationDate,CommandLine,Name | ConvertTo-Json -Compress";
-        let Ok(out) = Command::new("powershell")
+        let out = match Command::new("powershell")
             .args(["-NoProfile", "-Command", ps_script])
             .output()
-        else {
-            return Vec::new();
+        {
+            Ok(o) => o,
+            Err(e) => {
+                warnings.push(format!("powershell process listing failed: {e}"));
+                return (Vec::new(), warnings);
+            }
         };
         if !out.status.success() {
-            return Vec::new();
+            warnings.push(format!(
+                "powershell process listing exited with status {}",
+                out.status
+            ));
+            return (Vec::new(), warnings);
         }
         let Ok(val) = serde_json::from_slice::<serde_json::Value>(&out.stdout) else {
-            return Vec::new();
+            warnings.push("powershell process listing returned invalid JSON".to_string());
+            return (Vec::new(), warnings);
         };
         let items = match val {
             serde_json::Value::Array(arr) => arr,
@@ -678,13 +789,18 @@ pub fn list_observed_processes() -> Vec<ObservedProcess> {
             procs.push(ObservedProcess {
                 pid,
                 ppid,
+                uid: None,
                 start_time,
                 elapsed_secs: 0,
                 command,
             });
         }
-        procs
+        (procs, warnings)
     }
+}
+
+pub fn list_observed_processes() -> Vec<ObservedProcess> {
+    list_observed_processes_with_warnings().0
 }
 
 pub fn audit_mcp_with_processes(
@@ -798,8 +914,13 @@ pub fn audit_mcp_with_processes(
 }
 
 pub fn audit_mcp_fleet(opts: &McpAuditOptions) -> Result<McpAuditReport, SjError> {
-    let processes = list_observed_processes();
-    audit_mcp_with_processes(opts, &processes)
+    let (processes, proc_warnings) = list_observed_processes_with_warnings();
+    let mut report = audit_mcp_with_processes(opts, &processes)?;
+    for w in proc_warnings {
+        eprintln!("warning: {w}");
+        report.warnings.push(w);
+    }
+    Ok(report)
 }
 
 #[cfg(test)]
@@ -854,6 +975,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
             ObservedProcess {
                 pid: 100,
                 ppid: 1,
+                uid: None,
                 start_time: "Mon Nov 24 10:00:00 2026".to_string(),
                 elapsed_secs: 3600,
                 command: "claude".to_string(),
@@ -861,6 +983,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
             ObservedProcess {
                 pid: 201,
                 ppid: 100,
+                uid: None,
                 start_time: "Mon Nov 24 10:01:00 2026".to_string(),
                 elapsed_secs: 3500,
                 command: format!(
@@ -870,6 +993,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
             ObservedProcess {
                 pid: 202,
                 ppid: 100,
+                uid: None,
                 start_time: "Mon Nov 24 10:02:00 2026".to_string(),
                 elapsed_secs: 3400,
                 command: "node @modelcontextprotocol/server-github".to_string(),
@@ -877,6 +1001,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
             ObservedProcess {
                 pid: 203,
                 ppid: 1,
+                uid: None,
                 start_time: "Mon Nov 24 10:03:00 2026".to_string(),
                 elapsed_secs: 3300,
                 command: "node @modelcontextprotocol/server-github".to_string(),
@@ -906,5 +1031,57 @@ DOCS_API_KEY = "{dummy_secret_a}"
             !serialized.contains(dummy_secret_b),
             "raw arg secret leaked into serialized JSON!"
         );
+    }
+
+    #[test]
+    fn mcp_audit_never_leaks_url_credentials_or_secret_prefixes_and_parses_bsd_etime() {
+        let tmp = tempdir().unwrap();
+        let json_cfg = tmp.path().join("mcp.json");
+        fs::write(
+            &json_cfg,
+            r#"{
+  "mcpServers": {
+    "remote-mcp": {
+      "command": "npx",
+      "args": [
+        "-y",
+        "remote-mcp",
+        "https://alice:SUPER_URL_SECRET@example.com/mcp",
+        "--token",
+        "XYZ_PREFIX_SECRET_999"
+      ],
+      "env": {
+        "API_KEY": "ABC_ENV_SECRET_888"
+      }
+    }
+  }
+}"#,
+        )
+        .unwrap();
+
+        let opts = McpAuditOptions {
+            config_dirs: vec![tmp.path().to_path_buf()],
+        };
+        let report = audit_mcp_with_processes(&opts, &[]).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            !json.contains("SUPER_URL_SECRET"),
+            "leaked URL secret: {json}"
+        );
+        assert!(
+            !json.contains("alice:"),
+            "leaked URL user in key_name: {json}"
+        );
+        assert!(!json.contains("XYZ***"), "leaked 3-char arg prefix: {json}");
+        assert!(!json.contains("ABC***"), "leaked 3-char env prefix: {json}");
+        assert!(report
+            .secret_findings
+            .iter()
+            .all(|f| f.redacted_preview == "[REDACTED]"));
+
+        assert_eq!(parse_bsd_etime("45"), Some(45));
+        assert_eq!(parse_bsd_etime("05:30"), Some(330));
+        assert_eq!(parse_bsd_etime("02:05:30"), Some(7530));
+        assert_eq!(parse_bsd_etime("3-02:05:30"), Some(3 * 86400 + 7530));
     }
 }

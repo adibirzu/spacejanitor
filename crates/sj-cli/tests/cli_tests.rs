@@ -1163,3 +1163,48 @@ fn cli_serve_stdio_json_rpc_round_trip_and_error_handling() {
     assert_eq!(r5["id"], "req-unknown");
     assert_eq!(r5["error"]["code"], -32601);
 }
+
+#[test]
+fn cli_serve_stdio_omits_notification_responses_and_handles_invalid_utf8() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // JSON-RPC 2.0 notification (no id) must produce no response
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+        // Invalid UTF-8 line must return -32700 instead of crashing
+        stdin.write_all(b"\xff\xfe\xfd\n").unwrap();
+        // Subsequent valid request must still succeed
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":9,"method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses, got: {stdout}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(r1["id"], serde_json::Value::Null);
+    assert_eq!(r1["error"]["code"], -32700);
+
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["id"], 9);
+    assert_eq!(r2["result"]["schema"], "spacejanitor.doctor.v1");
+}
