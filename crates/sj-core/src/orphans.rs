@@ -77,11 +77,41 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
 
 fn anchor_to_cwd(path: &Path) -> Result<PathBuf, String> {
     if path.is_absolute() {
-        Ok(normalize_lexical_path(path))
+        Ok(path.to_path_buf())
     } else {
         let cwd = std::env::current_dir().map_err(|_| "unresolvable_current_dir".to_string())?;
-        Ok(normalize_lexical_path(&cwd.join(path)))
+        Ok(cwd.join(path))
     }
+}
+
+fn resolve_relative_from_dir(base_dir: &Path, rel: &Path) -> PathBuf {
+    if rel.is_absolute() {
+        return rel.to_path_buf();
+    }
+    if base_dir.exists() {
+        return base_dir.join(rel);
+    }
+    let mut missing: Vec<OsString> = Vec::new();
+    for anc in base_dir.ancestors() {
+        if anc.as_os_str().is_empty() {
+            break;
+        }
+        if let Ok(canon) = std::fs::canonicalize(anc) {
+            let mut resolved_base = canon;
+            for seg in missing.into_iter().rev() {
+                resolved_base.push(seg);
+            }
+            return normalize_lexical_path(&resolved_base.join(rel));
+        }
+        if let Some(comp) = anc.components().next_back() {
+            match comp {
+                Component::Normal(s) => missing.push(s.to_os_string()),
+                Component::ParentDir => missing.push(OsString::from("..")),
+                _ => {}
+            }
+        }
+    }
+    normalize_lexical_path(&base_dir.join(rel))
 }
 
 fn run_git_raw_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
@@ -207,14 +237,7 @@ fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), Stri
     if common_trimmed.is_empty() {
         return Err("empty_commondir".to_string());
     }
-    let common_path = {
-        let p = PathBuf::from(common_trimmed);
-        if p.is_absolute() {
-            p
-        } else {
-            normalize_lexical_path(&gitdir.join(p))
-        }
-    };
+    let common_path = resolve_relative_from_dir(gitdir, Path::new(common_trimmed));
     if is_symlink_path(&common_path).unwrap_or(true) {
         return Err("symlink_or_missing_commondir".to_string());
     }
@@ -240,14 +263,7 @@ fn validate_gitdir_pointer(
     if target_raw.is_empty() {
         return Err("empty_gitdir_pointer".to_string());
     }
-    let target = {
-        let p = PathBuf::from(target_raw);
-        if p.is_absolute() {
-            p
-        } else {
-            normalize_lexical_path(&logical_worktree.join(p))
-        }
-    };
+    let target = resolve_relative_from_dir(logical_worktree, Path::new(target_raw));
     if is_symlink_path(&target).unwrap_or(true) {
         return Err("symlink_or_missing_gitdir".to_string());
     }
@@ -289,6 +305,8 @@ fn resolve_staged_alternates(
         .map_err(|_| "unreadable_alternates".to_string())?;
     let mut resolved_paths: Vec<PathBuf> = Vec::new();
     let logical_objects = logical_repo.join(".git").join("objects");
+    let logical_repo_resolved = resolve_relative_from_dir(logical_repo, Path::new("."));
+    let canon_logical = std::fs::canonicalize(logical_repo).ok();
     for line in raw.lines() {
         let trimmed = line.trim();
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -298,8 +316,20 @@ fn resolve_staged_alternates(
         if p.is_absolute() {
             resolved_paths.push(p.to_path_buf());
         } else {
-            let resolved = normalize_lexical_path(&logical_objects.join(p));
-            if let Ok(rel_inside) = resolved.strip_prefix(logical_repo) {
+            let resolved = resolve_relative_from_dir(&logical_objects, p);
+            let rel_inside = match (
+                canon_logical.as_ref(),
+                std::fs::canonicalize(&resolved).ok(),
+            ) {
+                (Some(cl), Some(cr)) => cr.strip_prefix(cl).ok().map(Path::to_path_buf),
+                _ => resolved
+                    .strip_prefix(&logical_repo_resolved)
+                    .or_else(|_| resolved.strip_prefix(logical_repo))
+                    .ok()
+                    .filter(|rel| !rel.components().any(|c| matches!(c, Component::ParentDir)))
+                    .map(Path::to_path_buf),
+            };
+            if let Some(rel_inside) = rel_inside {
                 resolved_paths.push(actual_repo.join(rel_inside));
             } else {
                 resolved_paths.push(resolved);
@@ -374,7 +404,7 @@ fn resolve_relative_local_remote(url: &str, logical_repo: &Path) -> Option<PathB
             return None;
         }
     }
-    let resolved = normalize_lexical_path(&logical_repo.join(trimmed));
+    let resolved = resolve_relative_from_dir(logical_repo, Path::new(trimmed));
     if trimmed.starts_with("./")
         || trimmed.starts_with("../")
         || trimmed.starts_with(".\\")
@@ -865,27 +895,70 @@ mod tests {
     use super::*;
 
     #[test]
-    fn anchor_to_cwd_resolves_and_normalizes_relative_paths() {
+    fn anchor_to_cwd_preserves_filesystem_parent_components() {
         let cwd = std::env::current_dir().expect("current_dir should succeed");
-        let expected_cwd = normalize_lexical_path(&cwd);
 
         let anchored_dot = anchor_to_cwd(Path::new(".")).expect("anchor '.' should succeed");
         assert!(anchored_dot.is_absolute());
-        assert_eq!(anchored_dot, expected_cwd);
+        assert_eq!(anchored_dot, cwd.join("."));
 
-        let anchored_rel = anchor_to_cwd(Path::new("foo/./bar/../baz"))
+        let anchored_rel = anchor_to_cwd(Path::new("link/../checkout"))
             .expect("anchor relative path should succeed");
         assert!(anchored_rel.is_absolute());
-        assert_eq!(anchored_rel, expected_cwd.join("foo").join("baz"));
+        assert_eq!(anchored_rel, cwd.join("link/../checkout"));
 
-        let abs_in = expected_cwd
-            .join("alpha")
-            .join(".")
-            .join("beta")
-            .join("..")
-            .join("gamma");
+        let abs_in = cwd.join("link").join("..").join("checkout");
         let anchored_abs = anchor_to_cwd(&abs_in).expect("anchor absolute path should succeed");
         assert!(anchored_abs.is_absolute());
-        assert_eq!(anchored_abs, expected_cwd.join("alpha").join("gamma"));
+        assert_eq!(anchored_abs, abs_in);
+
+        #[cfg(unix)]
+        {
+            let unix_abs = Path::new("/tmp/link/../checkout");
+            let anchored_unix =
+                anchor_to_cwd(unix_abs).expect("anchor unix absolute path should succeed");
+            assert_eq!(anchored_unix, PathBuf::from("/tmp/link/../checkout"));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_relative_from_dir_handles_existing_and_missing_bases() {
+        let tmp = tempfile::tempdir().expect("tempdir should succeed");
+        let root = tmp.path();
+        let real_dir = root.join("real");
+        let sub = real_dir.join("sub");
+        let checkout = real_dir.join("checkout");
+        let shared = real_dir.join("shared");
+        std::fs::create_dir_all(&sub).expect("create sub");
+        std::fs::create_dir_all(&checkout).expect("create checkout");
+        std::fs::create_dir_all(&shared).expect("create shared");
+        std::os::unix::fs::symlink(&sub, root.join("link")).expect("create symlink");
+
+        let canon_shared = std::fs::canonicalize(&shared).expect("canonicalize shared");
+
+        // Existing base dir preserves symlink + '..' for OS resolution without lexical collapse.
+        let existing_base = root.join("link").join("..").join("checkout");
+        let resolved_existing = resolve_relative_from_dir(&existing_base, Path::new("../shared"));
+        assert_eq!(resolved_existing, existing_base.join("../shared"));
+        assert_eq!(
+            std::fs::canonicalize(&resolved_existing).expect("canonicalize resolved existing"),
+            canon_shared
+        );
+
+        // Missing/moved base dir canonicalizes deepest existing ancestor first, then normalizes.
+        let missing_base = root
+            .join("link")
+            .join("..")
+            .join("moved_checkout")
+            .join(".git")
+            .join("objects");
+        let resolved_missing =
+            resolve_relative_from_dir(&missing_base, Path::new("../../../shared"));
+        assert_eq!(resolved_missing, canon_shared);
+
+        // Absolute rel is returned unchanged.
+        let resolved_abs = resolve_relative_from_dir(&existing_base, &shared);
+        assert_eq!(resolved_abs, shared);
     }
 }

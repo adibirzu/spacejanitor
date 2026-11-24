@@ -279,3 +279,125 @@ fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
         }
     }
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let remote = home.join("origin.git");
+    let real_dir = home.join("real");
+    let sub = real_dir.join("sub");
+    let checkout = real_dir.join("checkout");
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&sub).unwrap();
+    fs::create_dir_all(&checkout).unwrap();
+    std::os::unix::fs::symlink(&sub, home.join("link")).unwrap();
+
+    run_git(&remote, &["init", "--bare"]);
+    run_git(&checkout, &["init"]);
+    run_git(&checkout, &["checkout", "-b", "main"]);
+    fs::write(checkout.join("README.md"), "hello\n").unwrap();
+    run_git(&checkout, &["add", "README.md"]);
+    run_git(&checkout, &["commit", "-m", "initial"]);
+    run_git(
+        &checkout,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git(&checkout, &["push", "-u", "origin", "main"]);
+
+    let canonical_checkout = checkout.to_string_lossy().into_owned();
+    let abs_symlink_checkout = home.join("link/../checkout").to_string_lossy().into_owned();
+    let abs_symlink_parent = home.join("link/..").to_string_lossy().into_owned();
+
+    let inputs: Vec<&str> = vec![
+        &canonical_checkout,
+        &abs_symlink_checkout,
+        "link/../checkout",
+        &abs_symlink_parent,
+    ];
+
+    let mut expected_branch: Option<String> = None;
+    let mut expected_head: Option<String> = None;
+
+    for input in &inputs {
+        let out = Command::new(sj_bin())
+            .current_dir(home)
+            .env("HOME", home)
+            .args(["orphans", input, "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "sj orphans {} --json failed: {}",
+            input,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let safe = json["safe_to_prune"].as_array().unwrap();
+        let blocked = json["blocked"].as_array().unwrap();
+        assert_eq!(
+            safe.len(),
+            1,
+            "expected 1 safe_to_prune for '{input}', got: {json}"
+        );
+        assert!(
+            blocked.is_empty(),
+            "expected empty blocked for '{input}', got: {json}"
+        );
+        let branch = safe[0]["branch"].as_str().unwrap().to_string();
+        let head = safe[0]["head"].as_str().unwrap().to_string();
+        assert!(!branch.is_empty());
+        assert!(!head.is_empty());
+
+        if let Some(ref b) = expected_branch {
+            assert_eq!(&branch, b);
+        } else {
+            expected_branch = Some(branch);
+        }
+        if let Some(ref h) = expected_head {
+            assert_eq!(&head, h);
+        } else {
+            expected_head = Some(head);
+        }
+    }
+
+    let mut expected_snapshot: Option<(String, String, String, String)> = None;
+    for input in &inputs {
+        let out = Command::new(sj_bin())
+            .current_dir(home)
+            .env("HOME", home)
+            .args(["plan", input, "--include-orphans", "--json"])
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "sj plan {} --include-orphans --json failed: {}",
+            input,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "expected 1 plan item for '{input}', got: {json}"
+        );
+        assert_eq!(items[0]["kind"], "orphan_worktree");
+        let snap = &items[0]["snapshot"];
+        let content_sha = snap["content_or_tree_sha256"].as_str().unwrap().to_string();
+        let git_head = snap["git_head"].as_str().unwrap().to_string();
+        let git_tree = snap["git_tree"].as_str().unwrap().to_string();
+        let git_refs_sha = snap["git_refs_sha256"].as_str().unwrap().to_string();
+        assert_eq!(Some(&git_head), expected_head.as_ref());
+
+        let tuple = (content_sha, git_head, git_tree, git_refs_sha);
+        if let Some(ref prev) = expected_snapshot {
+            assert_eq!(&tuple, prev);
+        } else {
+            expected_snapshot = Some(tuple);
+        }
+    }
+}
