@@ -5,7 +5,6 @@ use sj_core::{
         PlanOptions,
     },
     protect::{check_path_protection, ProtectionContext},
-    safe_remove::capture_snapshot_portable,
     scan::{scan_directory, ScanOptions, ScanStatus, ScanThresholds},
     trash::discover_trash_at,
     SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
@@ -397,16 +396,26 @@ fn remediation_plan_is_deterministic_dry_run_and_fail_closed() {
     assert!(execute_plan_item(&plan1, &bad_gate, &ctx).is_err());
     assert!(stale_file.exists());
 
-    // Valid gate: deletes only the targeted item
+    // Valid gate: deletes only the targeted item on Unix; dry-run only on non-Unix
     let good_gate = ExecutionGate {
         execute: true,
         confirm: true,
         plan_sha256: plan1.plan_sha256.clone(),
         item_id: plan1.items[0].id.clone(),
     };
-    execute_plan_item_with_roots(&plan1, &good_gate, &ctx, &[trash_dir]).unwrap();
-    assert!(!stale_file.exists());
-    assert!(protected_file.exists());
+    #[cfg(unix)]
+    {
+        execute_plan_item_with_roots(&plan1, &good_gate, &ctx, &[trash_dir]).unwrap();
+        assert!(!stale_file.exists());
+        assert!(protected_file.exists());
+    }
+    #[cfg(not(unix))]
+    {
+        let res = execute_plan_item_with_roots(&plan1, &good_gate, &ctx, &[trash_dir]);
+        assert!(matches!(res, Err(sj_core::SjError::ExecutionGate(_))));
+        assert!(stale_file.exists());
+        assert!(protected_file.exists());
+    }
 }
 
 #[test]
@@ -1417,55 +1426,61 @@ fn snapshot_binding_rejects_same_size_replacement_and_git_drift() {
 }
 
 #[test]
-fn capture_snapshot_portable_covers_regular_file_and_clean_orphan_deterministically() {
-    let dir = tempdir().unwrap();
-    let root = dir.path();
+fn nested_file_same_size_and_mtime_content_drift_changes_plan_and_fails_execute() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let nested_dir = trash_dir.join("nested_dir");
+    let sub_dir = nested_dir.join("sub");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    let data_file = sub_dir.join("data.bin");
+    fs::write(&data_file, vec![b'A'; 64]).unwrap();
+    let orig_mtime = fs::metadata(&data_file).unwrap().modified().unwrap();
+
     let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let opts = PlanOptions {
+        include_trash: true,
+        include_orphans: false,
+        trash_path_override: Some(trash_dir.clone()),
+        orphan_max_depth: 5,
+    };
 
-    let file_path = root.join("sample.txt");
-    fs::write(&file_path, b"hello portable\n").unwrap();
+    let plan1 = build_remediation_plan(root, &ctx, &opts).unwrap();
+    assert_eq!(plan1.items.len(), 1);
 
-    let snap1 = capture_snapshot_portable(&file_path, false, &ctx).unwrap();
-    let snap2 = capture_snapshot_portable(&file_path, false, &ctx).unwrap();
-    assert_eq!(snap1, snap2);
-    assert_eq!(snap1.entry_type, "file");
-    assert_eq!(snap1.dev, None);
-    assert_eq!(snap1.ino, None);
-    assert_eq!(snap1.size, 15);
-    assert!(!snap1.content_or_tree_sha256.is_empty());
-    assert_eq!(snap1.git_head, None);
-    assert_eq!(snap1.git_tree, None);
-    assert_eq!(snap1.git_refs_sha256, None);
+    // Overwrite nested file in-place with different bytes of the exact same length
+    // and restore its identical mtime.
+    {
+        use std::io::Write;
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&data_file)
+            .unwrap();
+        f.write_all(&[b'B'; 64]).unwrap();
+        f.flush().unwrap();
+        f.set_modified(orig_mtime).unwrap();
+    }
 
-    let remote_dir = root.join("remote.git");
-    fs::create_dir_all(&remote_dir).unwrap();
-    run_git(&remote_dir, &["init", "--bare"]);
-
-    let orphan_dir = root.join("orphan_repo");
-    fs::create_dir_all(&orphan_dir).unwrap();
-    run_git(&orphan_dir, &["init"]);
-    fs::write(orphan_dir.join("README.md"), "portable snapshot\n").unwrap();
-    run_git(&orphan_dir, &["add", "README.md"]);
-    run_git(&orphan_dir, &["commit", "-m", "init"]);
-    run_git(
-        &orphan_dir,
-        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    let plan2 = build_remediation_plan(root, &ctx, &opts).unwrap();
+    assert_ne!(
+        plan1.plan_sha256, plan2.plan_sha256,
+        "replan must detect nested file content change even with identical size and mtime"
     );
-    run_git(&orphan_dir, &["push", "-u", "origin", "HEAD"]);
 
-    let dir_snap1 = capture_snapshot_portable(&orphan_dir, true, &ctx).unwrap();
-    let dir_snap2 = capture_snapshot_portable(&orphan_dir, true, &ctx).unwrap();
-    assert_eq!(dir_snap1, dir_snap2);
-    assert_eq!(dir_snap1.entry_type, "dir");
-    assert_eq!(dir_snap1.dev, None);
-    assert_eq!(dir_snap1.ino, None);
-    assert!(!dir_snap1.content_or_tree_sha256.is_empty());
-    assert!(dir_snap1.git_head.as_deref().is_some_and(|s| !s.is_empty()));
-    assert!(dir_snap1.git_tree.as_deref().is_some_and(|s| !s.is_empty()));
-    assert!(dir_snap1
-        .git_refs_sha256
-        .as_deref()
-        .is_some_and(|s| !s.is_empty()));
+    let gate = ExecutionGate {
+        execute: true,
+        confirm: true,
+        plan_sha256: plan1.plan_sha256.clone(),
+        item_id: plan1.items[0].id.clone(),
+    };
+    let res = execute_plan_item_with_roots(&plan1, &gate, &ctx, std::slice::from_ref(&trash_dir));
+    assert!(
+        res.is_err(),
+        "execute must fail closed when nested file content drifted with same size and mtime"
+    );
+    assert!(data_file.exists(), "nested file must be preserved");
 }
 
 #[test]

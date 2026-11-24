@@ -4,7 +4,7 @@
 pub mod orphans;
 pub mod plan;
 pub mod protect;
-pub mod safe_remove;
+pub(crate) mod safe_remove;
 pub mod scan;
 pub mod trash;
 
