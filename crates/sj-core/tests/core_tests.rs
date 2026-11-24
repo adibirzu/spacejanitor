@@ -1509,3 +1509,176 @@ fn discover_nested_repos_exhaustive_excludes_outer_repo_and_finds_children() {
     let nested = discover_nested_repos_exhaustive(&outer, 100_000).unwrap();
     assert_eq!(nested, vec![child]);
 }
+
+#[cfg(unix)]
+#[test]
+fn stage_and_clean_rollback_on_drifted_trash_file_and_dir() {
+    use std::io::Write;
+
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let drift_dir = trash_dir.join("drift_dir");
+    let sub_dir = drift_dir.join("sub");
+    fs::create_dir_all(&sub_dir).unwrap();
+
+    let drift_file = trash_dir.join("drift.bin");
+    fs::write(&drift_file, vec![b'A'; 64]).unwrap();
+    let file_orig_mtime = fs::metadata(&drift_file).unwrap().modified().unwrap();
+
+    let nested_file = sub_dir.join("data.bin");
+    fs::write(&nested_file, vec![b'X'; 64]).unwrap();
+    let nested_orig_mtime = fs::metadata(&nested_file).unwrap().modified().unwrap();
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        root,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: false,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 2);
+
+    // Overwrite both files in-place with identical size and restored mtime
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&drift_file)
+            .unwrap();
+        f.write_all(&[b'B'; 64]).unwrap();
+        f.flush().unwrap();
+        f.set_modified(file_orig_mtime).unwrap();
+    }
+    {
+        let mut f = fs::OpenOptions::new()
+            .write(true)
+            .truncate(false)
+            .open(&nested_file)
+            .unwrap();
+        f.write_all(&[b'Y'; 64]).unwrap();
+        f.flush().unwrap();
+        f.set_modified(nested_orig_mtime).unwrap();
+    }
+
+    for item in &plan.items {
+        let gate = ExecutionGate {
+            execute: true,
+            confirm: true,
+            plan_sha256: plan.plan_sha256.clone(),
+            item_id: item.id.clone(),
+        };
+        let res =
+            execute_plan_item_with_roots(&plan, &gate, &ctx, std::slice::from_ref(&trash_dir));
+        assert!(
+            res.is_err(),
+            "execute must fail closed on drifted item {}: {res:?}",
+            item.path
+        );
+    }
+
+    assert_eq!(
+        fs::read(&drift_file).unwrap(),
+        vec![b'B'; 64],
+        "drifted trash file must be restored cleanly at original path"
+    );
+    assert_eq!(
+        fs::read(&nested_file).unwrap(),
+        vec![b'Y'; 64],
+        "drifted trash dir must be restored cleanly at original path"
+    );
+
+    let stage_leftovers: Vec<_> = fs::read_dir(&trash_dir)
+        .unwrap()
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+        .collect();
+    assert!(
+        stage_leftovers.is_empty(),
+        "expected zero .sj-stage-* residue in trash_dir, found: {stage_leftovers:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn zero_stage_residue_on_happy_path_execution() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let trash_dir = root.join("Trash");
+    let workspace_dir = root.join("workspaces");
+    let remotes_dir = root.join("remotes");
+    fs::create_dir_all(&trash_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    fs::create_dir_all(&remotes_dir).unwrap();
+
+    let happy_file = trash_dir.join("happy.bin");
+    fs::write(&happy_file, vec![1u8; 32]).unwrap();
+
+    let happy_dir = trash_dir.join("happy_dir");
+    fs::create_dir_all(happy_dir.join("a/b")).unwrap();
+    fs::write(happy_dir.join("a/b/c.bin"), vec![2u8; 32]).unwrap();
+
+    let bare_remote = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare_remote).unwrap();
+    run_git(&bare_remote, &["init", "--bare"]);
+    let clean_orphan = workspace_dir.join("clean_orphan");
+    run_git(
+        &workspace_dir,
+        &["clone", bare_remote.to_str().unwrap(), "clean_orphan"],
+    );
+    fs::write(clean_orphan.join("README.md"), "hello\n").unwrap();
+    run_git(&clean_orphan, &["add", "README.md"]);
+    run_git(&clean_orphan, &["commit", "-m", "init"]);
+    run_git(&clean_orphan, &["push", "-u", "origin", "HEAD"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let plan = build_remediation_plan(
+        &workspace_dir,
+        &ctx,
+        &PlanOptions {
+            include_trash: true,
+            include_orphans: true,
+            trash_path_override: Some(trash_dir.clone()),
+            orphan_max_depth: 5,
+        },
+    )
+    .unwrap();
+    assert_eq!(plan.items.len(), 3);
+
+    for item in &plan.items {
+        execute_plan_item_with_roots(
+            &plan,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256: plan.plan_sha256.clone(),
+                item_id: item.id.clone(),
+            },
+            &ctx,
+            std::slice::from_ref(&trash_dir),
+        )
+        .unwrap();
+    }
+
+    assert!(!happy_file.exists());
+    assert!(!happy_dir.exists());
+    assert!(!clean_orphan.exists());
+
+    for parent in [&trash_dir, &workspace_dir] {
+        let stage_leftovers: Vec<_> = fs::read_dir(parent)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| e.file_name().to_string_lossy().starts_with(".sj-stage-"))
+            .collect();
+        assert!(
+            stage_leftovers.is_empty(),
+            "expected zero .sj-stage-* residue in {}, found: {stage_leftovers:?}",
+            parent.display()
+        );
+    }
+}

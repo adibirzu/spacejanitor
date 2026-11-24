@@ -306,6 +306,7 @@ mod unix_impl {
         pub(super) size: u64,
         pub(super) mtime_secs: i64,
         pub(super) mtime_nsec: i64,
+        pub(super) content_sha256: String,
     }
 
     pub(super) struct ManifestDir {
@@ -447,22 +448,22 @@ mod unix_impl {
                 )?;
                 manifest.dirs.push(sub_manifest);
             } else if mode == libc::S_IFREG {
+                let file_fd = openat_nofollow(
+                    dir_fd.as_raw_fd(),
+                    &name_c,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )?;
+                let file_st = fstat_fd(&file_fd)?;
+                if (file_st.st_mode & libc::S_IFMT) != libc::S_IFREG
+                    || !stat_matches_reg_identity(&file_st, &child_st)
+                {
+                    return Err(SjError::ExecutionGate(format!(
+                        "file fd identity mismatch: {}",
+                        child_full_path.display()
+                    )));
+                }
+                let content_sha256 = hash_fd_stable(&file_fd, &child_st)?;
                 if !in_dot_git {
-                    let file_fd = openat_nofollow(
-                        dir_fd.as_raw_fd(),
-                        &name_c,
-                        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-                    )?;
-                    let file_st = fstat_fd(&file_fd)?;
-                    if (file_st.st_mode & libc::S_IFMT) != libc::S_IFREG
-                        || !stat_matches_reg_identity(&file_st, &child_st)
-                    {
-                        return Err(SjError::ExecutionGate(format!(
-                            "file fd identity mismatch: {}",
-                            child_full_path.display()
-                        )));
-                    }
-                    let content_sha256 = hash_fd_stable(&file_fd, &child_st)?;
                     let (ms, mn) = stat_mtime(&child_st);
                     state.records.push((
                         rel_path,
@@ -472,7 +473,7 @@ mod unix_impl {
                         child_st.st_size as u64,
                         ms,
                         mn,
-                        content_sha256,
+                        content_sha256.clone(),
                     ));
                 }
                 manifest.files.push(ManifestFile {
@@ -483,6 +484,7 @@ mod unix_impl {
                     size: child_st.st_size as u64,
                     mtime_secs: child_st.st_mtime as i64,
                     mtime_nsec: child_st.st_mtime_nsec as i64,
+                    content_sha256,
                 });
             } else {
                 return Err(SjError::ProtectedPath(format!(
@@ -640,6 +642,13 @@ mod unix_impl {
                     "file fd identity mismatch during manifest deletion".to_string(),
                 ));
             }
+            let live_sha = hash_fd_stable(&file_fd, &f_st)?;
+            if live_sha != file.content_sha256 {
+                return Err(SjError::ExecutionGate(
+                    "file content digest drifted from reviewed manifest; aborting deletion"
+                        .to_string(),
+                ));
+            }
             drop(file_fd);
 
             let recheck_st = fstatat_nofollow(dir_fd, &file.name_c)?;
@@ -772,6 +781,201 @@ mod unix_impl {
         }
     }
 
+    static STAGE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+    pub(super) fn create_private_stage_dir(
+        parent_fd: &OwnedFd,
+        root_dev: u64,
+    ) -> Result<(OwnedFd, CString, String), SjError> {
+        use std::sync::atomic::Ordering;
+        use std::time::{SystemTime, UNIX_EPOCH};
+
+        let pid = std::process::id();
+        for _ in 0..32 {
+            let seq = STAGE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let nanos = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let mut urandom_buf = [0u8; 16];
+            if let Ok(mut f) = File::open("/dev/urandom") {
+                let _ = f.read_exact(&mut urandom_buf);
+            }
+
+            let mut hasher = Sha256::new();
+            hasher.update(pid.to_le_bytes());
+            hasher.update(seq.to_le_bytes());
+            hasher.update(nanos.to_le_bytes());
+            hasher.update(urandom_buf);
+            let hex = sha256_to_hex(hasher.finalize());
+            let stage_name = format!(".sj-stage-{pid}-{}", &hex[..16]);
+            let stage_c = to_cstring(&stage_name)?;
+
+            let rc = unsafe { libc::mkdirat(parent_fd.as_raw_fd(), stage_c.as_ptr(), 0o700) };
+            if rc != 0 {
+                let err = std::io::Error::last_os_error();
+                if err.raw_os_error() == Some(libc::EEXIST) {
+                    continue;
+                }
+                return Err(SjError::Io(err));
+            }
+
+            let stage_fd = openat_nofollow(
+                parent_fd.as_raw_fd(),
+                &stage_c,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let mut st = fstat_fd(&stage_fd)?;
+            if (st.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err(SjError::ExecutionGate(
+                    "staging path is not a directory".to_string(),
+                ));
+            }
+            let euid = unsafe { libc::geteuid() };
+            if st.st_uid != euid {
+                return Err(SjError::ExecutionGate(
+                    "staging directory owner mismatch".to_string(),
+                ));
+            }
+            if (st.st_dev as u64) != root_dev {
+                return Err(SjError::ExecutionGate(
+                    "staging directory device mismatch".to_string(),
+                ));
+            }
+            if (st.st_mode & 0o777) != 0o700 {
+                let chmod_rc = unsafe { libc::fchmod(stage_fd.as_raw_fd(), 0o700) };
+                if chmod_rc != 0 {
+                    return Err(last_os_err());
+                }
+                st = fstat_fd(&stage_fd)?;
+                if (st.st_mode & 0o777) != 0o700 {
+                    return Err(SjError::ExecutionGate(
+                        "failed to enforce 0700 mode on staging directory".to_string(),
+                    ));
+                }
+            }
+
+            let guard = fd_to_dir(&stage_fd)?;
+            loop {
+                set_errno(0);
+                let dent = unsafe { libc::readdir(guard.0) };
+                if dent.is_null() {
+                    let err = get_errno();
+                    if err != 0 {
+                        return Err(SjError::Io(std::io::Error::from_raw_os_error(err)));
+                    }
+                    break;
+                }
+                let name_c = unsafe { CStr::from_ptr((*dent).d_name.as_ptr()) };
+                let name_bytes = name_c.to_bytes();
+                if name_bytes != b"." && name_bytes != b".." {
+                    return Err(SjError::ExecutionGate(
+                        "newly created staging directory is not empty".to_string(),
+                    ));
+                }
+            }
+            drop(guard);
+
+            return Ok((stage_fd, stage_c, stage_name));
+        }
+
+        Err(SjError::ExecutionGate(
+            "exhausted attempts creating unique private staging directory".to_string(),
+        ))
+    }
+
+    pub(super) fn renameat_no_replace(
+        from_dir: &OwnedFd,
+        from_name: &CStr,
+        to_dir: &OwnedFd,
+        to_name: &CStr,
+    ) -> Result<(), std::io::Error> {
+        #[cfg(target_os = "macos")]
+        {
+            let rc = unsafe {
+                libc::renameatx_np(
+                    from_dir.as_raw_fd(),
+                    from_name.as_ptr(),
+                    to_dir.as_raw_fd(),
+                    to_name.as_ptr(),
+                    libc::RENAME_EXCL,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let rc = unsafe {
+                libc::syscall(
+                    libc::SYS_renameat2,
+                    from_dir.as_raw_fd(),
+                    from_name.as_ptr(),
+                    to_dir.as_raw_fd(),
+                    to_name.as_ptr(),
+                    libc::RENAME_NOREPLACE,
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            if fstatat_nofollow(to_dir, to_name).is_ok() {
+                return Err(std::io::Error::from_raw_os_error(libc::EEXIST));
+            }
+            let rc = unsafe {
+                libc::renameat(
+                    from_dir.as_raw_fd(),
+                    from_name.as_ptr(),
+                    to_dir.as_raw_fd(),
+                    to_name.as_ptr(),
+                )
+            };
+            if rc == 0 {
+                Ok(())
+            } else {
+                Err(std::io::Error::last_os_error())
+            }
+        }
+    }
+
+    pub(super) fn restore_staged_or_preserve(
+        parent_fd: &OwnedFd,
+        leaf_c: &CStr,
+        stage_fd: &OwnedFd,
+        stage_name_c: &CStr,
+    ) -> Result<(), String> {
+        let target_c = c"target";
+        match renameat_no_replace(stage_fd, target_c, parent_fd, leaf_c) {
+            Ok(()) => {
+                let rc = unsafe {
+                    libc::unlinkat(
+                        parent_fd.as_raw_fd(),
+                        stage_name_c.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    )
+                };
+                if rc != 0 {
+                    let err = std::io::Error::last_os_error();
+                    return Err(format!(
+                        "restored target but failed to remove empty staging directory: {err}"
+                    ));
+                }
+                Ok(())
+            }
+            Err(e) => Err(format!(
+                "staged target preserved in quarantine without overwrite: {e}"
+            )),
+        }
+    }
+
     pub(super) fn safe_remove_plan_item_unix(
         item: &PlanItem,
         ctx: &ProtectionContext,
@@ -789,7 +993,7 @@ mod unix_impl {
             )));
         }
 
-        let (parent_fd, leaf_c, canon_target, is_orphan) = match item.kind.as_str() {
+        let (parent_fd, leaf_c, canon_target, canon_parent, is_orphan) = match item.kind.as_str() {
             "trash_item" => {
                 let canon_target = std::fs::canonicalize(target)?;
                 let mut matched_root: Option<PathBuf> = None;
@@ -814,6 +1018,12 @@ mod unix_impl {
                 if prot_canon.protected {
                     return Err(SjError::ProtectedPath(prot_canon.reason));
                 }
+                let canon_parent = canon_target
+                    .parent()
+                    .ok_or_else(|| {
+                        SjError::ExecutionGate("trash target has no parent".to_string())
+                    })?
+                    .to_path_buf();
                 let rel = canon_target.strip_prefix(&canon_root).map_err(|_| {
                     SjError::ExecutionGate("failed to strip canonical trash root".to_string())
                 })?;
@@ -824,7 +1034,13 @@ mod unix_impl {
                     .ok_or_else(|| SjError::ExecutionGate("invalid trash item leaf".to_string()))?;
                 let root_fd = open_dir_nofollow_from_root(&canon_root)?;
                 let parent_fd = open_rel_dir_nofollow(root_fd, rel_parent)?;
-                (parent_fd, to_cstring(leaf)?, canon_target, false)
+                (
+                    parent_fd,
+                    to_cstring(leaf)?,
+                    canon_target,
+                    canon_parent,
+                    false,
+                )
             }
             "orphan_worktree" => {
                 let canon_target = std::fs::canonicalize(target)?;
@@ -838,15 +1054,24 @@ mod unix_impl {
                         canon_target.display()
                     )));
                 }
-                let canon_parent = canon_target.parent().ok_or_else(|| {
-                    SjError::ExecutionGate("orphan target has no parent".to_string())
-                })?;
+                let canon_parent = canon_target
+                    .parent()
+                    .ok_or_else(|| {
+                        SjError::ExecutionGate("orphan target has no parent".to_string())
+                    })?
+                    .to_path_buf();
                 let leaf = canon_target
                     .file_name()
                     .and_then(|n| n.to_str())
                     .ok_or_else(|| SjError::ExecutionGate("invalid orphan leaf".to_string()))?;
-                let parent_fd = open_dir_nofollow_from_root(canon_parent)?;
-                (parent_fd, to_cstring(leaf)?, canon_target, true)
+                let parent_fd = open_dir_nofollow_from_root(&canon_parent)?;
+                (
+                    parent_fd,
+                    to_cstring(leaf)?,
+                    canon_target,
+                    canon_parent,
+                    true,
+                )
             }
             other => {
                 return Err(SjError::ExecutionGate(format!(
@@ -865,56 +1090,107 @@ mod unix_impl {
             )));
         }
 
+        let target_c = c"target";
+        let st_parent = fstat_fd(&parent_fd)?;
+
         if !is_orphan && mode == libc::S_IFREG {
             if item.snapshot.entry_type != "file" {
                 return Err(SjError::ExecutionGate(
                     "snapshot entry_type mismatch (expected dir, found file)".to_string(),
                 ));
             }
-            let file_fd = openat_nofollow(
-                parent_fd.as_raw_fd(),
-                &leaf_c,
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )?;
-            let st = fstat_fd(&file_fd)?;
-            if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
-                return Err(SjError::ExecutionGate(
-                    "opened fd is not a regular file".to_string(),
-                ));
-            }
-            if !snapshot_matches_stat(&item.snapshot, &st) {
+            if !snapshot_matches_stat(&item.snapshot, &st_leaf) {
                 return Err(SjError::ExecutionGate(
                     "target dev/ino changed since plan; regenerate plan".to_string(),
                 ));
             }
-            let size = st.st_size as u64;
-            let (ms, mn) = stat_mtime(&st);
-            let content_hash = hash_fd_stable(&file_fd, &st)?;
-            drop(file_fd);
-            let live_snapshot = TargetSnapshot {
-                entry_type: "file".to_string(),
-                dev: Some(st.st_dev as u64),
-                ino: Some(st.st_ino as u64),
-                size,
-                mtime_secs: ms,
-                mtime_nanos: mn,
-                content_or_tree_sha256: content_hash,
-                git_head: None,
-                git_tree: None,
-                git_refs_sha256: None,
+
+            let (stage_fd, stage_name_c, _stage_name_str) =
+                create_private_stage_dir(&parent_fd, st_parent.st_dev as u64)?;
+            if let Err(e) = renameat_no_replace(&parent_fd, &leaf_c, &stage_fd, target_c) {
+                drop(stage_fd);
+                let _ = unsafe {
+                    libc::unlinkat(
+                        parent_fd.as_raw_fd(),
+                        stage_name_c.as_ptr(),
+                        libc::AT_REMOVEDIR,
+                    )
+                };
+                return Err(SjError::Io(e));
+            }
+
+            let verify_staged_file = || -> Result<(), SjError> {
+                let staged_file_fd = openat_nofollow(
+                    stage_fd.as_raw_fd(),
+                    target_c,
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                )?;
+                let st = fstat_fd(&staged_file_fd)?;
+                if (st.st_mode & libc::S_IFMT) != libc::S_IFREG {
+                    return Err(SjError::ExecutionGate(
+                        "opened fd is not a regular file".to_string(),
+                    ));
+                }
+                if !snapshot_matches_stat(&item.snapshot, &st) {
+                    return Err(SjError::ExecutionGate(
+                        "target dev/ino changed since plan; regenerate plan".to_string(),
+                    ));
+                }
+                let size = st.st_size as u64;
+                let (ms, mn) = stat_mtime(&st);
+                let content_hash = hash_fd_stable(&staged_file_fd, &st)?;
+                let live_snapshot = TargetSnapshot {
+                    entry_type: "file".to_string(),
+                    dev: Some(st.st_dev as u64),
+                    ino: Some(st.st_ino as u64),
+                    size,
+                    mtime_secs: ms,
+                    mtime_nanos: mn,
+                    content_or_tree_sha256: content_hash,
+                    git_head: None,
+                    git_tree: None,
+                    git_refs_sha256: None,
+                };
+                if live_snapshot != item.snapshot {
+                    return Err(SjError::ExecutionGate(
+                        "target snapshot mismatch; regenerate plan".to_string(),
+                    ));
+                }
+                let st_recheck = fstatat_nofollow(&stage_fd, target_c)?;
+                if !stat_matches_reg_identity(&st_recheck, &st) {
+                    return Err(SjError::ExecutionGate(
+                        "staged target changed before unlinkat; aborting".to_string(),
+                    ));
+                }
+                Ok(())
             };
-            if live_snapshot != item.snapshot {
-                return Err(SjError::ExecutionGate(
-                    "target snapshot mismatch; regenerate plan".to_string(),
-                ));
+
+            if let Err(err) = verify_staged_file() {
+                return match restore_staged_or_preserve(
+                    &parent_fd,
+                    &leaf_c,
+                    &stage_fd,
+                    &stage_name_c,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_note) => {
+                        Err(SjError::ExecutionGate(format!("{err}; {rollback_note}")))
+                    }
+                };
             }
-            let st_recheck = fstatat_nofollow(&parent_fd, &leaf_c)?;
-            if !stat_matches_dev_ino(&st_recheck, &st) {
-                return Err(SjError::ExecutionGate(
-                    "target changed before unlinkat; aborting".to_string(),
-                ));
+
+            let rc = unsafe { libc::unlinkat(stage_fd.as_raw_fd(), target_c.as_ptr(), 0) };
+            if rc != 0 {
+                return Err(last_os_err());
             }
-            let rc = unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), 0) };
+            drop(stage_fd);
+            let rc = unsafe {
+                libc::unlinkat(
+                    parent_fd.as_raw_fd(),
+                    stage_name_c.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
             if rc != 0 {
                 return Err(last_os_err());
             }
@@ -932,126 +1208,182 @@ mod unix_impl {
                 "snapshot entry_type mismatch (expected file, found dir)".to_string(),
             ));
         }
-
-        let target_dir_fd = openat_nofollow(
-            parent_fd.as_raw_fd(),
-            &leaf_c,
-            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )?;
-        let st_root = fstat_fd(&target_dir_fd)?;
-        if (st_root.st_mode & libc::S_IFMT) != libc::S_IFDIR {
-            return Err(SjError::ExecutionGate(
-                "opened fd is not a directory".to_string(),
-            ));
-        }
-        if !snapshot_matches_stat(&item.snapshot, &st_root) {
+        if !snapshot_matches_stat(&item.snapshot, &st_leaf) {
             return Err(SjError::ExecutionGate(
                 "target directory dev/ino changed since plan; regenerate plan".to_string(),
             ));
         }
 
-        let root_dev = st_root.st_dev as u64;
-        let (git_head, git_tree, git_refs_sha256) = if is_orphan {
-            let st_lstat_before = lstat_path(&canon_target)?;
-            let st_at_before = fstatat_nofollow(&parent_fd, &leaf_c)?;
-            if !stat_matches_dev_ino(&st_root, &st_lstat_before)
-                || !stat_matches_dev_ino(&st_root, &st_at_before)
-            {
-                return Err(SjError::ExecutionGate(
-                    "orphan directory identity mismatch before git checks".to_string(),
-                ));
-            }
-
+        if is_orphan {
             verify_orphan_safe_to_remove(&canon_target, ctx)?;
-            let (h, t, r) = capture_git_snapshot_identity(&canon_target)?;
-
-            let st_lstat_after = lstat_path(&canon_target)?;
-            let st_at_after = fstatat_nofollow(&parent_fd, &leaf_c)?;
-            if !stat_matches_dev_ino(&st_root, &st_lstat_after)
-                || !stat_matches_dev_ino(&st_root, &st_at_after)
-            {
-                return Err(SjError::ExecutionGate(
-                    "orphan directory identity changed during git checks".to_string(),
-                ));
-            }
-            let prot_after = check_path_protection(&canon_target, ctx);
-            if prot_after.protected {
-                return Err(SjError::ProtectedPath(prot_after.reason));
-            }
-            if is_symlink_path(&canon_target)? {
-                return Err(SjError::ProtectedPath(format!(
-                    "refusing symlink target: {}",
-                    canon_target.display()
-                )));
-            }
-            (Some(h), Some(t), Some(r))
-        } else {
-            (None, None, None)
-        };
-
-        let mut state = InspectState {
-            root_dev,
-            seen: 0,
-            skip_dot_git: is_orphan,
-            ctx,
-            records: Vec::new(),
-        };
-        let mut root_manifest = ManifestDir {
-            name_c: leaf_c.clone(),
-            name_str: leaf_c.to_string_lossy().into_owned(),
-            dev: st_root.st_dev as u64,
-            ino: st_root.st_ino as u64,
-            dirs: Vec::new(),
-            files: Vec::new(),
-        };
-        inspect_dir_fd_recursive(
-            &target_dir_fd,
-            &canon_target,
-            "",
-            1,
-            &mut state,
-            &mut root_manifest,
-        )?;
-        state.records.sort();
-        let tree_hash = hash_dir_tree_records(&state.records);
-
-        let (ms, mn) = stat_mtime(&st_root);
-        let live_snapshot = TargetSnapshot {
-            entry_type: "dir".to_string(),
-            dev: Some(st_root.st_dev as u64),
-            ino: Some(st_root.st_ino as u64),
-            size: st_root.st_size as u64,
-            mtime_secs: ms,
-            mtime_nanos: mn,
-            content_or_tree_sha256: tree_hash,
-            git_head,
-            git_tree,
-            git_refs_sha256,
-        };
-        if live_snapshot != item.snapshot {
-            return Err(SjError::ExecutionGate(
-                "target directory snapshot mismatch; regenerate plan".to_string(),
-            ));
         }
 
+        let (stage_fd, stage_name_c, stage_name_str) =
+            create_private_stage_dir(&parent_fd, st_parent.st_dev as u64)?;
+        if let Err(e) = renameat_no_replace(&parent_fd, &leaf_c, &stage_fd, target_c) {
+            drop(stage_fd);
+            let _ = unsafe {
+                libc::unlinkat(
+                    parent_fd.as_raw_fd(),
+                    stage_name_c.as_ptr(),
+                    libc::AT_REMOVEDIR,
+                )
+            };
+            return Err(SjError::Io(e));
+        }
+
+        let verify_staged_dir = || -> Result<(OwnedFd, libc::stat, ManifestDir, u64), SjError> {
+            let staged_dir_fd = openat_nofollow(
+                stage_fd.as_raw_fd(),
+                target_c,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            let st_root = fstat_fd(&staged_dir_fd)?;
+            if (st_root.st_mode & libc::S_IFMT) != libc::S_IFDIR {
+                return Err(SjError::ExecutionGate(
+                    "opened fd is not a directory".to_string(),
+                ));
+            }
+            if !snapshot_matches_stat(&item.snapshot, &st_root) {
+                return Err(SjError::ExecutionGate(
+                    "target directory dev/ino changed since plan; regenerate plan".to_string(),
+                ));
+            }
+
+            let root_dev = st_root.st_dev as u64;
+            let staged_target_path = canon_parent.join(&stage_name_str).join("target");
+            let (git_head, git_tree, git_refs_sha256) = if is_orphan {
+                let st_lstat_before = lstat_path(&staged_target_path)?;
+                let st_at_before = fstatat_nofollow(&stage_fd, target_c)?;
+                if !stat_matches_dev_ino(&st_root, &st_lstat_before)
+                    || !stat_matches_dev_ino(&st_root, &st_at_before)
+                {
+                    return Err(SjError::ExecutionGate(
+                        "orphan directory identity mismatch before git checks".to_string(),
+                    ));
+                }
+
+                verify_orphan_safe_to_remove(&staged_target_path, ctx)?;
+                let (h, t, r) = capture_git_snapshot_identity(&staged_target_path)?;
+
+                let st_lstat_after = lstat_path(&staged_target_path)?;
+                let st_at_after = fstatat_nofollow(&stage_fd, target_c)?;
+                if !stat_matches_dev_ino(&st_root, &st_lstat_after)
+                    || !stat_matches_dev_ino(&st_root, &st_at_after)
+                {
+                    return Err(SjError::ExecutionGate(
+                        "orphan directory identity changed during git checks".to_string(),
+                    ));
+                }
+                let prot_after = check_path_protection(&staged_target_path, ctx);
+                if prot_after.protected {
+                    return Err(SjError::ProtectedPath(prot_after.reason));
+                }
+                if is_symlink_path(&staged_target_path)? {
+                    return Err(SjError::ProtectedPath(format!(
+                        "refusing symlink target: {}",
+                        staged_target_path.display()
+                    )));
+                }
+                (Some(h), Some(t), Some(r))
+            } else {
+                (None, None, None)
+            };
+
+            let mut state = InspectState {
+                root_dev,
+                seen: 0,
+                skip_dot_git: is_orphan,
+                ctx,
+                records: Vec::new(),
+            };
+            let mut root_manifest = ManifestDir {
+                name_c: leaf_c.clone(),
+                name_str: leaf_c.to_string_lossy().into_owned(),
+                dev: st_root.st_dev as u64,
+                ino: st_root.st_ino as u64,
+                dirs: Vec::new(),
+                files: Vec::new(),
+            };
+            inspect_dir_fd_recursive(
+                &staged_dir_fd,
+                &canon_target,
+                "",
+                1,
+                &mut state,
+                &mut root_manifest,
+            )?;
+            state.records.sort();
+            let tree_hash = hash_dir_tree_records(&state.records);
+
+            let (ms, mn) = stat_mtime(&st_root);
+            let live_snapshot = TargetSnapshot {
+                entry_type: "dir".to_string(),
+                dev: Some(st_root.st_dev as u64),
+                ino: Some(st_root.st_ino as u64),
+                size: st_root.st_size as u64,
+                mtime_secs: ms,
+                mtime_nanos: mn,
+                content_or_tree_sha256: tree_hash,
+                git_head,
+                git_tree,
+                git_refs_sha256,
+            };
+            if live_snapshot != item.snapshot {
+                return Err(SjError::ExecutionGate(
+                    "target directory snapshot mismatch; regenerate plan".to_string(),
+                ));
+            }
+
+            Ok((staged_dir_fd, st_root, root_manifest, root_dev))
+        };
+
+        let (staged_dir_fd, st_root, root_manifest, root_dev) = match verify_staged_dir() {
+            Ok(v) => v,
+            Err(err) => {
+                return match restore_staged_or_preserve(
+                    &parent_fd,
+                    &leaf_c,
+                    &stage_fd,
+                    &stage_name_c,
+                ) {
+                    Ok(()) => Err(err),
+                    Err(rollback_note) => {
+                        Err(SjError::ExecutionGate(format!("{err}; {rollback_note}")))
+                    }
+                };
+            }
+        };
+
         delete_dir_from_manifest(
-            &target_dir_fd,
+            &staged_dir_fd,
             &canon_target,
             &root_manifest,
             root_dev,
             ctx,
             1,
         )?;
-        drop(target_dir_fd);
+        drop(staged_dir_fd);
 
-        let st_recheck = fstatat_nofollow(&parent_fd, &leaf_c)?;
+        let st_recheck = fstatat_nofollow(&stage_fd, target_c)?;
         if !stat_matches_dev_ino(&st_recheck, &st_root) {
             return Err(SjError::ExecutionGate(
                 "target directory changed before final unlinkat; aborting".to_string(),
             ));
         }
         let rc =
-            unsafe { libc::unlinkat(parent_fd.as_raw_fd(), leaf_c.as_ptr(), libc::AT_REMOVEDIR) };
+            unsafe { libc::unlinkat(stage_fd.as_raw_fd(), target_c.as_ptr(), libc::AT_REMOVEDIR) };
+        if rc != 0 {
+            return Err(last_os_err());
+        }
+        drop(stage_fd);
+        let rc = unsafe {
+            libc::unlinkat(
+                parent_fd.as_raw_fd(),
+                stage_name_c.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        };
         if rc != 0 {
             return Err(last_os_err());
         }
@@ -1425,7 +1757,10 @@ mod tests {
         }
 
         fn build_manifest_file(path: &Path, name: &str) -> ManifestFile {
-            let meta = fs::symlink_metadata(path.join(name)).unwrap();
+            let full = path.join(name);
+            let meta = fs::symlink_metadata(&full).unwrap();
+            let mut f = fs::File::open(&full).unwrap();
+            let (content_sha256, _) = hash_file_reader(&mut f).unwrap();
             ManifestFile {
                 name_c: CString::new(name).unwrap(),
                 name_str: name.to_string(),
@@ -1434,6 +1769,7 @@ mod tests {
                 size: meta.size(),
                 mtime_secs: meta.mtime(),
                 mtime_nsec: meta.mtime_nsec(),
+                content_sha256,
             }
         }
 
@@ -1509,6 +1845,95 @@ mod tests {
                 "mutated/replaced file must fail closed: {res:?}"
             );
             assert!(file_a.exists(), "mutated file must be preserved");
+        }
+
+        #[test]
+        fn delete_dir_from_manifest_rejects_same_size_and_mtime_content_drift() {
+            use std::io::Write;
+
+            let tmp = tempdir().unwrap();
+            let target = tmp.path().join("target_dir");
+            fs::create_dir_all(&target).unwrap();
+            let file_a = target.join("a.txt");
+            fs::write(&file_a, b"initial").unwrap();
+            let orig_mtime = fs::metadata(&file_a).unwrap().modified().unwrap();
+
+            let dir_meta = fs::symlink_metadata(&target).unwrap();
+            let manifest = ManifestDir {
+                name_c: CString::new("target_dir").unwrap(),
+                name_str: "target_dir".to_string(),
+                dev: dir_meta.dev(),
+                ino: dir_meta.ino(),
+                dirs: Vec::new(),
+                files: vec![build_manifest_file(&target, "a.txt")],
+            };
+
+            let dir_fd = open_dir_fd(&target);
+            {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .truncate(false)
+                    .open(&file_a)
+                    .unwrap();
+                f.write_all(b"DRIFTED").unwrap();
+                f.flush().unwrap();
+                f.set_modified(orig_mtime).unwrap();
+            }
+
+            let ctx = ProtectionContext::new(tmp.path().to_path_buf(), vec![]);
+            let res =
+                delete_dir_from_manifest(&dir_fd, &target, &manifest, dir_meta.dev(), &ctx, 1);
+            assert!(
+                matches!(res, Err(SjError::ExecutionGate(_))),
+                "same-size/same-mtime content drift must fail closed: {res:?}"
+            );
+            assert_eq!(
+                fs::read(&file_a).unwrap(),
+                b"DRIFTED",
+                "drifted file must be preserved intact on disk"
+            );
+        }
+
+        #[test]
+        fn restore_staged_or_preserve_non_clobbering_on_eexist() {
+            let tmp = tempdir().unwrap();
+            let parent = tmp.path();
+            let leaf_path = parent.join("victim.txt");
+            fs::write(&leaf_path, b"staged payload").unwrap();
+
+            let parent_fd = open_dir_fd(parent);
+            let parent_meta = fs::symlink_metadata(parent).unwrap();
+            let (stage_fd, stage_name_c, stage_name_str) =
+                unix_impl::create_private_stage_dir(&parent_fd, parent_meta.dev()).unwrap();
+
+            let leaf_c = CString::new("victim.txt").unwrap();
+            let target_c = c"target";
+            unix_impl::renameat_no_replace(&parent_fd, &leaf_c, &stage_fd, target_c).unwrap();
+
+            // Simulate concurrent creation of a new file at the original path
+            fs::write(&leaf_path, b"new concurrent file").unwrap();
+
+            let res = unix_impl::restore_staged_or_preserve(
+                &parent_fd,
+                &leaf_c,
+                &stage_fd,
+                &stage_name_c,
+            );
+            assert!(
+                res.is_err(),
+                "restore_staged_or_preserve must fail when destination already exists"
+            );
+            assert_eq!(
+                fs::read(&leaf_path).unwrap(),
+                b"new concurrent file",
+                "new file at leaf_c must not be clobbered"
+            );
+            let quarantined_target = parent.join(&stage_name_str).join("target");
+            assert_eq!(
+                fs::read(&quarantined_target).unwrap(),
+                b"staged payload",
+                "staged target must remain preserved in quarantine"
+            );
         }
     }
 }
