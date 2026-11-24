@@ -1,0 +1,203 @@
+# SpaceJanitor Use Cases
+
+Practical walkthroughs for the six core workstation failure modes SpaceJanitor is built to diagnose and resolve safely. Every workflow starts **read-only** and uses deterministic dry-run plans before any mutation occurs.
+
+---
+
+## 1. Runaway Disk Exhaustion
+
+### Symptom
+Your SSD hits 95%+ capacity unexpectedly during builds or parallel AI coding sessions, even though your active source repositories are small. Hidden culprits include stale `target/` or `node_modules` directories, abandoned git worktrees, multi-gigabyte OS Trash, and macOS APFS local Time Machine snapshots.
+
+### Read-Only Commands
+
+```bash
+# Audit top directory consumers (bounded depth, same filesystem)
+sj scan ~/dev --depth 3 --top 15 --same-fs
+
+# Inspect OS Trash / Recycle Bin
+sj trash
+
+# Inspect git repositories and worktrees for safe-to-prune orphans
+sj orphans ~/dev --depth 5
+```
+
+### Sample Output
+
+```text
+scan: /Users/<you>/dev (84210944000 bytes, 148230 files, status=Ok)
+   28410220544  /Users/<you>/dev/project-alpha/target (dir)
+   14205110272  /Users/<you>/dev/worktrees/feature-old (dir)
+trash: /Users/<you>/.Trash (exists=true, items=42, total=9812031488B, reclaimable=9812031488B, protected=0)
+orphans: /Users/<you>/dev (scanned=18, safe=1, blocked=2)
+  SAFE    /Users/<you>/dev/worktrees/feature-old (14205110272B)
+  BLOCKED /Users/<you>/dev/worktrees/wip-branch [dirty_working_tree]
+  BLOCKED /Users/<you>/dev/scratch-notes [missing_remote]
+```
+
+### How SpaceJanitor Solves It Safely
+- **Recursive Git Proof:** `sj orphans` verifies that a candidate tree has a valid `.git`, zero uncommitted/untracked files (`git status --porcelain` empty), at least one remote, and zero unpushed branch commits—including nested sub-repositories. Anything dirty or unpushed is listed under `BLOCKED` and excluded.
+- **Protected Path Enforcement:** Even if Trash or a scan root contains `.ssh`, `.env`, VM images (`*.qcow2`, `*.vmdk`), or user-configured protected paths, `sj-core` excludes them deterministically.
+- **APFS & Snapshot Awareness:** SpaceJanitor flags snapshot-held space as informational rather than generating unsafe deletions.
+
+### Verification
+
+```bash
+# 1. Generate a deterministic dry-run plan (zero mutations)
+sj plan ~/dev --include-trash --include-orphans --json
+
+# 2. Execute ONLY a specific allowlisted item using the plan's SHA-256 digest
+sj plan ~/dev --include-trash --include-orphans \
+  --execute --confirm --plan-sha256 <sha256> --item <item_id>
+```
+
+---
+
+## 2. Hidden Memory & Swap Thrashing
+
+### Symptom
+macOS, Linux, or Windows becomes sluggish, UI animations stutter, and terminals lag—yet `ps` or Task Manager RSS columns only account for a fraction of physical RAM. Modern kernels compress inactive pages in RAM and spill pages into encrypted swap/pagefiles.
+
+### Read-Only Command *(M2)*
+
+```bash
+sj memory --top 15
+```
+
+### Sample Output
+
+```text
+MEMORY FOOTPRINT (workstation-01 | darwin/arm64)
+Physical: 32.0 GiB | Compressed: 11.4 GiB | Swap Used: 14.2 GiB | Status: ALERT
+
+OWNER GROUP       PROCS   RSS (GiB)   COMPRESSED (GiB)   SWAP (GiB)   TRUE FOOTPRINT
+MCP Fleet            48         3.1                4.8          5.2         13.1 GiB
+IDE & Renderers      14         4.5                3.2          3.9         11.6 GiB
+Local Containers      6         2.8                1.4          2.1          6.3 GiB
+```
+
+### How SpaceJanitor Solves It Safely
+- **Cross-Platform True Footprint:**
+  - **macOS:** Combines `top -l 1` (`MEM` + `CMPRS` + `#PORTS`), `vm_stat`, and `sysctl vm.swapusage`.
+  - **Linux:** Reads `/proc/<pid>/smaps_rollup` (`Pss` + `SwapPss`), `/proc/meminfo`, and `swapon --show`.
+  - **Windows:** Queries `Win32_Process` (`WorkingSetSize`, `PrivatePageCount`, `HandleCount`), OS pagefile, and WSL2 `Vmmem`.
+- **Owner Attribution:** Groups child processes under their logical owner (`MCP Fleet`, `IDE & Renderers`, `Agent CLIs`) so you see the real cost of a tool cluster rather than 50 fragmented `node` rows.
+
+### Verification
+Re-run `sj memory --top 10 --json` after closing or reaping the targeted group and confirm `compressed` and `swap` drop below alert thresholds.
+
+---
+
+## 3. Kernel & VFS OS Blockers
+
+### Symptom
+CPU is mostly idle and disk has free space, but `git status`, terminal spawns, or SSH logins freeze for seconds or minutes. Common causes are macOS vnode table exhaustion (`kern.num_vnodes` near `maxvnodes`), `fseventsd` backlog storms, Linux `inotify` watch exhaustion, `D`/`U`-state uninterruptible I/O waits, or recursive `lsof +D` walkers.
+
+### Read-Only Command *(M2)*
+
+```bash
+sj blockers
+```
+
+### Sample Output
+
+```text
+OS BLOCKERS (dev-laptop | linux/x86_64)
+inotify watches : 521400 / 524288 (99.4%)  [CRITICAL]
+file-nr         : 48120 / 1048576 (4.6%)   [OK]
+D-state procs   : 2                        [CHECK]
+VFS walkers     : 1 (lsof +D detected)     [ALERT]
+```
+
+### How SpaceJanitor Solves It Safely
+- **Never Runs `lsof +D`:** SpaceJanitor explicitly bans recursive `lsof +D` tree walks in its own collectors (`O(N processes)` `/proc/<pid>/cwd` or non-recursive `lsof -Fn -d cwd` instead) so diagnostics never worsen a VFS lock.
+- **Actionable Root-Cause Surfacing:** Pinpoints whether the freeze is caused by `inotify` watch exhaustion, macOS vnode/Mach port saturation, Windows NonPaged pool/handle spikes, or a runaway file-tree indexer.
+
+### Verification
+Run `sj blockers --json` after stopping a runaway watcher or raising `fs.inotify.max_user_watches` and confirm status returns to `OK`.
+
+---
+
+## 4. AI Agent MCP Server Sprawl & Inline Secret Leaks
+
+### Symptom
+Running multiple AI editors and CLI agents spawns dozens or hundreds of duplicate stdio MCP servers (`npx` -> `npm exec` -> `node`, or `uvx` -> `python`). Worse, some MCP configs pass API keys or bearer tokens as CLI flags (`--api-key=...`, `--token=...`), exposing them in `ps` output.
+
+### Read-Only Command *(M2)*
+
+```bash
+sj mcp-audit --config-dir ~/.config --config-dir ~/.cursor
+```
+
+### Sample Output
+
+```text
+MCP AUDIT (workstation-01)
+Running MCP servers : 42 (18 duplicate stdio pairs)
+Redacted secrets    : 2 inline CLI/env credential patterns detected (never printed raw)
+
+FAMILY     COUNT   DUPLICATE STDIO   EXAMPLE COMMAND (REDACTED)
+cursor        18                10   npx -y @example/mcp-server --api-key=<REDACTED>
+codex         14                 6   node /Users/<you>/.npm/_npx/.../server.js
+claude        10                 2   python -m mcp_proxy --token=<REDACTED>
+```
+
+### How SpaceJanitor Solves It Safely
+- **Parent-Tree Grouping:** Correlates running MCP servers back to their parent agent family and flags `npx` double-spawning overhead.
+- **Automatic Redaction at the Boundary:** `redact_secrets()` masks `--api-key`, `--token`, `--secret`, `--password`, `Bearer`/`Basic` headers, and URL userinfo (`https://<REDACTED>@...`) **before** serialization, logging, or UI rendering. Raw secrets never appear in `sj` output.
+
+### Verification
+Consolidate duplicate stdio entries or move shared servers to a single daemon/HTTP endpoint, then re-run `sj mcp-audit --json` to confirm duplicate counts drop to `0`.
+
+---
+
+## 5. Safe `PPID=1` Orphan Process Reaping
+
+### Symptom
+Background subagents, test runners, or MCP child processes detach from terminated parent sessions and linger with `PPID=1`, holding gigabytes of RAM or open file descriptors. Blindly running `pkill -f node` risks killing active editors, dev servers, or other agents.
+
+### Read-Only & Gated Commands *(M3)*
+
+```bash
+# Step 1: Dry-run discovery (default; zero signals sent)
+sj reap --min-age-mins 30 --dry-run
+
+# Step 2: Execute ONLY with exact confirmation phrase and plan SHA-256
+sj reap --min-age-mins 30 --execute \
+  --confirm "reap-orphans-workstation-01" \
+  --plan-sha256 <sha256>
+```
+
+### How SpaceJanitor Solves It Safely
+- **No Wildcard Kills:** SpaceJanitor never uses `pkill` or `killall`.
+- **TOCTOU Re-Verification:** At `--execute` time, `sj-core` re-verifies each target's exact **PID**, **PPID == 1**, **command line**, and **process start time** against the SHA-256-hashed dry-run plan before sending `SIGTERM`. If a PID was recycled or no longer matches, execution aborts safely.
+
+### Verification
+Re-run `sj reap --min-age-mins 30 --dry-run --json` and confirm the reaped PIDs are no longer present and active sessions remain untouched.
+
+---
+
+## 6. Agent-First Automation (AXI) & Optional Local SLM Advisor
+
+### Symptom
+AI coding agents waste thousands of context tokens parsing verbose `du`/`top`/`ps` output before spawning parallel worktrees, while human operators sometimes encounter unfamiliar cache directories and want a plain-English explanation without sending workstation paths to a cloud LLM.
+
+### Read-Only Commands
+
+```bash
+# Compact TOON output for coding agents (low token overhead)
+npx spacejanitor-axi summary
+
+# Machine-readable v1 JSON contract
+npx spacejanitor-axi memory --json
+
+# Optional local SLM advisor (M6, strictly 127.0.0.1 / offline GGUF, 0 MiB idle)
+sj advise --plan-json plan.json
+```
+
+### How SpaceJanitor Solves It Safely
+- **AXI Contract:** `spacejanitor-axi` defaults to compact line-oriented TOON tables and supports `--json` for `spacejanitor.*.v1` schemas. Agent skills ([skills/spacejanitor-axi/SKILL.md](../skills/spacejanitor-axi/SKILL.md)) enforce never passing `--execute` automatically.
+- **Zero-Cloud, Zero-Idle SLM:** When enabled, the optional Local SLM Advisor (`0.5B`–`1.5B` GGUF or local `127.0.0.1` Ollama) runs only on explicit request, receives only redacted metadata, checks that free RAM is `>= 2.5 GiB`, and has **zero execution capability**—every suggestion is re-validated by `sj-core` and requires standard two-step human confirmation.
+
+### Verification
+Run `npx spacejanitor-axi doctor --json` to confirm `safetyMode: "dry-run-default"` and verify local contract readiness.
