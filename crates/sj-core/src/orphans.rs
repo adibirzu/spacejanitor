@@ -75,6 +75,15 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
     }
 }
 
+fn anchor_to_cwd(path: &Path) -> Result<PathBuf, String> {
+    if path.is_absolute() {
+        Ok(normalize_lexical_path(path))
+    } else {
+        let cwd = std::env::current_dir().map_err(|_| "unresolvable_current_dir".to_string())?;
+        Ok(normalize_lexical_path(&cwd.join(path)))
+    }
+}
+
 fn run_git_raw_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
 where
     I: IntoIterator<Item = S>,
@@ -311,17 +320,19 @@ fn build_git_exec_context(
     logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<(GitExecContext, bool), String> {
-    let dot_git = actual_repo.join(".git");
+    let actual_abs = anchor_to_cwd(actual_repo)?;
+    let logical_abs = anchor_to_cwd(logical_repo)?;
+    let dot_git = actual_abs.join(".git");
     let dot_git_meta =
         std::fs::symlink_metadata(&dot_git).map_err(|_| "missing_dot_git".to_string())?;
     if dot_git_meta.file_type().is_symlink() {
         return Err("symlink_dot_git".to_string());
     }
     if dot_git_meta.is_file() {
-        let git_dir = validate_gitdir_pointer(logical_repo, &dot_git, ctx)?;
+        let git_dir = validate_gitdir_pointer(&logical_abs, &dot_git, ctx)?;
         Ok((
             GitExecContext {
-                work_tree: actual_repo.to_path_buf(),
+                work_tree: actual_abs,
                 git_dir,
                 alternate_object_dirs: None,
             },
@@ -329,10 +340,10 @@ fn build_git_exec_context(
         ))
     } else if dot_git_meta.is_dir() {
         validate_commondir(&dot_git, ctx)?;
-        let alternate_object_dirs = resolve_staged_alternates(actual_repo, logical_repo)?;
+        let alternate_object_dirs = resolve_staged_alternates(&actual_abs, &logical_abs)?;
         Ok((
             GitExecContext {
-                work_tree: actual_repo.to_path_buf(),
+                work_tree: actual_abs,
                 git_dir: dot_git,
                 alternate_object_dirs,
             },
@@ -495,11 +506,18 @@ fn validate_single_repo_at(
             let mut remote_query_failed = false;
             for remote_name in &remotes {
                 let target_override = if actual_repo != logical_repo {
+                    let logical_abs = match anchor_to_cwd(logical_repo) {
+                        Ok(p) => p,
+                        Err(_) => {
+                            remote_query_failed = true;
+                            continue;
+                        }
+                    };
                     let cfg_key = format!("remote.{remote_name}.url");
                     run_git_ctx(&git_ctx, ["config", "--get", &cfg_key])
                         .ok()
                         .filter(|(ok, out)| *ok && !out.is_empty())
-                        .and_then(|(_, url)| resolve_relative_local_remote(&url, logical_repo))
+                        .and_then(|(_, url)| resolve_relative_local_remote(&url, &logical_abs))
                 } else {
                     None
                 };
@@ -840,4 +858,34 @@ pub(crate) fn verify_orphan_safe_to_remove_staged(
 /// Fail-closed pre-removal verification for an orphan worktree/repo directory.
 pub fn verify_orphan_safe_to_remove(repo: &Path, ctx: &ProtectionContext) -> Result<(), SjError> {
     verify_orphan_safe_to_remove_staged(repo, repo, ctx)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn anchor_to_cwd_resolves_and_normalizes_relative_paths() {
+        let cwd = std::env::current_dir().expect("current_dir should succeed");
+        let expected_cwd = normalize_lexical_path(&cwd);
+
+        let anchored_dot = anchor_to_cwd(Path::new(".")).expect("anchor '.' should succeed");
+        assert!(anchored_dot.is_absolute());
+        assert_eq!(anchored_dot, expected_cwd);
+
+        let anchored_rel = anchor_to_cwd(Path::new("foo/./bar/../baz"))
+            .expect("anchor relative path should succeed");
+        assert!(anchored_rel.is_absolute());
+        assert_eq!(anchored_rel, expected_cwd.join("foo").join("baz"));
+
+        let abs_in = expected_cwd
+            .join("alpha")
+            .join(".")
+            .join("beta")
+            .join("..")
+            .join("gamma");
+        let anchored_abs = anchor_to_cwd(&abs_in).expect("anchor absolute path should succeed");
+        assert!(anchored_abs.is_absolute());
+        assert_eq!(anchored_abs, expected_cwd.join("alpha").join("gamma"));
+    }
 }

@@ -1,9 +1,30 @@
 use std::fs;
+use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
 fn sj_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sj")
+}
+
+fn run_git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_AUTHOR_NAME", "Test User")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test User")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .output()
+        .expect("git command should run");
+    assert!(
+        out.status.success(),
+        "git {:?} failed in {}: {}",
+        args,
+        dir.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
 }
 
 #[test]
@@ -130,4 +151,131 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
     // doctor --json includes real probe fields
     assert!(doc_json.get("git_available").is_some());
     assert!(doc_json.get("home_dir_resolved").is_some());
+}
+
+#[test]
+fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path();
+    let remote = home.join("origin.git");
+    let ws = home.join("ws");
+    let checkout = ws.join("checkout");
+    fs::create_dir_all(&remote).unwrap();
+    fs::create_dir_all(&checkout).unwrap();
+
+    run_git(&remote, &["init", "--bare"]);
+    run_git(&checkout, &["init"]);
+    run_git(&checkout, &["checkout", "-b", "main"]);
+    fs::write(checkout.join("README.md"), "hello\n").unwrap();
+    run_git(&checkout, &["add", "README.md"]);
+    run_git(&checkout, &["commit", "-m", "initial"]);
+    run_git(
+        &checkout,
+        &["remote", "add", "origin", remote.to_str().unwrap()],
+    );
+    run_git(&checkout, &["push", "-u", "origin", "main"]);
+
+    let checkout_abs = checkout.to_str().unwrap();
+    let orphan_invocations: Vec<(&Path, Vec<&str>)> = vec![
+        (&ws, vec!["orphans", "--json"]),
+        (&ws, vec!["orphans", "checkout", "--json"]),
+        (&ws, vec!["orphans", checkout_abs, "--json"]),
+        (&checkout, vec!["orphans", "--json"]),
+    ];
+
+    let mut expected_branch: Option<String> = None;
+    let mut expected_head: Option<String> = None;
+
+    for (cwd, args) in &orphan_invocations {
+        let out = Command::new(sj_bin())
+            .current_dir(cwd)
+            .env("HOME", home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "sj {:?} in {} failed: {}",
+            args,
+            cwd.display(),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let safe = json["safe_to_prune"].as_array().unwrap();
+        let blocked = json["blocked"].as_array().unwrap();
+        assert_eq!(
+            safe.len(),
+            1,
+            "expected 1 safe_to_prune for {:?} in {}, got: {json}",
+            args,
+            cwd.display()
+        );
+        assert!(
+            blocked.is_empty(),
+            "expected empty blocked for {:?} in {}, got: {json}",
+            args,
+            cwd.display()
+        );
+        let branch = safe[0]["branch"].as_str().unwrap().to_string();
+        let head = safe[0]["head"].as_str().unwrap().to_string();
+        assert!(!branch.is_empty());
+        assert!(!head.is_empty());
+
+        if let Some(ref b) = expected_branch {
+            assert_eq!(&branch, b);
+        } else {
+            expected_branch = Some(branch);
+        }
+        if let Some(ref h) = expected_head {
+            assert_eq!(&head, h);
+        } else {
+            expected_head = Some(head);
+        }
+    }
+
+    let plan_invocations: Vec<Vec<&str>> = vec![
+        vec!["plan", "--include-orphans", "--json"],
+        vec!["plan", "checkout", "--include-orphans", "--json"],
+        vec!["plan", checkout_abs, "--include-orphans", "--json"],
+    ];
+
+    let mut expected_snapshot: Option<(String, String, String, String)> = None;
+    for args in &plan_invocations {
+        let out = Command::new(sj_bin())
+            .current_dir(&ws)
+            .env("HOME", home)
+            .args(args)
+            .output()
+            .unwrap();
+        assert_eq!(
+            out.status.code(),
+            Some(0),
+            "sj {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let json: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        let items = json["items"].as_array().unwrap();
+        assert_eq!(
+            items.len(),
+            1,
+            "expected 1 plan item for {:?}, got: {json}",
+            args
+        );
+        assert_eq!(items[0]["kind"], "orphan_worktree");
+        let snap = &items[0]["snapshot"];
+        let content_sha = snap["content_or_tree_sha256"].as_str().unwrap().to_string();
+        let git_head = snap["git_head"].as_str().unwrap().to_string();
+        let git_tree = snap["git_tree"].as_str().unwrap().to_string();
+        let git_refs_sha = snap["git_refs_sha256"].as_str().unwrap().to_string();
+        assert_eq!(Some(&git_head), expected_head.as_ref());
+
+        let tuple = (content_sha, git_head, git_tree, git_refs_sha);
+        if let Some(ref prev) = expected_snapshot {
+            assert_eq!(&tuple, prev);
+        } else {
+            expected_snapshot = Some(tuple);
+        }
+    }
 }
