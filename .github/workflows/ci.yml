@@ -26,16 +26,35 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-  cross-platform-tests:
-    name: Test (${{ matrix.os }})
+  rust-core-tests:
+    name: Rust Core (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os:
-          - ubuntu-latest       # Linux x86_64
-          - ubuntu-24.04-arm    # Linux ARM64
-          - macos-15            # macOS Apple Silicon (ARM64)
-          - windows-latest      # Windows x86_64
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15
+          - windows-latest
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Run cargo test
+        run: cargo test --workspace
+      - name: Verify Rust doctor
+        run: cargo run -p sj-cli -- doctor --json
+
+  cross-platform-node-tests:
+    name: Node CLI & SDK (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - ubuntu-24.04-arm
+          - macos-15
+          - windows-latest
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -47,9 +66,9 @@ jobs:
       - name: Verify CLI doctor
         run: node packages/cli/bin/spacejanitor.mjs doctor --json
 
-  # Desktop release build matrix (enabled once ADR-001 shell scaffold lands):
+  # Electron desktop release matrix (enabled once M5 desktop bundle lands):
   #   - macOS Universal (arm64 + x86_64) on macos-15
   #   - Linux x86_64 (.AppImage / .deb) on ubuntu-latest
   #   - Linux ARM64 (.AppImage / .deb) on ubuntu-24.04-arm
-  #   - Windows x86_64 (.msi / .exe) on windows-latest
-  #   - Windows ARM64 (.msi / .exe) on windows-11-arm (or native MSVC cross-target)
+  #   - Windows x86_64 (.exe / .msi) on windows-latest
+  #   - Windows ARM64 (.exe / .msi) on windows-11-arm

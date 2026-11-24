@@ -1,0 +1,8 @@
+[package]
+name = "sj-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "SpaceJanitor high-speed Rust core: immutable protected-path denylist, secret redaction, and schema contracts."
+
+[dependencies]

@@ -1,0 +1,13 @@
+[package]
+name = "sj-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "High-speed Rust CLI & desktop IPC engine for SpaceJanitor."
+
+[[bin]]
+name = "sj"
+path = "src/main.rs"
+
+[dependencies]
+sj-core = { path = "../sj-core" }

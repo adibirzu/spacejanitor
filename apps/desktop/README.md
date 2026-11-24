@@ -1,8 +1,10 @@
-# SpaceJanitor Cross-Platform Desktop Shell (`apps/desktop`)
+# SpaceJanitor Electron Desktop Shell (`apps/desktop`)
 
-Target platforms (`x86_64` and `ARM64`):
+Per [ADR-001](../../docs/adr/ADR-001-desktop-runtime-tauri-vs-electron.md), SpaceJanitor uses a **Rust core binary (`crates/sj-cli`)** wrapped by a **thin Electron desktop shell** hosting `apps/ui` for consistent rendering across:
 - **macOS:** Apple Silicon (`darwin-arm64`) and Intel (`darwin-x64`)
-- **Linux:** `linux-x64` and `linux-arm64` (`.AppImage` / `.deb`)
-- **Windows:** `win32-x64` and `win32-arm64` (`.msi` / `.exe`)
+- **Linux:** `linux-x64` and `linux-arm64` (`.AppImage` / `.deb`, zero WebKitGTK version lock)
+- **Windows:** `win32-x64` and `win32-arm64` (`.msi` / `.exe` / NSIS)
 
-See [ADR-001](../../docs/adr/ADR-001-desktop-runtime-tauri-vs-electron.md) for the **Tauri v2** recommendation vs. thin **Electron** fallback comparison, and [PRD-003](../../docs/prd/PRD-003-cross-platform-desktop-app.md) for resource budgets and tray requirements.
+## Tray Memory Discipline
+
+When minimized/closed to the menu bar or system tray, the Electron main process destroys the `BrowserWindow` renderer and keeps only the lightweight Rust telemetry daemon active (`~8–20 MiB`), recreating the UI window on demand.
