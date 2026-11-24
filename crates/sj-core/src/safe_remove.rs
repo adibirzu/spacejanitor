@@ -1,11 +1,6 @@
-use crate::orphans::{
-    capture_git_snapshot_identity_staged, verify_orphan_safe_to_remove,
-    verify_orphan_safe_to_remove_staged,
-};
+use crate::orphans::capture_git_snapshot_identity_staged;
 use crate::plan::{PlanItem, TargetSnapshot};
-use crate::protect::{
-    check_path_protection, is_symlink_path, ProtectionContext, QUARANTINE_STAGE_PREFIX,
-};
+use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
 use crate::SjError;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -73,6 +68,8 @@ pub(crate) fn hash_dir_tree_records(records: &[DirTreeRecord]) -> String {
 #[allow(clippy::unnecessary_cast)]
 mod unix_impl {
     use super::*;
+    use crate::orphans::{verify_orphan_safe_to_remove, verify_orphan_safe_to_remove_staged};
+    use crate::protect::QUARANTINE_STAGE_PREFIX;
     use std::ffi::{CStr, CString};
     use std::fs::File;
     use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
@@ -1893,13 +1890,18 @@ pub(crate) fn safe_remove_plan_item(
     ctx: &ProtectionContext,
     allowed_trash_roots: &[PathBuf],
 ) -> Result<(), SjError> {
+    let prot = check_path_protection(Path::new(&item.path), ctx);
+    if prot.protected {
+        return Err(SjError::ProtectedPath(prot.reason));
+    }
+
     #[cfg(unix)]
     {
         unix_impl::safe_remove_plan_item_unix(item, ctx, allowed_trash_roots)
     }
     #[cfg(not(unix))]
     {
-        let _ = (item, ctx, allowed_trash_roots);
+        let _ = allowed_trash_roots;
         Err(SjError::ExecutionGate(
             "safe handle-anchored execution is not supported on this platform; dry-run planning only"
                 .to_string(),
@@ -2004,6 +2006,99 @@ mod tests {
             .git_refs_sha256
             .as_deref()
             .is_some_and(|s| !s.is_empty()));
+    }
+
+    #[test]
+    fn safe_remove_plan_item_refuses_quarantine_stage_targets_cross_platform() {
+        let dir = tempdir().unwrap();
+        let root = dir.path();
+        let trash_dir = root.join("Trash");
+        let stage_dir = trash_dir.join(".sj-stage-999-deadbeef01234567");
+        let nested_target = stage_dir.join("target");
+        fs::create_dir_all(&nested_target).unwrap();
+        let leftover = nested_target.join("leftover.txt");
+        fs::write(&leftover, b"recover me").unwrap();
+
+        let unprotected = root.join("normal.txt");
+        fs::write(&unprotected, b"outside trash").unwrap();
+
+        let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+        let allowed_trash_roots = vec![trash_dir];
+
+        let dir_snapshot = TargetSnapshot {
+            entry_type: "dir".to_string(),
+            dev: None,
+            ino: None,
+            size: 0,
+            mtime_secs: None,
+            mtime_nanos: None,
+            content_or_tree_sha256: String::new(),
+            git_head: None,
+            git_tree: None,
+            git_refs_sha256: None,
+        };
+
+        let trash_stage_item = PlanItem {
+            id: "item_stage_dir".to_string(),
+            kind: "trash_item".to_string(),
+            path: stage_dir.to_string_lossy().into_owned(),
+            bytes: 0,
+            tier: "safe".to_string(),
+            safety_reasons: Vec::new(),
+            snapshot: dir_snapshot.clone(),
+        };
+        let res1 = safe_remove_plan_item(&trash_stage_item, &ctx, &allowed_trash_roots);
+        assert!(
+            matches!(res1, Err(SjError::ProtectedPath(ref r)) if r.starts_with("quarantine_stage_recovery_required:")),
+            "expected ProtectedPath for stage_dir, got: {res1:?}"
+        );
+
+        let orphan_nested_item = PlanItem {
+            id: "item_nested_target".to_string(),
+            kind: "orphan_worktree".to_string(),
+            path: nested_target.to_string_lossy().into_owned(),
+            bytes: 0,
+            tier: "safe".to_string(),
+            safety_reasons: Vec::new(),
+            snapshot: dir_snapshot,
+        };
+        let res2 = safe_remove_plan_item(&orphan_nested_item, &ctx, &allowed_trash_roots);
+        assert!(
+            matches!(res2, Err(SjError::ProtectedPath(ref r)) if r.starts_with("quarantine_stage_recovery_required:")),
+            "expected ProtectedPath for nested_target, got: {res2:?}"
+        );
+        assert!(
+            leftover.exists(),
+            "quarantined leftover.txt must remain intact"
+        );
+
+        let file_snapshot = TargetSnapshot {
+            entry_type: "file".to_string(),
+            dev: None,
+            ino: None,
+            size: 13,
+            mtime_secs: None,
+            mtime_nanos: None,
+            content_or_tree_sha256: String::new(),
+            git_head: None,
+            git_tree: None,
+            git_refs_sha256: None,
+        };
+        let unprotected_item = PlanItem {
+            id: "item_unprotected".to_string(),
+            kind: "trash_item".to_string(),
+            path: unprotected.to_string_lossy().into_owned(),
+            bytes: 13,
+            tier: "safe".to_string(),
+            safety_reasons: Vec::new(),
+            snapshot: file_snapshot,
+        };
+        let res3 = safe_remove_plan_item(&unprotected_item, &ctx, &allowed_trash_roots);
+        assert!(
+            matches!(res3, Err(SjError::ExecutionGate(_))),
+            "expected ExecutionGate for unprotected path outside trash roots, got: {res3:?}"
+        );
+        assert!(unprotected.exists(), "unprotected file must remain intact");
     }
 
     #[cfg(unix)]
