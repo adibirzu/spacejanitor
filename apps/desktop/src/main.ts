@@ -9,7 +9,7 @@ import {
   validateTargetPath,
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
-import { annotateSummary, approvedFromSummary } from "./candidateAnnotations";
+import { annotateSummary, approvedFromSummary, protectWithRules } from "./candidateAnnotations";
 import { OrphanScanSetting, setOrphanScanWithConfirmation } from "./orphanSetting";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
@@ -26,7 +26,9 @@ const bridge = new SjBridge({
   binaryPath: resolveSjBinary({ isPackaged: app.isPackaged }),
 });
 const orphanScan = new OrphanScanSetting(path.join(app.getPath("userData"), "settings.json"));
-const gate = new RemediationGate({ orphanScanEnabled: () => orphanScan.get() });
+// One rule set for the dry-run plan, the execution and the UI annotation (custom rules only add protection).
+const PROTECT_RULES = {};
+const gate = new RemediationGate({ orphanScanEnabled: () => orphanScan.get(), ruleOptions: PROTECT_RULES });
 const slmAdvisor = new SlmAdvisorService();
 
 function resolveUiEntry(): { devUrl?: string; indexPath?: string } {
@@ -199,7 +201,7 @@ function registerIpcHandlers(): void {
     if (method === "orphans" || method === "summary") params.includeOrphans = orphanScan.get();
     let result = await bridge.invoke(method, params);
     // Tell the UI which candidates the gate accepts (and why not), so it never offers what plan would refuse.
-    if (method === "summary") result = annotateSummary(result, (paths) => core.protectPaths(paths));
+    if (method === "summary") result = annotateSummary(result, protectWithRules(PROTECT_RULES));
     registerApprovedFromReport(method, result);
     // Read-only views always work; the renderer is told whether destructive actions are possible.
     return method === "summary" ? { ...result, remediationGate: bridge.remediationAvailable() } : result;

@@ -14,27 +14,32 @@ function deny(reason) {
 // eslint-disable-next-line no-control-regex
 const CONTROL_CHAR_RE = /[\u0000-\u001f\u007f]/;
 
-function ask(
-  candidatePath,
-  { homeDir, descendants = false, timeoutMs, maxEntries, exactPaths, dynamicProtectedPaths, globPatterns } = {}
-) {
-  if (typeof candidatePath !== "string" || candidatePath.trim() === "") return deny("empty_path");
-  // NUL cannot be passed as an argument at all and control characters are never legitimate: refuse early.
-  if (CONTROL_CHAR_RE.test(candidatePath)) return deny("control_character_in_path");
-  const args = ["protect", "--json"];
+/** The CLI flags for the options every call path must forward identically (never allow, only protect more). */
+export function protectRuleArgs({ descendants = false, maxEntries, exactPaths, dynamicProtectedPaths, globPatterns } = {}) {
+  const args = [];
+  if (descendants) args.push("--descendants");
+  if (maxEntries) args.push("--max-entries", String(maxEntries));
   for (const [flag, list] of [
     ["--exact", exactPaths],
     ["--dynamic", dynamicProtectedPaths],
     ["--glob", globPatterns],
   ]) {
     for (const v of Array.isArray(list) ? list : []) {
-      if (typeof v !== "string" || v === "" || CONTROL_CHAR_RE.test(v)) return deny("invalid_custom_rule");
+      if (typeof v !== "string" || v === "" || CONTROL_CHAR_RE.test(v)) return null;
       args.push(`${flag}=${v}`);
     }
   }
-  if (descendants) args.push("--descendants");
-  if (maxEntries) args.push("--max-entries", String(maxEntries));
-  args.push("--", candidatePath);
+  return args;
+}
+
+function ask(candidatePath, options = {}) {
+  const { homeDir, timeoutMs } = options;
+  if (typeof candidatePath !== "string" || candidatePath.trim() === "") return deny("empty_path");
+  // NUL cannot be passed as an argument at all and control characters are never legitimate: refuse early.
+  if (CONTROL_CHAR_RE.test(candidatePath)) return deny("control_character_in_path");
+  const flags = protectRuleArgs(options);
+  if (flags === null) return deny("invalid_custom_rule");
+  const args = ["protect", "--json", ...flags, "--", candidatePath];
   let reply;
   try {
     reply = runSjSync(args, { homeDir, timeoutMs });
@@ -80,9 +85,11 @@ export function protectPaths(paths, options = {}) {
     return list.map((p) => ({ path: p, ...ask(p, options) }));
   }
   const { homeDir, timeoutMs } = options;
+  const flags = protectRuleArgs(options);
+  if (flags === null) return closed("invalid_custom_rule");
   let reply;
   try {
-    reply = runSjSync(["protect", "--json", "--", ...list], { homeDir, timeoutMs });
+    reply = runSjSync(["protect", "--json", ...flags, "--", ...list], { homeDir, timeoutMs });
   } catch (err) {
     return closed(err && err.reason ? err.reason : "sj_unavailable");
   }

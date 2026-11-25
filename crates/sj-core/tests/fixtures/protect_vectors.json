@@ -1,5 +1,5 @@
 {
-  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep. Every rule of the former JS denylist (main a66538f packages/core/src/protect.mjs) has a vector here; the Rust gate is the only implementation. Sections: protected/unprotected run as pure string tests on every platform; posix_host_protected needs POSIX path semantics (drive letters are meaningless there). Note: there was no config/protected.json on main.",
+  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep. Every rule of the former JS denylist (main a66538f packages/core/src/protect.mjs) has a vector here; the Rust gate is the only implementation. Sections: protected/unprotected run as pure string tests on every platform; posix_host_protected needs POSIX path semantics (drive letters are meaningless there). Note: there was no config/protected.json on main. fs_cases (Unix only) are built under a scratch root: paths are relative to it, 'home' is the synthetic home, link entries are symlinks (target relative to the root unless absolute), options mirror --exact/--dynamic/--glob; a candidate listed under protected must be judged protected, under unprotected must not.",
   "home": "/Users/alice",
   "protected": [
     "/",
@@ -158,7 +158,9 @@
     "/Users/alice/.cache/a\nb",
     "/Users/alice/.cache/a\u0000b",
     "~/Documents",
-    "~/.config/gcloud/x"
+    "~/.config/gcloud/x",
+    "/private/tmp",
+    "/private/tmp/"
   ],
   "unprotected": [
     "/Users/alice/.cache/npm",
@@ -192,6 +194,152 @@
     "D:/data/x",
     "D:\\data\\x",
     "C:/../Library/Keychains",
-    "E:/"
+    "E:/",
+    "\\Users\\alice\\Library\\Caches\\Homebrew",
+    "\\Users\\alice\\.cache\\vite",
+    "\\tmp\\x"
+  ],
+  "fs_cases": [
+    {
+      "name": "~/.ssh symlinked elsewhere: the real target stays protected (R2-B3)",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ext/real_ssh"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/.ssh",
+          "target": "ext/real_ssh"
+        }
+      ],
+      "protected": [
+        "ext/real_ssh/config",
+        "ext/real_ssh"
+      ],
+      "unprotected": [
+        "ext/other/file"
+      ]
+    },
+    {
+      "name": "~/Documents symlinked into the trash",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.Trash/Documents_real"
+        },
+        {
+          "link": "home/Documents",
+          "target": "home/.Trash/Documents_real"
+        }
+      ],
+      "protected": [
+        "home/.Trash/Documents_real/tax.pdf"
+      ],
+      "unprotected": [
+        "home/.Trash/other.bin"
+      ]
+    },
+    {
+      "name": "~/.password-store symlinked to a git checkout",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ws/pass-repo"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/.password-store",
+          "target": "ws/pass-repo"
+        }
+      ],
+      "protected": [
+        "ws/pass-repo",
+        "ws/pass-repo/site.gpg"
+      ],
+      "unprotected": [
+        "ws/other-repo"
+      ]
+    },
+    {
+      "name": "custom exact path given through a symlink protects the real target",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/models_ssd"
+        },
+        {
+          "link": "home/models",
+          "target": "ext/models_ssd"
+        }
+      ],
+      "options": {
+        "exact": [
+          "~/models"
+        ]
+      },
+      "protected": [
+        "ext/models_ssd/llama.gguf",
+        "home/models/x"
+      ],
+      "unprotected": [
+        "ext/models_other/x"
+      ]
+    },
+    {
+      "name": "custom dynamic path given through a symlink protects the real target",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/active_real"
+        },
+        {
+          "link": "ws_link",
+          "target": "ext/active_real"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "ws_link"
+        ]
+      },
+      "protected": [
+        "ext/active_real/src"
+      ],
+      "unprotected": [
+        "ext/idle/src"
+      ]
+    },
+    {
+      "name": "custom rules are additive only: they never allow what a built-in rule protects",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.ssh"
+        }
+      ],
+      "options": {
+        "exact": [
+          "/nonexistent-allow"
+        ],
+        "glob": [
+          "*.never-matches"
+        ]
+      },
+      "protected": [
+        "home/.ssh/id_x"
+      ],
+      "unprotected": []
+    }
   ]
 }

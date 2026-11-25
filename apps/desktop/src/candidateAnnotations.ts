@@ -1,4 +1,7 @@
-import { RemediationCandidate } from "./remediationGate";
+import { RemediationCandidate, RuleOptions } from "./remediationGate";
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const core = require("@spacejanitor/core");
 
 /**
  * What the UI may offer for cleanup must be what the gate would accept. `annotateSummary` tags every
@@ -89,4 +92,12 @@ export function approvedFromSummary(summary: Record<string, unknown>): Remediati
       bytes: Number(r.bytes) || 0,
       kind: (r.kind === "dir" || r.kind === "git-worktree" ? r.kind : "file") as RemediationCandidate["kind"],
     }));
+}
+
+/**
+ * The annotation verdicts must come from the same rule set as the dry-run plan: the identical custom
+ * rule options (which can only ever protect more) are forwarded to the batched `sj protect` call.
+ */
+export function protectWithRules(rules: RuleOptions = {}): ProtectFn {
+  return (paths) => core.protectPaths(paths, rules);
 }

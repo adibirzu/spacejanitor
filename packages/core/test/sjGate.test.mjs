@@ -333,3 +333,51 @@ test("gate: protectPaths asks sj once for a whole batch and fails closed for eve
     assert.deepEqual(out.map((r) => [r.protected, r.reason]), [[true, "sj_unavailable"], [true, "sj_unavailable"]]);
   });
 });
+
+test("gate: protectPaths forwards every rule option, so batched annotation agrees with isProtectedPath", { skip: !HAVE_SJ }, () => {
+  withBinary(REAL_SJ, () => {
+    const o = {
+      homeDir: "/Users/alice",
+      exactPaths: ["/data/keep"],
+      dynamicProtectedPaths: ["/work/active"],
+      globPatterns: ["*.vaultx"],
+    };
+    const paths = ["/data/keep/sub", "/work/active/a", "/Users/alice/x.vaultx", "/data/other", "/Users/alice/.cache/vite"];
+    const batched = protectPaths(paths, o).map((r) => r.protected);
+    const single = paths.map((p) => isProtectedPath(p, o).protected);
+    assert.deepEqual(batched, single);
+    assert.deepEqual(batched, [true, true, true, false, false]);
+  });
+});
+
+test("gate: shared fs vectors (symlinked home subpaths, symlinked custom rules) hold through the Node wrapper", { skip: !HAVE_SJ || process.platform === "win32" }, () => {
+  withBinary(REAL_SJ, () => {
+    for (const c of vectors.fs_cases) {
+      const root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-fsv-")));
+      try {
+        const abs = (rel) => (path.isAbsolute(rel) ? rel : path.join(root, rel));
+        for (const step of c.setup) {
+          if (step.dir) fs.mkdirSync(abs(step.dir), { recursive: true });
+          else if (step.link) {
+            fs.mkdirSync(path.dirname(abs(step.link)), { recursive: true });
+            fs.symlinkSync(abs(step.target), abs(step.link));
+          }
+        }
+        const rule = (x) => (x.startsWith("~") || path.isAbsolute(x) ? x : abs(x));
+        const o = {
+          homeDir: abs(c.home),
+          exactPaths: (c.options?.exact || []).map(rule),
+          dynamicProtectedPaths: (c.options?.dynamic || []).map(rule),
+          globPatterns: c.options?.glob || [],
+        };
+        for (const p of c.protected) {
+          assert.equal(isProtectedPath(abs(p), o).protected, true, `${c.name}: ${p}`);
+          assert.equal(protectPaths([abs(p)], o)[0].protected, true, `${c.name} (batched): ${p}`);
+        }
+        for (const p of c.unprotected) assert.equal(isProtectedPath(abs(p), o).protected, false, `${c.name}: ${p}`);
+      } finally {
+        fs.rmSync(root, { recursive: true, force: true });
+      }
+    }
+  });
+});

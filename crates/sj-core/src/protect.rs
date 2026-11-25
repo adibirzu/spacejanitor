@@ -96,7 +96,7 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
 
 /// Protected as the directory itself only (children are governed by the other rules).
 pub const PROTECTED_EXACT_ONLY_ROOTS: &[&str] = &[
-    "/Users", "/home", "/var", "/private", "/private/var", "/Volumes", "/mnt", "/srv", "/tmp", "C:/Users",
+    "/Users", "/home", "/var", "/private", "/private/var", "/private/tmp", "/Volumes", "/mnt", "/srv", "/tmp", "C:/Users",
 ];
 
 /// Account roots whose children belong to some other user unless they sit under the current home.
@@ -174,6 +174,9 @@ pub struct ProtectionContext {
     pub dynamic_paths: Vec<PathBuf>,
     /// Extra wildcard patterns on top of [`PROTECTED_GLOB_PATTERNS`].
     pub glob_patterns: Vec<String>,
+    /// Resolved forms of every rule root (computed once per context, on first filesystem-aware
+    /// check). Mutate the public rule fields before the first check.
+    prepared: std::sync::OnceLock<Prepared>,
 }
 
 impl ProtectionContext {
@@ -183,6 +186,7 @@ impl ProtectionContext {
             exact_paths,
             dynamic_paths: Vec::new(),
             glob_patterns: Vec::new(),
+            prepared: std::sync::OnceLock::new(),
         }
     }
 
@@ -390,8 +394,83 @@ fn is_protected_filename(name: &str) -> Option<String> {
     None
 }
 
-/// Pure rule evaluation over already-normalised candidate forms (`cands`) and home forms (`homes`).
-fn evaluate(cands: &[String], homes: &[String], ctx: &ProtectionContext) -> ProtectionVerdict {
+/// Every rule root in all the forms a candidate may legitimately take: the textual form and, for the
+/// filesystem-aware layer, the form the OS resolves it to (so `/tmp` also protects `/private/tmp`,
+/// and a `~/.ssh` that is a symlink also protects its real target). Custom rules are only ever added
+/// here, so they can protect more but never allow anything.
+#[derive(Debug, Clone)]
+struct Prepared {
+    homes: Vec<String>,
+    system_roots: Vec<(String, Vec<String>)>,
+    exact_only: Vec<(String, Vec<String>)>,
+    foreign: Vec<(String, Vec<String>)>,
+    home_subs: Vec<(String, Vec<String>)>,
+    exact: Vec<(String, Vec<String>)>,
+    dynamic: Vec<(String, Vec<String>)>,
+}
+
+fn forms_of(textual: &str, resolve: &dyn Fn(&str) -> String) -> Vec<String> {
+    let mut out = vec![textual.to_string()];
+    let r = resolve(textual);
+    if !r.is_empty() && !out.iter().any(|x| key(x) == key(&r)) {
+        out.push(r);
+    }
+    out
+}
+
+fn prepare(homes: Vec<String>, ctx: &ProtectionContext, resolve: &dyn Fn(&str) -> String) -> Prepared {
+    let norm_roots = |roots: &[&str]| -> Vec<(String, Vec<String>)> {
+        roots
+            .iter()
+            .filter_map(|r| {
+                let t = normalize_lexical(r).ok()?;
+                // a root that resolves to "/" or a bare drive would swallow everything: keep it textual
+                let forms = forms_of(&t, resolve)
+                    .into_iter()
+                    .filter(|f| f == &t || (f != "/" && !is_drive_root(f)))
+                    .collect();
+                Some(((*r).to_string(), forms))
+            })
+            .collect()
+    };
+    let mut home_subs = Vec::new();
+    for sub in PROTECTED_HOME_SUBPATHS {
+        let mut forms: Vec<String> = Vec::new();
+        for h in &homes {
+            let t = format!("{}/{sub}", h.trim_end_matches('/'));
+            for f in forms_of(&t, resolve) {
+                if !forms.iter().any(|x| key(x) == key(&f)) {
+                    forms.push(f);
+                }
+            }
+        }
+        home_subs.push(((*sub).to_string(), forms));
+    }
+    let home0 = homes.first().cloned().unwrap_or_default();
+    let user_forms = |paths: &[PathBuf]| -> Vec<(String, Vec<String>)> {
+        paths
+            .iter()
+            .filter_map(|p| {
+                let t = expand_tilde_textual(p.to_string_lossy().trim(), &home0);
+                let n = normalize_lexical(&t).ok()?;
+                Some((p.display().to_string(), forms_of(&n, resolve)))
+            })
+            .collect()
+    };
+    Prepared {
+        homes,
+        system_roots: norm_roots(PROTECTED_SYSTEM_ROOTS),
+        exact_only: norm_roots(PROTECTED_EXACT_ONLY_ROOTS),
+        foreign: norm_roots(PROTECTED_FOREIGN_HOME_ROOTS),
+        home_subs,
+        exact: user_forms(&ctx.exact_paths),
+        dynamic: user_forms(&ctx.dynamic_paths),
+    }
+}
+
+/// Pure rule evaluation over already-normalised candidate forms (`cands`).
+fn evaluate(cands: &[String], prep: &Prepared, ctx: &ProtectionContext) -> ProtectionVerdict {
+    let homes = &prep.homes;
     let in_any_home = |c: &str| homes.iter().any(|h| same_or_child(c, h));
 
     for c in cands {
@@ -409,50 +488,52 @@ fn evaluate(cands: &[String], homes: &[String], ctx: &ProtectionContext) -> Prot
         }
     }
 
-    for root in PROTECTED_SYSTEM_ROOTS {
-        if cands.iter().any(|c| same_or_child(c, root)) {
-            return ProtectionVerdict::deny(format!("protected_system:{root}"));
+    for (label, forms) in &prep.system_roots {
+        if cands.iter().any(|c| forms.iter().any(|f| same_or_child(c, f))) {
+            return ProtectionVerdict::deny(format!("protected_system:{label}"));
         }
     }
 
-    for root in PROTECTED_EXACT_ONLY_ROOTS {
-        if cands.iter().any(|c| key(c) == key(root)) {
-            return ProtectionVerdict::deny(format!("protected_system_root:{root}"));
+    for (label, forms) in &prep.exact_only {
+        if cands.iter().any(|c| forms.iter().any(|f| key(c) == key(f))) {
+            return ProtectionVerdict::deny(format!("protected_system_root:{label}"));
         }
     }
 
     // Other accounts' homes are never ours to clean.
-    for root in PROTECTED_FOREIGN_HOME_ROOTS {
+    for (label, forms) in &prep.foreign {
         for c in cands {
-            if same_or_child(c, root) && !in_any_home(c) {
-                return ProtectionVerdict::deny(format!("protected_foreign_home:{root}"));
+            if forms.iter().any(|f| same_or_child(c, f)) && !in_any_home(c) {
+                return ProtectionVerdict::deny(format!("protected_foreign_home:{label}"));
             }
         }
     }
 
-    for sub in PROTECTED_HOME_SUBPATHS {
-        for h in homes {
-            let full = format!("{}/{sub}", h.trim_end_matches('/'));
-            if cands.iter().any(|c| same_or_child(c, &full)) {
-                // Carve-out only if EVERY form of the candidate sits under an allow-listed subtree.
-                let allow_roots: Vec<String> = PROTECTED_HOME_ALLOW_SUBPATHS
-                    .iter()
-                    .filter(|a| a.starts_with(&format!("{sub}/")))
-                    .flat_map(|a| {
-                        homes
-                            .iter()
-                            .map(move |hh| format!("{}/{a}", hh.trim_end_matches('/')))
-                    })
-                    .collect();
-                let allowed = !allow_roots.is_empty()
-                    && cands
+    for (sub, forms) in &prep.home_subs {
+        if cands
+            .iter()
+            .any(|c| forms.iter().any(|f| same_or_child(c, f)))
+        {
+            // Carve-out only if EVERY form of the candidate sits under an allow-listed subtree.
+            // Allow roots are built textually from the home (never by resolving), so a symlink inside
+            // an allowed cache cannot launder a sensitive target.
+            let allow_roots: Vec<String> = PROTECTED_HOME_ALLOW_SUBPATHS
+                .iter()
+                .filter(|a| a.starts_with(&format!("{sub}/")))
+                .flat_map(|a| {
+                    homes
                         .iter()
-                        .all(|c| allow_roots.iter().any(|r| same_or_child(c, r)));
-                if allowed {
-                    continue;
-                }
-                return ProtectionVerdict::deny(format!("protected_credential_store:~/{sub}"));
+                        .map(move |hh| format!("{}/{a}", hh.trim_end_matches('/')))
+                })
+                .collect();
+            let allowed = !allow_roots.is_empty()
+                && cands
+                    .iter()
+                    .all(|c| allow_roots.iter().any(|r| same_or_child(c, r)));
+            if allowed {
+                continue;
             }
+            return ProtectionVerdict::deny(format!("protected_credential_store:~/{sub}"));
         }
     }
 
@@ -476,29 +557,27 @@ fn evaluate(cands: &[String], homes: &[String], ctx: &ProtectionContext) -> Prot
         }
     }
 
-    let home0 = homes.first().cloned().unwrap_or_default();
-    let norm_user = |p: &Path| -> Option<String> {
-        let t = expand_tilde_textual(p.to_string_lossy().trim(), &home0);
-        normalize_lexical(&t).ok()
-    };
-    for exact in &ctx.exact_paths {
-        let Some(ne) = norm_user(exact) else { continue };
-        let is_root_like = ne == "/" || homes.iter().any(|h| key(h) == key(&ne));
-        if is_root_like {
-            if cands.iter().any(|c| key(c) == key(&ne)) {
-                return ProtectionVerdict::deny(format!("protected_exact:{}", exact.display()));
+    for (display, forms) in &prep.exact {
+        for ne in forms {
+            let root_like = ne == "/" || homes.iter().any(|h| key(h) == key(ne));
+            let hit = if root_like {
+                cands.iter().any(|c| key(c) == key(ne))
+            } else {
+                cands.iter().any(|c| same_or_child(c, ne))
+            };
+            if hit {
+                return ProtectionVerdict::deny(format!("protected_exact:{display}"));
             }
-        } else if cands.iter().any(|c| same_or_child(c, &ne)) {
-            return ProtectionVerdict::deny(format!("protected_exact:{}", exact.display()));
         }
     }
-    for dynp in &ctx.dynamic_paths {
-        let Some(nd) = norm_user(dynp) else { continue };
-        if nd != "/"
-            && !homes.iter().any(|h| key(h) == key(&nd))
-            && cands.iter().any(|c| same_or_child(c, &nd))
-        {
-            return ProtectionVerdict::deny(format!("protected_dynamic:{}", dynp.display()));
+    for (display, forms) in &prep.dynamic {
+        for nd in forms {
+            if nd != "/"
+                && !homes.iter().any(|h| key(h) == key(nd))
+                && cands.iter().any(|c| same_or_child(c, nd))
+            {
+                return ProtectionVerdict::deny(format!("protected_dynamic:{display}"));
+            }
         }
     }
 
@@ -555,7 +634,8 @@ pub fn is_protected_path_with(
         Ok(h) if !h.is_empty() => h,
         _ => return ProtectionVerdict::deny("unresolvable_home"),
     };
-    evaluate(&[cand], &[home], ctx)
+    let prep = prepare(vec![home], ctx, &|_| String::new());
+    evaluate(&[cand], &prep, ctx)
 }
 
 /// Evaluates whether `candidate` is protected by immutable built-in safety rules or user exact paths.
@@ -656,6 +736,11 @@ pub fn check_path_protection(candidate: &Path, ctx: &ProtectionContext) -> Prote
     if cfg!(not(windows)) && is_drive_letter_start(expanded.trim()) {
         return ProtectionVerdict::deny("windows_path_on_posix_rejected");
     }
+    // `\x` is rooted only on Windows. On a POSIX host it is a relative file name, so judging it as
+    // `/x` would approve a different path than the one the OS acts on.
+    if cfg!(not(windows)) && !expanded.trim().starts_with('/') {
+        return ProtectionVerdict::deny("relative_path_rejected");
+    }
     let sep_norm = match normalize_separators(&expanded) {
         Ok(s) => s,
         Err(reason) => return ProtectionVerdict::deny(reason),
@@ -689,7 +774,21 @@ pub fn check_path_protection(candidate: &Path, ctx: &ProtectionContext) -> Prote
         }
     }
 
-    evaluate(&cands, &homes, ctx)
+    let prep = ctx
+        .prepared
+        .get_or_init(|| prepare(homes.clone(), ctx, &|t| resolve_lenient(t)));
+    evaluate(&cands, prep, ctx)
+}
+
+/// The OS-resolved form of a rule root, or nothing when it cannot be resolved or is not a Unix path.
+fn resolve_lenient(textual: &str) -> String {
+    if cfg!(unix) && is_drive_letter_start(textual) {
+        return String::new();
+    }
+    match resolve_os_style(textual) {
+        Ok(r) => normalize_lexical(&r).unwrap_or_default(),
+        Err(_) => String::new(),
+    }
 }
 
 /// Internal callers hold paths that are legitimately relative to the cwd (for example a CLI root of

@@ -849,3 +849,59 @@ fn cli_protect_honours_custom_exact_dynamic_and_glob_rules() {
     let flags: Vec<bool> = v["results"].as_array().unwrap().iter().map(|r| r["protected"].as_bool().unwrap()).collect();
     assert_eq!(flags, vec![true, true, true, false]);
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_selection_token_for_one_item_cannot_execute_another_selection() {
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    for (n, b) in [("a.bin", "aaaa"), ("b.bin", "bbbbbb")] {
+        fs::write(trash.join(n), b).unwrap();
+    }
+    let a = trash.join("a.bin");
+    let b = trash.join("b.bin");
+    let sj = |args: &[&str]| {
+        Command::new(sj_bin())
+            .args(args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+    let h = home.to_str().unwrap();
+    let plan_a = sj(&["plan", h, "--json", "--select", a.to_str().unwrap()]);
+    assert_eq!(plan_a.status.code(), Some(0), "{}", String::from_utf8_lossy(&plan_a.stderr));
+    let pa: serde_json::Value = serde_json::from_slice(&plan_a.stdout).unwrap();
+    let token_a = pa["selection"]["selection_sha256"].as_str().unwrap().to_string();
+    let plan_ab = sj(&["plan", h, "--json", "--select", a.to_str().unwrap(), "--select", b.to_str().unwrap()]);
+    let pab: serde_json::Value = serde_json::from_slice(&plan_ab.stdout).unwrap();
+    assert_ne!(pab["selection"]["selection_sha256"].as_str().unwrap(), token_a);
+    assert_eq!(pa["plan_sha256"], pab["plan_sha256"], "the whole-plan digest is the same; only the selection digest differs");
+
+    // the one-item token must not authorise A+B or B
+    for sel in [vec![a.to_str().unwrap(), b.to_str().unwrap()], vec![b.to_str().unwrap()]] {
+        let mut args = vec!["plan", h, "--execute", "--confirm", "--selection-sha256", token_a.as_str()];
+        for s in &sel {
+            args.push("--select");
+            args.push(s);
+        }
+        let out = sj(&args);
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(a.exists() && b.exists());
+    }
+
+    // the right selection executes only that item (reordered/duplicated flags are fine)
+    let out = sj(&["plan", h, "--execute", "--confirm", "--selection-sha256", &token_a, "--select", a.to_str().unwrap(), "--select", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let done: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["executed_items"].as_array().unwrap().len(), 1);
+    assert!(!a.exists());
+    assert!(b.exists());
+}

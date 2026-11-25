@@ -70,6 +70,7 @@ test("desktop startup scan (summary), orphan view and remediation plan spawn no 
         plan_sha256: "a".repeat(64),
         items: [],
         protected_exclusions: [],
+        selection: { paths: [], ids: [], unmatched: [], selection_sha256: "b".repeat(64) },
       }),
     });
     const cache = path.join(dir, "home", ".cache", "npm");
@@ -98,6 +99,7 @@ test("remediation never asks sj for orphan worktrees and spawns no git unless sc
     const runSj = async (args: string[]) => {
       calls.push(args);
       return {
+        selection: { paths: [], ids: [], unmatched: [], selection_sha256: "b".repeat(64) },
         schema: "spacejanitor.proposal.v1",
         mode: "dry-run",
         mutated: false,

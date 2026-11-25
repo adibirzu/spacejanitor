@@ -2268,6 +2268,61 @@ fn shared_posix_host_vectors_reject_drive_letter_strings() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn shared_fs_vectors_resolve_symlink_targets_for_home_subpaths_and_custom_rules() {
+    use std::os::unix::fs::symlink;
+    let v = shared_protect_vectors();
+    for case in v["fs_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+        let abs = |rel: &str| -> PathBuf {
+            if Path::new(rel).is_absolute() {
+                PathBuf::from(rel)
+            } else {
+                root.join(rel)
+            }
+        };
+        for step in case["setup"].as_array().unwrap() {
+            if let Some(dir) = step["dir"].as_str() {
+                fs::create_dir_all(abs(dir)).unwrap();
+            } else if let Some(link) = step["link"].as_str() {
+                let l = abs(link);
+                fs::create_dir_all(l.parent().unwrap()).unwrap();
+                symlink(abs(step["target"].as_str().unwrap()), l).unwrap();
+            }
+        }
+        let mut ctx = ProtectionContext::new(abs(case["home"].as_str().unwrap()), vec![]);
+        if let Some(o) = case.get("options") {
+            let list = |k: &str| -> Vec<String> {
+                o.get(k)
+                    .and_then(|x| x.as_array())
+                    .map(|a| a.iter().map(|y| y.as_str().unwrap().to_string()).collect())
+                    .unwrap_or_default()
+            };
+            let resolve = |x: String| -> PathBuf {
+                if x.starts_with('~') || Path::new(&x).is_absolute() {
+                    PathBuf::from(x)
+                } else {
+                    abs(&x)
+                }
+            };
+            ctx.exact_paths = list("exact").into_iter().map(resolve).collect();
+            ctx.dynamic_paths = list("dynamic").into_iter().map(resolve).collect();
+            ctx.glob_patterns = list("glob");
+        }
+        for p in case["protected"].as_array().unwrap() {
+            let p = abs(p.as_str().unwrap());
+            assert!(check_path_protection(&p, &ctx).protected, "{name}: expected protected: {}", p.display());
+        }
+        for p in case["unprotected"].as_array().unwrap() {
+            let p = abs(p.as_str().unwrap());
+            let verdict = check_path_protection(&p, &ctx);
+            assert!(!verdict.protected, "{name}: expected unprotected: {} ({})", p.display(), verdict.reason);
+        }
+    }
+}
+
 #[test]
 fn custom_exact_dynamic_and_glob_rules_are_honoured() {
     let home = PathBuf::from("/Users/alice");
@@ -2787,4 +2842,107 @@ fn orphan_linked_worktree_ignores_reflog_only_commits_held_by_surviving_branch_r
         !report.safe_to_prune.iter().any(|c| c.path.ends_with("detached_wt")),
         "an abandoned detached commit held only by this worktree's HEAD reflog must still block"
     );
+}
+
+// ---- selection-bound confirmation (cross-family review R2 blocker 1) ----
+
+fn selection_fixture() -> (tempfile::TempDir, PathBuf, ProtectionContext, PlanOptions) {
+    let tmp = tempdir().unwrap();
+    let root = fs::canonicalize(tmp.path()).unwrap();
+    let trash_dir = root.join("Trash");
+    fs::create_dir_all(&trash_dir).unwrap();
+    for (name, body) in [("a.bin", "aaaa"), ("b.bin", "bbbbbb"), ("c.bin", "cc")] {
+        fs::write(trash_dir.join(name), body).unwrap();
+    }
+    let ctx = ProtectionContext::new(root.clone(), vec![]);
+    let opts = PlanOptions {
+        include_trash: true,
+        include_orphans: false,
+        trash_path_override: Some(trash_dir.clone()),
+        orphan_max_depth: 5,
+    };
+    (tmp, trash_dir, ctx, opts)
+}
+
+#[test]
+fn selection_hash_is_bound_to_the_exact_selected_set_not_the_whole_plan() {
+    use sj_core::plan::{select_by_paths, selection_sha256};
+    let (_tmp, trash, ctx, opts) = selection_fixture();
+    let root = trash.parent().unwrap().to_path_buf();
+    let plan = build_remediation_plan(&root, &ctx, &opts).unwrap();
+    let p = |n: &str| trash.join(n).to_string_lossy().into_owned();
+    let hash_of = |names: &[&str]| {
+        let paths: Vec<String> = names.iter().map(|n| p(n)).collect();
+        let (items, unmatched) = select_by_paths(&plan, &paths);
+        assert!(unmatched.is_empty());
+        selection_sha256(&items).unwrap()
+    };
+    let a = hash_of(&["a.bin"]);
+    assert_ne!(a, hash_of(&["a.bin", "b.bin"]), "A and A+B must not share a confirmation hash");
+    assert_ne!(a, hash_of(&["b.bin"]));
+    assert_eq!(hash_of(&["a.bin", "b.bin"]), hash_of(&["b.bin", "a.bin"]), "order must not matter");
+    assert_eq!(hash_of(&["a.bin", "b.bin"]), hash_of(&["a.bin", "b.bin", "a.bin"]), "duplicates must not matter");
+    assert_ne!(a, plan.plan_sha256, "the selection hash is not the whole-plan hash");
+    let (_, unmatched) = select_by_paths(&plan, &[p("missing.bin")]);
+    assert_eq!(unmatched, vec![p("missing.bin")]);
+}
+
+#[test]
+fn execute_selection_refuses_a_hash_confirmed_for_a_different_selection_and_deletes_nothing() {
+    use sj_core::plan::{
+        execute_selection_with_roots, select_by_paths, selection_sha256, SelectionGate,
+    };
+    let (_tmp, trash, ctx, opts) = selection_fixture();
+    let root = trash.parent().unwrap().to_path_buf();
+    let plan = build_remediation_plan(&root, &ctx, &opts).unwrap();
+    let p = |n: &str| trash.join(n).to_string_lossy().into_owned();
+    let (only_a, _) = select_by_paths(&plan, &[p("a.bin")]);
+    let token_a = selection_sha256(&only_a).unwrap();
+    let roots = [trash.clone()];
+
+    for paths in [vec![p("a.bin"), p("b.bin")], vec![p("b.bin")], vec![p("missing.bin")], vec![]] {
+        let gate = SelectionGate { execute: true, confirm: true, selection_sha256: token_a.clone(), paths };
+        assert!(execute_selection_with_roots(&plan, &gate, &ctx, &roots).is_err());
+    }
+    for n in ["a.bin", "b.bin", "c.bin"] {
+        assert!(trash.join(n).exists(), "{n} must survive every refused execution");
+    }
+    // flags are still required
+    for (execute, confirm) in [(false, true), (true, false)] {
+        let gate = SelectionGate { execute, confirm, selection_sha256: token_a.clone(), paths: vec![p("a.bin")] };
+        assert!(execute_selection_with_roots(&plan, &gate, &ctx, &roots).is_err());
+    }
+    assert!(trash.join("a.bin").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn execute_selection_removes_only_the_confirmed_items_and_refuses_when_the_selection_changed_on_disk() {
+    use sj_core::plan::{
+        execute_selection_with_roots, select_by_paths, selection_sha256, SelectionGate,
+    };
+    let (_tmp, trash, ctx, opts) = selection_fixture();
+    let root = trash.parent().unwrap().to_path_buf();
+    let plan = build_remediation_plan(&root, &ctx, &opts).unwrap();
+    let p = |n: &str| trash.join(n).to_string_lossy().into_owned();
+    let roots = [trash.clone()];
+
+    // changed on disk after the plan: sj rebuilds the plan, the selection hash differs, nothing is removed
+    let (sel, _) = select_by_paths(&plan, &[p("a.bin"), p("b.bin")]);
+    let token = selection_sha256(&sel).unwrap();
+    fs::write(trash.join("b.bin"), "tampered after the dry run, different size").unwrap();
+    let replanned = build_remediation_plan(&root, &ctx, &opts).unwrap();
+    let gate = SelectionGate { execute: true, confirm: true, selection_sha256: token, paths: vec![p("a.bin"), p("b.bin")] };
+    assert!(execute_selection_with_roots(&replanned, &gate, &ctx, &roots).is_err());
+    assert!(trash.join("a.bin").exists() && trash.join("b.bin").exists());
+
+    // the matching selection executes exactly those items
+    let (sel, _) = select_by_paths(&replanned, &[p("a.bin"), p("c.bin")]);
+    let token = selection_sha256(&sel).unwrap();
+    let gate = SelectionGate { execute: true, confirm: true, selection_sha256: token, paths: vec![p("c.bin"), p("a.bin")] };
+    let out = execute_selection_with_roots(&replanned, &gate, &ctx, &roots).unwrap();
+    assert_eq!(out.executed.len(), 2);
+    assert!(out.failed.is_empty());
+    assert!(!trash.join("a.bin").exists() && !trash.join("c.bin").exists());
+    assert!(trash.join("b.bin").exists(), "unselected item must survive");
 }

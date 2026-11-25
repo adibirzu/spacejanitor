@@ -46,6 +46,8 @@ interface SjPlan {
   planSha256: string;
   items: SjPlanItem[];
   exclusions: Array<{ path: string; reason: string }>;
+  /** sj's digest of exactly the selected items (identity snapshots included); the confirmation token */
+  selection: { sha256: string; paths: string[]; unmatched: string[] } | null;
 }
 
 const PLAN_TTL_MS = 5 * 60 * 1000;
@@ -104,11 +106,43 @@ function parseSjPlan(raw: Record<string, unknown>): SjPlan {
   const exclusions = excl
     .filter((e) => e && typeof e.path === "string")
     .map((e) => ({ path: String(e.path), reason: String(e.reason || "protected") }));
-  return { planSha256: sha, items, exclusions };
+  let selection: SjPlan["selection"] = null;
+  const sel = raw.selection as Record<string, unknown> | undefined;
+  if (sel !== undefined) {
+    const strings = (v: unknown): string[] | null =>
+      Array.isArray(v) && v.every((x) => typeof x === "string") ? (v as string[]) : null;
+    const paths = strings(sel?.paths);
+    const unmatched = strings(sel?.unmatched);
+    if (
+      !sel ||
+      typeof sel.selection_sha256 !== "string" ||
+      !SHA256_RE.test(sel.selection_sha256) ||
+      !paths ||
+      !unmatched
+    ) {
+      throw unparseable();
+    }
+    selection = { sha256: sel.selection_sha256, paths, unmatched };
+  }
+  return { planSha256: sha, items, exclusions, selection };
 }
 
-function planArgs(root: string, orphans: boolean): string[] {
-  return ["plan", root, "--json", ...(orphans ? ["--include-orphans"] : [])];
+export interface RuleOptions {
+  exactPaths?: string[];
+  dynamicProtectedPaths?: string[];
+  globPatterns?: string[];
+}
+
+/** Same flags on every call path (plan, execute, annotation): custom rules only ever protect more. */
+function planArgs(root: string, orphans: boolean, rules: string[], selects: string[] = []): string[] {
+  return [
+    "plan",
+    root,
+    "--json",
+    ...(orphans ? ["--include-orphans"] : []),
+    ...rules,
+    ...selects.flatMap((p) => ["--select", p]),
+  ];
 }
 
 function uiKind(sjKind: string): RemediationCandidate["kind"] {
@@ -117,6 +151,9 @@ function uiKind(sjKind: string): RemediationCandidate["kind"] {
 
 interface ActivePlan {
   orphans: boolean;
+  rules: string[];
+  /** paths of exactly the items the confirmation covers (sorted, de-duplicated) */
+  paths: string[];
   plan: RemediationPlan;
   sha: string;
   root: string;
@@ -127,12 +164,18 @@ export class RemediationGate {
   private readonly homeDir?: string;
   private readonly runSj: RunSj;
   private readonly orphanScanEnabled: () => boolean;
+  private readonly ruleFlags: string[];
   private planRoot: string;
   private active: ActivePlan | null = null;
   private readonly approved = new Map<string, RemediationCandidate>();
   private executing = false;
 
-  constructor(options: { homeDir?: string; runSj?: RunSj; planRoot?: string; orphanScanEnabled?: () => boolean } = {}) {
+  constructor(
+    options: { homeDir?: string; runSj?: RunSj; planRoot?: string; orphanScanEnabled?: () => boolean; ruleOptions?: RuleOptions } = {}
+  ) {
+    const flags = core.protectRuleArgs(options.ruleOptions ?? {});
+    if (flags === null) throw new Error("invalid_custom_rule");
+    this.ruleFlags = flags as string[];
     this.orphanScanEnabled = options.orphanScanEnabled ?? (() => false);
     this.homeDir = options.homeDir;
     this.runSj = options.runSj ?? ((args, opts) => core.runSj(args, { homeDir: this.homeDir, ...opts }));
@@ -176,8 +219,18 @@ export class RemediationGate {
     const root = this.planRoot;
     // Orphan worktrees are planned only when the main-process opt-in is on (default OFF: trash only).
     const orphans = this.orphanScanEnabled() === true;
-    const sjPlan = parseSjPlan(await this.runSj(planArgs(root, orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
-    const selected = sjPlan.items.filter((i) => wanted.has(i.path));
+    const paths = [...wanted].sort();
+    const sjPlan = parseSjPlan(
+      await this.runSj(planArgs(root, orphans, this.ruleFlags, paths), { timeoutMs: PLAN_TIMEOUT_MS })
+    );
+    // The confirmation token is sj's digest of exactly the selected items (path, kind, size and the
+    // dev/ino/mtime/content snapshot). It differs for A, A+B and B, is identical for a reordered or
+    // duplicated selection, and changes if a selected item changed on disk.
+    if (!sjPlan.selection) throw unparseable();
+    const matched = new Set(sjPlan.selection.paths);
+    for (const m of matched) if (!wanted.has(m)) throw unparseable();
+    const selected = sjPlan.items.filter((i) => matched.has(i.path));
+    if (selected.length !== matched.size) throw unparseable();
     const plannedPaths = new Set(selected.map((i) => i.path));
     const blockedItems: RemediationPlan["blockedItems"] = [];
     for (const p of wanted) {
@@ -191,19 +244,28 @@ export class RemediationGate {
       });
     }
 
+    const token = sjPlan.selection.sha256;
     const plan: RemediationPlan = {
       schema: "spacejanitor.plan.v1",
-      planId: sjPlan.planSha256,
+      planId: token,
       dryRun: true,
       items: selected.map((i) => ({ id: i.id, path: i.path, bytes: i.bytes, kind: uiKind(i.kind) })),
       blockedItems,
       totalBytes: selected.reduce((acc, i) => acc + i.bytes, 0),
-      planSha256: sjPlan.planSha256,
-      confirmationPhrase: `CONFIRM-${sjPlan.planSha256.slice(0, 8).toUpperCase()}`,
+      planSha256: token,
+      confirmationPhrase: `CONFIRM-${token.slice(0, 8).toUpperCase()}`,
       createdAtMs: nowMs,
       expiresAtMs: nowMs + PLAN_TTL_MS,
     };
-    this.active = { plan, sha: sjPlan.planSha256, root, items: selected, orphans };
+    this.active = {
+      plan,
+      sha: token,
+      root,
+      items: selected,
+      orphans,
+      rules: this.ruleFlags,
+      paths: [...plannedPaths].sort(),
+    };
     return plan;
   }
 
@@ -239,26 +301,35 @@ export class RemediationGate {
     const removed: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
     try {
-      // The user confirmed one digest. If sj no longer reports it, nothing runs.
-      let planError: string | null = null;
-      try {
-        const current = parseSjPlan(await this.runSj(planArgs(active.root, active.orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
-        if (current.planSha256 !== active.sha) planError = "plan_changed_since_confirmation";
-      } catch (err) {
-        planError = reasonOf(err);
+      // ONE sj call for exactly the confirmed selection. sj rebuilds the plan, recomputes the digest
+      // of those items and refuses (exit 2, nothing touched) if it differs from what was confirmed.
+      const out = await this.runSj(
+        [...planArgs(active.root, active.orphans, active.rules, active.paths), "--execute", "--confirm", "--selection-sha256", active.sha],
+        { timeoutMs: EXECUTE_TIMEOUT_MS }
+      );
+      const executed = Array.isArray(out.executed_items) ? (out.executed_items as Array<{ path?: unknown }>) : null;
+      const fails = Array.isArray(out.failed_items) ? (out.failed_items as Array<{ path?: unknown; error?: unknown }>) : null;
+      if (out.mode !== "executed" || out.selection_sha256 !== active.sha || !executed || !fails) {
+        throw unparseable();
       }
-      for (const item of active.items) {
-        if (planError) {
-          failed.push({ path: item.path, error: planError });
-          continue;
-        }
-        try {
-          await this.executeItem(active, item);
-          removed.push(item.path);
-        } catch (err) {
-          failed.push({ path: item.path, error: reasonOf(err) });
-        }
+      const confirmed = new Set(active.paths);
+      for (const e of executed) {
+        if (typeof e?.path !== "string" || !confirmed.has(e.path)) throw unparseable();
+        removed.push(e.path);
       }
+      for (const f of fails) {
+        if (typeof f?.path !== "string" || !confirmed.has(f.path)) throw unparseable();
+        failed.push({ path: f.path, error: redactForRenderer(String(f.error ?? "remediation_failed")) });
+      }
+      // anything sj did not report either way is not counted as removed
+      const reported = new Set([...removed, ...failed.map((f) => f.path)]);
+      for (const p of active.paths) if (!reported.has(p)) failed.push({ path: p, error: "not_reported_by_sj" });
+    } catch (err) {
+      // refused or unreadable: nothing is counted as removed
+      removed.length = 0;
+      failed.length = 0;
+      const reason = reasonOf(err);
+      for (const p of active.paths) failed.push({ path: p, error: reason });
     } finally {
       this.executing = false;
     }
@@ -270,24 +341,5 @@ export class RemediationGate {
       removed,
       failed,
     };
-  }
-
-  private async executeItem(active: ActivePlan, item: SjPlanItem): Promise<void> {
-    // sj rebuilds and re-proves the plan at execution. Removing an item changes the digest of the
-    // rest, so later items are bound to a freshly planned digest, but only when sj still reports
-    // the exact item the user confirmed.
-    const fresh = parseSjPlan(await this.runSj(planArgs(active.root, active.orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
-    const current = fresh.items.find((i) => i.id === item.id);
-    if (!current || JSON.stringify(current) !== JSON.stringify(item)) {
-      throw new Error("item_changed_since_plan");
-    }
-    const out = await this.runSj(
-      [...planArgs(active.root, active.orphans), "--execute", "--confirm", "--plan-sha256", fresh.planSha256, "--item", item.id],
-      { timeoutMs: EXECUTE_TIMEOUT_MS }
-    );
-    const done = out.executed_item as { id?: unknown } | undefined;
-    if (out.mode !== "executed" || out.mutated !== true || !done || done.id !== item.id) {
-      throw unparseable();
-    }
   }
 }

@@ -66,6 +66,7 @@ test("plan flow: the gate refuses a cache even if a renderer asks for it, and pl
     plan_sha256: "a".repeat(64),
     items: [{ id: "item_t1", kind: "trash_item", path: "/h/.Trash/junk.bin", bytes: 3, snapshot: {} }],
     protected_exclusions: [],
+    selection: { paths: ["/h/.Trash/junk.bin"], ids: ["item_t1"], unmatched: [], selection_sha256: "c".repeat(64) },
   };
   const gate = new RemediationGate({ runSj: async () => sjPlan, planRoot: "/h" });
   const annotated = annotateSummary(summary(), protectFn({ "/h/.Trash/vault.kdbx": "protected_key_ext:*.kdbx" }));
@@ -74,4 +75,25 @@ test("plan flow: the gate refuses a cache even if a renderer asks for it, and pl
   await assert.rejects(() => gate.createDryRunPlan([{ id: "t2", path: "/h/.Trash/vault.kdbx", bytes: 9, kind: "file" }]), /unapproved_candidate/);
   const plan = await gate.createDryRunPlan([{ id: "t1", path: "/h/.Trash/junk.bin", bytes: 3, kind: "file" }]);
   assert.deepEqual(plan.items.map((i) => i.path), ["/h/.Trash/junk.bin"]);
+});
+
+test("annotation uses the same rule options as the plan: protectWithRules forwards exact/dynamic/glob to sj", async () => {
+  const fs = await import("node:fs");
+  const path = await import("node:path");
+  const repoRoot = path.resolve(__dirname, "../../../..");
+  const exe = process.platform === "win32" ? "sj.exe" : "sj";
+  const sjBin = ["release", "debug"].map((p) => path.join(repoRoot, "target", p, exe)).find((p) => fs.existsSync(p));
+  if (!sjBin || process.env.SPACEJANITOR_NO_SJ === "1") return;
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const core = require("@spacejanitor/core");
+  const { protectWithRules } = await import("../src/candidateAnnotations");
+  core.configureSjBinary(sjBin);
+  try {
+    const rules = { exactPaths: ["/data/keep"], dynamicProtectedPaths: ["/work/active"], globPatterns: ["*.vaultx"] };
+    const paths = ["/data/keep/a", "/work/active/b", "/data/c.vaultx", "/data/other"];
+    assert.deepEqual(protectWithRules(rules)(paths).map((r) => r.protected), [true, true, true, false]);
+    assert.deepEqual(protectWithRules({})(paths).map((r) => r.protected), [false, false, false, false]);
+  } finally {
+    core.configureSjBinary(undefined);
+  }
 });
