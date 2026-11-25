@@ -61,14 +61,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Install workspace dependencies
         run: npm ci
-      - name: Node tests
-        run: npm test
-      - name: Rust tests
+      - name: Rust tests (also builds target/debug/sj for the Node and desktop gate tests)
         run: cargo test --workspace
+      - name: Node tests (with sj)
+        run: npm test
+      - name: Node tests with the gate disabled (fail closed)
+        run: npm test
+        env:
+          SPACEJANITOR_NO_SJ: "1"
       - name: Desktop typecheck
         run: npm run desktop:typecheck
-      - name: Desktop tests
+      - name: Desktop tests (with sj)
         run: npm run desktop:test
+      - name: Desktop tests with the gate disabled (fail closed)
+        run: npm run desktop:test
+        env:
+          SPACEJANITOR_NO_SJ: "1"
 
   rust-cli-matrix:
     name: Build sj CLI (${{ matrix.artifact }})
@@ -135,23 +143,38 @@ jobs:
       matrix:
         include:
           - label: macos-universal
+            sj_platform: darwin
+            sj_arch: universal
+            sj_smoke: true
             os: macos-15
             cli_artifact: cli-sj-darwin-arm64
             cli_artifact_x64: cli-sj-darwin-x64
             eb_flags: "--mac --universal"
           - label: linux-x64
+            sj_platform: linux
+            sj_arch: x64
+            sj_smoke: true
             os: ubuntu-24.04
             cli_artifact: cli-sj-linux-x64
             eb_flags: "--linux --x64"
           - label: linux-arm64
+            sj_platform: linux
+            sj_arch: arm64
+            sj_smoke: true
             os: ubuntu-24.04-arm
             cli_artifact: cli-sj-linux-arm64
             eb_flags: "--linux --arm64"
           - label: windows-x64
+            sj_platform: win32
+            sj_arch: x64
+            sj_smoke: true
             os: windows-latest
             cli_artifact: cli-sj-win32-x64
             eb_flags: "--win --x64"
           - label: windows-arm64
+            sj_platform: win32
+            sj_arch: arm64
+            sj_smoke: false
             os: windows-latest
             cli_artifact: cli-sj-win32-arm64
             eb_flags: "--win --arm64"
@@ -208,6 +231,12 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npx --workspace @spacejanitor/desktop electron-builder --config electron-builder.yml --publish never ${{ matrix.eb_flags }}
+      - name: Verify the bundled sj gate inside the packaged app (arch, exec bit, absolute resources path)
+        shell: bash
+        run: |
+          SMOKE=""
+          if [ "${{ matrix.sj_smoke }}" = "true" ]; then SMOKE="--smoke"; fi
+          node apps/desktop/scripts/verify-packaged-sj.cjs --platform ${{ matrix.sj_platform }} --arch ${{ matrix.sj_arch }} $SMOKE
       - uses: actions/upload-artifact@v4 # v4.4.3
         with:
           name: desktop-${{ matrix.label }}

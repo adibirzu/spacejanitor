@@ -2,11 +2,11 @@ use clap::{Parser, Subcommand};
 use sj_core::{
     orphans::{inspect_orphans, OrphanOptions},
     plan::{build_remediation_plan, execute_plan_item, ExecutionGate, PlanOptions},
-    protect::ProtectionContext,
+    protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions},
     trash::{default_trash_paths, discover_trash_at},
     SjError, SCHEMA_BLOCKERS_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1,
-    SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
+    SCHEMA_PROTECT_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
 };
 use std::env;
 use std::path::PathBuf;
@@ -96,6 +96,21 @@ enum Commands {
         /// Allowlisted item ID to execute
         #[arg(long)]
         item: Option<String>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Evaluate paths against the protected-path gate (lexical + symlink-resolved; optional subtree walk)
+    Protect {
+        /// Paths to evaluate
+        #[arg(required = true, num_args = 1.., last = true)]
+        paths: Vec<PathBuf>,
+        /// Also walk each directory and block when any descendant is protected, a symlink or unreadable
+        #[arg(long, default_value_t = false)]
+        descendants: bool,
+        /// Maximum entries to inspect per directory walk (fail closed when exceeded)
+        #[arg(long, default_value_t = 200_000)]
+        max_entries: usize,
         /// Emit versioned JSON output
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -193,6 +208,49 @@ fn run() -> Result<(), CliError> {
     match cli.command {
         Commands::Doctor { json } => {
             print_doctor(json)?;
+        }
+        Commands::Protect {
+            paths,
+            descendants,
+            max_entries,
+            json,
+        } => {
+            let mut results = Vec::with_capacity(paths.len());
+            for p in &paths {
+                let mut verdict = check_path_protection(p, &ctx);
+                if !verdict.protected && descendants {
+                    verdict = check_dir_descendants_safe(p, &ctx, max_entries);
+                }
+                results.push(serde_json::json!({
+                    "path": p.to_string_lossy(),
+                    "protected": verdict.protected,
+                    "reason": verdict.reason,
+                }));
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": SCHEMA_PROTECT_V1,
+                        "descendants": descendants,
+                        "results": results,
+                    }))
+                    .map_err(SjError::from)?
+                );
+            } else {
+                for r in &results {
+                    println!(
+                        "{} {} {}",
+                        if r["protected"] == true {
+                            "PROTECTED"
+                        } else {
+                            "SAFE"
+                        },
+                        r["path"].as_str().unwrap_or(""),
+                        r["reason"].as_str().unwrap_or("")
+                    );
+                }
+            }
         }
         Commands::Scan {
             path,

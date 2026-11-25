@@ -116,6 +116,11 @@ export const App: React.FC = () => {
     setExecResult(null);
     if (window.spaceJanitor) {
       const plan = await window.spaceJanitor.planRemediation(selectedCandidates);
+      if (plan.gateError) {
+        setActivePlan(null);
+        setExecResult(`Cleanup refused: ${plan.gateError.message}`);
+        return;
+      }
       setActivePlan(plan);
     } else {
       setActivePlan({
@@ -299,6 +304,13 @@ export const App: React.FC = () => {
 
         {summary && tab === "disk" && (
           <>
+            {summary.remediationGate?.available === false && (
+              <p className="muted" role="alert">
+                Cleanup is disabled: the Rust safety gate (sj) is unavailable ({summary.remediationGate.reason}). Read-only
+                views still work.
+              </p>
+            )}
+            {!activePlan && execResult && <p role="status">{execResult}</p>}
             <section className="card" data-testid="orphan-scan-card">
               <div className="card-header">
                 <h2>Git worktree orphans</h2>
@@ -332,7 +344,7 @@ export const App: React.FC = () => {
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={selectedCandidates.length === 0}
+                  disabled={selectedCandidates.length === 0 || summary.remediationGate?.available === false}
                   onClick={() => void handleOpenDryRun()}
                 >
                   Dry-Run Plan ({selectedCandidates.length})

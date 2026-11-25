@@ -1,9 +1,6 @@
-import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, Menu, nativeImage, session, shell, Tray } from "electron";
-import { execFile } from "node:child_process";
+import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, Menu, nativeImage, session, Tray } from "electron";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
-import { promisify } from "node:util";
 import {
   isAuthorizedSenderFrame,
   isSafeNavigationUrl,
@@ -12,13 +9,9 @@ import {
   validateTargetPath,
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
-import { executePlanItems } from "./executor";
-import { removeWorktreeSafely } from "./worktreeGuard";
 import { OrphanScanSetting, setOrphanScanWithConfirmation } from "./orphanSetting";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
-
-const execFileAsync = promisify(execFile);
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -28,8 +21,8 @@ let lastStatusSummary = "Status: Initializing...";
 const bridge = new SjBridge({
   binaryPath: resolveSjBinary({ isPackaged: app.isPackaged }),
 });
-const gate = new RemediationGate();
 const orphanScan = new OrphanScanSetting(path.join(app.getPath("userData"), "settings.json"));
+const gate = new RemediationGate({ orphanScanEnabled: () => orphanScan.get() });
 const slmAdvisor = new SlmAdvisorService();
 
 function resolveUiEntry(): { devUrl?: string; indexPath?: string } {
@@ -167,6 +160,8 @@ function assertAuthorizedSender(event: IpcMainInvokeEvent): void {
 }
 
 function registerApprovedFromReport(method: string, result: Record<string, unknown>): void {
+  const orphanRoot = method === "orphans" ? result.targetPath : (result.orphans as { targetPath?: unknown } | undefined)?.targetPath;
+  if (typeof orphanRoot === "string" && path.isAbsolute(orphanRoot)) gate.setPlanRoot(orphanRoot);
   if (method !== "summary") return;
   const trashCands = Array.isArray((result.trash as { candidates?: RemediationCandidate[] })?.candidates)
     ? ((result.trash as { candidates: RemediationCandidate[] }).candidates)
@@ -182,14 +177,11 @@ function registerApprovedFromReport(method: string, result: Record<string, unkno
   gate.registerApprovedCandidates([...trashCands, ...cacheCands, ...orphanCands]);
 }
 
-function isInsideOsTrash(targetPath: string): boolean {
-  const home = os.homedir();
-  const resolved = path.resolve(targetPath);
-  const trashRoots = [
-    path.join(home, ".Trash"),
-    path.join(home, ".local", "share", "Trash", "files"),
-  ];
-  return trashRoots.some((r) => resolved === r || resolved.startsWith(`${r}${path.sep}`));
+function gateRefusalMessage(reason: string): string {
+  return (
+    `The Rust safety gate (sj) refused or could not run (${reason}). ` +
+    "Cleanup is disabled until it is available; read-only views still work."
+  );
 }
 
 function registerIpcHandlers(): void {
@@ -213,7 +205,8 @@ function registerIpcHandlers(): void {
     if (method === "orphans" || method === "summary") params.includeOrphans = orphanScan.get();
     const result = await bridge.invoke(method, params);
     registerApprovedFromReport(method, result);
-    return result;
+    // Read-only views always work; the renderer is told whether destructive actions are possible.
+    return method === "summary" ? { ...result, remediationGate: bridge.remediationAvailable() } : result;
   });
 
   ipcMain.handle("sj:plan", async (event, payload: { candidates?: RemediationCandidate[] }) => {
@@ -225,31 +218,33 @@ function registerIpcHandlers(): void {
         throw new Error(`Invalid candidate path: ${check.reason}`);
       }
     }
-    return gate.createDryRunPlan(candidates);
+    try {
+      return await gate.createDryRunPlan(candidates);
+    } catch (err) {
+      const reason = (err as { reason?: string })?.reason;
+      if (!reason) throw err;
+      // sj missing, timed out or unparseable: refuse and say why (no JavaScript fallback exists).
+      return {
+        schema: "spacejanitor.plan.v1",
+        planId: "",
+        dryRun: true,
+        items: [],
+        blockedItems: [],
+        totalBytes: 0,
+        planSha256: "",
+        confirmationPhrase: "",
+        createdAtMs: Date.now(),
+        expiresAtMs: 0,
+        gateError: { reason, message: gateRefusalMessage(reason) },
+      };
+    }
   });
 
   ipcMain.handle("sj:execute", async (event, payload: { planSha256?: string; phrase?: string }) => {
     assertAuthorizedSender(event);
     const planSha256 = String(payload?.planSha256 || "");
     const phrase = String(payload?.phrase || "");
-    const auth = gate.authorizeExecute({ planSha256, phrase });
-    if (!auth.allowed || !auth.plan) {
-      return {
-        schema: "spacejanitor.reap.v1",
-        executed: false,
-        error: auth.reason,
-      };
-    }
-
-    return gate.withMutex(() =>
-      executePlanItems(auth.plan!, auth.identities || {}, {
-        homeDir: os.homedir(),
-        isInsideOsTrash,
-        trashItem: (p) => shell.trashItem(p),
-        removeWorktree: (p) => removeWorktreeSafely(p, { includeOrphans: orphanScan.get() }),
-        orphanScanEnabled: () => orphanScan.get(),
-      })
-    );
+    return gate.run({ planSha256, phrase });
   });
 
   ipcMain.handle("sj:orphan-scan-get", (event) => {

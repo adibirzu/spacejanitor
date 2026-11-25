@@ -4,11 +4,8 @@ import {
   collectDisk as _collectDisk,
   collectTrash,
   collectOrphans,
-  inspectWorktree,
-  removeLinkedWorktree,
   ORPHAN_SCAN_WARNING,
   ORPHAN_SCAN_DISABLED_MESSAGE,
-  classifyExecutableConfigKey,
   collectMemory as _collectMemory,
   collectBlockers,
   collectMcpAudit as _collectMcpAudit,
@@ -17,33 +14,34 @@ import {
   normalizeReportEnvelope,
 } from "./telemetry.mjs";
 import {
-  findProtectedDescendant as _findProtectedDescendant,
-  createRemediationPlan as _createRemediationPlan,
-  verifyRemediationGate as _verifyRemediationGate,
-} from "./remediation.mjs";
-import {
   validateLoopbackSlmUrl,
   redactSlmPayload as _redactSlmPayload,
   adviseWithLocalSlm as _adviseWithLocalSlm,
 } from "./slm.mjs";
 import { formatToon } from "./toon.mjs";
 import { redactSecrets, redactArgv } from "./redact.mjs";
-import { DEFAULT_PROTECTED_PATTERNS, isProtectedPath } from "./protect.mjs";
+import { findProtectedDescendant, isProtectedPath } from "./protect.mjs";
+import {
+  SjGateError,
+  activeSjBinary,
+  configureSjBinary,
+  resolveSjBinary,
+  runSj,
+  runSjSync,
+} from "./sjGate.mjs";
 
 export const SCHEMA_VERSIONS = SCHEMA_VERSIONS_EXT;
 
-export { DEFAULT_PROTECTED_PATTERNS, isProtectedPath };
+export { findProtectedDescendant, isProtectedPath };
+export { SjGateError, activeSjBinary, configureSjBinary, resolveSjBinary, runSj, runSjSync };
 export { redactSecrets, redactArgv };
 
 export {
-  ORPHAN_SCAN_WARNING,
-  ORPHAN_SCAN_DISABLED_MESSAGE,
-  inspectWorktree,
-  removeLinkedWorktree,
-  classifyExecutableConfigKey,
   collectDoctor,
   collectTrash,
   collectOrphans,
+  ORPHAN_SCAN_WARNING,
+  ORPHAN_SCAN_DISABLED_MESSAGE,
   collectBlockers,
   validateLoopbackSlmUrl,
   formatToon,
@@ -70,22 +68,10 @@ export function collectSummary(options = {}) {
   return _collectSummary({ ...options, isProtectedFn: isProtectedPath, redactFn: redactSecrets });
 }
 
-export function createRemediationPlan(candidates = [], options = {}) {
-  return _createRemediationPlan(candidates, { ...options, isProtectedFn: isProtectedPath });
-}
-
-export function verifyRemediationGate(options = {}) {
-  return _verifyRemediationGate({ ...options, isProtectedFn: isProtectedPath });
-}
-
 export function redactSlmPayload(value) {
   return _redactSlmPayload(value, redactSecrets);
 }
 
 export function adviseWithLocalSlm(options = {}) {
   return _adviseWithLocalSlm({ ...options, redactFn: redactSecrets, isProtectedFn: isProtectedPath });
-}
-
-export function findProtectedDescendant(dirPath, options = {}) {
-  return _findProtectedDescendant(dirPath, { ...options, isProtectedFn: isProtectedPath });
 }

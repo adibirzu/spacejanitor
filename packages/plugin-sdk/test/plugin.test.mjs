@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { definePlugin, validatePluginRules } from "../src/index.mjs";
+import { activeSjBinary } from "../../core/src/index.mjs";
 
 const SYNTHETIC_HOME = "/home/developer";
 
@@ -37,6 +38,13 @@ test("validates plugin rules against core immutable protected denylist", () => {
   });
 
   const result = validatePluginRules(plugin, { homeDir: SYNTHETIC_HOME });
+  if (!activeSjBinary()) {
+    // Fail closed: without the Rust gate no plugin rule can be proven safe.
+    assert.equal(result.allowedRules.length, 0);
+    assert.equal(result.rejectedRules.length, 3);
+    assert.ok(result.rejectedRules.every((r) => r.reason === "sj_unavailable"));
+    return;
+  }
   assert.equal(result.allowedRules.length, 1);
   assert.equal(result.allowedRules[0].id, "safe-cache");
   assert.equal(result.rejectedRules.length, 2);

@@ -85,6 +85,7 @@ export interface SummaryReport {
     servers: McpServerEntry[];
   };
   cleanableCaches?: DiskConsumer[];
+  remediationGate?: { available: boolean; reason: string };
 }
 
 export interface RemediationPlan {
@@ -97,6 +98,7 @@ export interface RemediationPlan {
   planSha256: string;
   confirmationPhrase: string;
   expiresAtMs: number;
+  gateError?: { reason: string; message: string };
 }
 
 export interface SlmConfig {

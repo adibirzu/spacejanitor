@@ -687,4 +687,86 @@ fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
         .unwrap();
     assert!(String::from_utf8_lossy(&on.stderr).contains("experimental"), "opt-in must warn");
     assert!(marker.exists(), "opt-in scan should reach git");
+
+fn run_protect(home: &str, args: &[&str]) -> std::process::Output {
+    Command::new(sj_bin())
+        .arg("protect")
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_protect_reports_per_path_verdicts_from_the_rust_gate() {
+    let out = run_protect(
+        "/Users/alice",
+        &[
+            "--json",
+            "--",
+            "/Users/alice/.ssh/id_x",
+            "/Users/alice/.cache/vite",
+            "/Users/alice/proj/.env",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema"], "spacejanitor.protect.v1");
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["path"], "/Users/alice/.ssh/id_x");
+    assert_eq!(results[0]["protected"], true);
+    assert_eq!(results[1]["protected"], false);
+    assert_eq!(results[2]["protected"], true);
+    assert!(results[2]["reason"].as_str().unwrap().contains("env"));
+}
+
+#[test]
+fn cli_protect_descendants_blocks_a_tree_holding_a_protected_entry() {
+    let tmp = tempdir().unwrap();
+    let home = tmp.path().join("home");
+    let project = tmp.path().join("project");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(project.join("app")).unwrap();
+    fs::write(project.join("app").join(".env.production"), "S=1").unwrap();
+    let clean = tmp.path().join("clean");
+    fs::create_dir_all(clean.join("src")).unwrap();
+    fs::write(clean.join("src").join("main.rs"), "x").unwrap();
+
+    let out = run_protect(
+        home.to_str().unwrap(),
+        &[
+            "--json",
+            "--descendants",
+            "--",
+            project.to_str().unwrap(),
+            clean.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results[0]["protected"], true);
+    assert!(results[0]["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("protected_descendant"));
+    assert_eq!(results[1]["protected"], false);
+}
+
+#[test]
+fn cli_protect_with_no_paths_is_a_usage_error() {
+    let out = run_protect("/Users/alice", &["--json"]);
+    assert_ne!(out.status.code(), Some(0));
 }

@@ -16,6 +16,7 @@ pub const SCHEMA_BLOCKERS_V1: &str = "spacejanitor.blockers.v1";
 pub const SCHEMA_ORPHANS_V1: &str = "spacejanitor.orphans.v1";
 pub const SCHEMA_TRASH_V1: &str = "spacejanitor.trash.v1";
 pub const SCHEMA_PROPOSAL_V1: &str = "spacejanitor.proposal.v1";
+pub const SCHEMA_PROTECT_V1: &str = "spacejanitor.protect.v1";
 
 pub use protect::{
     is_protected_path, ProtectionVerdict, PROTECTED_HOME_SUBPATHS, PROTECTED_SYSTEM_ROOTS,

@@ -16,7 +16,7 @@ Traditional disk cleaners clear browser caches. Developer disk cleaners delete `
 4. **MCP server multiplication** where globally configured stdio MCP servers (`npx` / Node / Python) multiply across dozens of concurrent agent sessions.
 5. **OS Trash & Recycle Bin bloat** sitting silently beside multi-gigabyte container and VM images.
 
-Orphan-repo scanning (item 1) is **experimental and off by default**; see [Known limitations](#known-limitations). SpaceJanitor **never deletes a file or signals a process by default**. Every sweep produces a deterministic dry-run plan and requires explicit, two-step confirmation gated behind an immutable protected-path denylist.
+Orphan-repo scanning (item 1) is **experimental and off by default**; see [Known limitations](#known-limitations). SpaceJanitor **never deletes a file or signals a process by default**. Every sweep produces a deterministic dry-run plan and requires explicit, two-step confirmation gated behind the Rust `sj` protected-path gate (the desktop app and Node tooling contain no copy of it and fail closed without it).
 
 ---
 
