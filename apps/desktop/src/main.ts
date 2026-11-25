@@ -13,6 +13,7 @@ import {
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
 import { executePlanItems } from "./executor";
+import { removeWorktreeSafely } from "./worktreeGuard";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
 
@@ -240,9 +241,7 @@ function registerIpcHandlers(): void {
         homeDir: os.homedir(),
         isInsideOsTrash,
         trashItem: (p) => shell.trashItem(p),
-        removeWorktree: async (p) => {
-          await execFileAsync("git", ["worktree", "remove", p], { cwd: path.dirname(p), timeout: 5000 });
-        },
+        removeWorktree: (p) => removeWorktreeSafely(p),
       })
     );
   });

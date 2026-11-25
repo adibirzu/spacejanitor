@@ -5,6 +5,8 @@ import {
   collectTrash,
   collectOrphans,
   inspectWorktree,
+  removeLinkedWorktree,
+  classifyExecutableConfigKey,
   collectMemory as _collectMemory,
   collectBlockers,
   collectMcpAudit as _collectMcpAudit,
@@ -33,6 +35,8 @@ export { redactSecrets, redactArgv };
 
 export {
   inspectWorktree,
+  removeLinkedWorktree,
+  classifyExecutableConfigKey,
   collectDoctor,
   collectTrash,
   collectOrphans,

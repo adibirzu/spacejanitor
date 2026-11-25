@@ -76,22 +76,49 @@ function findRustSjBinary() {
   return exe;
 }
 
+// How the last Rust call failed ("timed_out" | "error" | null): destructive-action proofs must not
+// silently fall back to the weaker Node answer when a Rust binary exists but could not finish.
+let lastRustFailure = null;
+
+function rustTimeoutMs(cmd) {
+  const fromEnv = Number(process.env.SPACEJANITOR_SJ_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return cmd === "orphans" ? 60000 : 5000;
+}
+
+function failClosedOnRustFailure(report) {
+  if (!lastRustFailure || !report || !Array.isArray(report.candidates)) return report;
+  return {
+    ...report,
+    rustProof: lastRustFailure,
+    candidates: report.candidates.map((c) => ({
+      ...c,
+      safeToPrune: false,
+      proofStatus: `rust_proof_${lastRustFailure}`,
+    })),
+  };
+}
+
 function tryRustSj(subArgs) {
   // SPACEJANITOR_NO_SJ=1 forces the Node collectors (hermetic tests, locked-down hosts).
+  lastRustFailure = null;
   if (process.env.SPACEJANITOR_NO_SJ === "1") return null;
   const bin = findRustSjBinary();
   try {
     const out = execFileSync(bin, [...subArgs, "--json"], {
       encoding: "utf8",
-      timeout: 5000,
+      timeout: rustTimeoutMs(subArgs[0]),
       stdio: ["ignore", "pipe", "ignore"],
     });
     const parsed = JSON.parse(out);
     if (parsed && typeof parsed === "object" && parsed.schema) {
       return normalizeReportEnvelope({ ...parsed, source: "sj-core" });
     }
-  } catch {
-    // Fallback to Node telemetry collector
+  } catch (err) {
+    // Fallback to Node telemetry collector, but never silently for a binary that ran and failed
+    if (err && err.code !== "ENOENT") {
+      lastRustFailure = err.code === "ETIMEDOUT" || err.killed || err.signal ? "timed_out" : "error";
+    }
   }
   return null;
 }
@@ -156,7 +183,8 @@ async function main(argv) {
   } else if (cmd === "blockers") {
     report = tryRustSj(["blockers"]) || (await collectBlockers());
   } else if (cmd === "orphans") {
-    report = tryRustSj(["orphans", targetPath]) || (await collectOrphans({ targetPath }));
+    report =
+      tryRustSj(["orphans", targetPath]) || failClosedOnRustFailure(await collectOrphans({ targetPath }));
   } else if (cmd === "trash") {
     report = tryRustSj(["trash"]) || (await collectTrash());
   } else if (cmd === "mcp-audit") {

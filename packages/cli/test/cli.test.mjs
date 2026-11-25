@@ -91,3 +91,37 @@ test("R2-B8: SPACEJANITOR_NO_SJ=1 forces the Node fallback even when a Rust sj b
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("R10-B34: when the Rust proof times out the CLI reports it and fails closed instead of silently trusting the weaker Node answer", { skip: process.platform === "win32" }, () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-cli-timeout-")));
+  try {
+    const g = (cwd, ...a) =>
+      execFileSync("git", ["-c", "user.email=t@e.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a], { cwd, encoding: "utf8" });
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    g(base, "init", "--bare", "-b", "main", origin);
+    g(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    g(repo, "add", ".");
+    g(repo, "commit", "-m", "init");
+    g(repo, "remote", "add", "origin", origin);
+    g(repo, "push", "-u", "origin", "main");
+    const wt = path.join(base, "wt");
+    g(repo, "worktree", "add", "-b", "feat", wt);
+    g(wt, "push", "-u", "origin", "feat");
+
+    // Node alone says SAFE for this worktree
+    const nodeOnly = JSON.parse(runCli(["orphans", "--path", repo, "--json"], { SPACEJANITOR_NO_SJ: "1" }));
+    assert.equal(nodeOnly.candidates.find((c) => c.path === wt)?.safeToPrune, true);
+
+    // a "Rust sj" that hangs: the CLI must time out, say so, and refuse to call anything safe
+    const fake = path.join(base, "sj");
+    fs.writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    const out = JSON.parse(runCli(["orphans", "--path", repo, "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_SJ_TIMEOUT_MS: "300", SPACEJANITOR_NO_SJ: "" }));
+    assert.equal(out.rustProof, "timed_out");
+    for (const c of out.candidates) assert.equal(c.safeToPrune, false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

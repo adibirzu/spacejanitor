@@ -71,3 +71,43 @@ test("R2-B7: redacts secrets in mcp-audit/memory output coming back from the Rus
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("R10-B34: a hanging Rust sj makes the orphan proof fail closed and say so (no silent Node fallback)", async () => {
+  if (process.platform === "win32") return;
+  const { execFileSync } = await import("node:child_process");
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-bridge-timeout-")));
+  const prev = process.env.SPACEJANITOR_SJ_TIMEOUT_MS;
+  try {
+    const g = (cwd: string, ...a: string[]) =>
+      execFileSync("git", ["-c", "user.email=t@e.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...a], { cwd, encoding: "utf8" });
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    g(base, "init", "--bare", "-b", "main", origin);
+    g(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    g(repo, "add", ".");
+    g(repo, "commit", "-m", "init");
+    g(repo, "remote", "add", "origin", origin);
+    g(repo, "push", "-u", "origin", "main");
+    const wt = path.join(base, "wt");
+    g(repo, "worktree", "add", "-b", "feat", wt);
+    g(wt, "push", "-u", "origin", "feat");
+    const fake = path.join(base, "sj");
+    fs.writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
+    process.env.SPACEJANITOR_SJ_TIMEOUT_MS = "300";
+    const bridge = new SjBridge({ binaryPath: fake });
+    const res = (await bridge.invoke("orphans", { targetPath: repo })) as {
+      rustProof?: string;
+      candidates: Array<{ path: string; safeToPrune: boolean }>;
+    };
+    bridge.dispose();
+    assert.equal(res.rustProof, "timed_out");
+    assert.ok(res.candidates.length > 0);
+    for (const c of res.candidates) assert.equal(c.safeToPrune, false);
+  } finally {
+    if (prev === undefined) delete process.env.SPACEJANITOR_SJ_TIMEOUT_MS;
+    else process.env.SPACEJANITOR_SJ_TIMEOUT_MS = prev;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

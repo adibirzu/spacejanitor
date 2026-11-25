@@ -16,6 +16,7 @@ import {
   collectSummary,
   collectCleanableCaches,
   inspectWorktree,
+  classifyExecutableConfigKey,
   createRemediationPlan,
   verifyRemediationGate,
   validateLoopbackSlmUrl,
@@ -907,9 +908,168 @@ test("R9-note: a config.worktree core.worktree decoy and an inherited GIT_DIR ca
     process.env.GIT_DIR = path.join(repo, ".git");
     const proof = await inspectWorktree(wt);
     assert.equal(proof.safeToPrune, false);
+    // the ONLY thing blocking the prune must be the dirty tree itself, so a redirected proof cannot pass
+    assert.equal(proof.clean, false, "dirty edit must be seen through the decoy");
+    assert.equal(proof.hasUnpushed, false);
+    assert.equal(proof.configRisk, undefined);
   } finally {
     if (savedGitDir === undefined) delete process.env.GIT_DIR;
     else process.env.GIT_DIR = savedGitDir;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R10-B33: attached short-flag credentials inside shell strings and -p-… leak nowhere; ordinary flags stay readable", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r10b33-"));
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r10b33h-"));
+  const leaks = (t) => [...new Set(String(t).match(/LEAK\d\d/g) || [])];
+  try {
+    fs.writeFileSync(
+      path.join(dir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          sh_c_mysql: { command: "sh", args: ["-c", "mysql -h db -uroot -pLEAK71shell mydb"] },
+          dash_leading_pw: { command: "mysql", args: ["-uroot", "-p-LEAK72dash"] },
+          sh_c_curl_u: { command: "bash", args: ["-lc", "curl -uadmin:LEAK73pw https://x"] },
+          quoted_shell: { command: "sh", args: ["-c", "mysql -uroot '-pLEAK74quoted' db"] },
+          plain_flags: { command: "tool", args: ["-transport", "stdio", "-timeout", "30", "-tls", "-url", "x", "-update", "-path", "/srv", "-port=8080"] },
+        },
+      })
+    );
+    const audit = await collectMcpAudit({ configDirs: [dir] });
+    assert.deepEqual(leaks(JSON.stringify(audit)), []);
+    const by = Object.fromEntries(audit.servers.map((s) => [s.name, s]));
+    for (const n of ["sh_c_mysql", "dash_leading_pw", "sh_c_curl_u", "quoted_shell"]) assert.equal(by[n].hasSecretRisk, true, n);
+    // over-redaction stays small: ordinary single-dash flags are left readable
+    for (const w of ["-transport", "-timeout", "-tls", "-url", "-update", "-path", "-port=8080"]) {
+      assert.ok(by.plain_flags.argsRedacted.includes(w), `${w} must stay readable: ${by.plain_flags.argsRedacted}`);
+    }
+    const summary = await collectSummary({ configDirs: [dir], homeDir: home, targetPath: home });
+    assert.deepEqual(leaks(JSON.stringify(summary)), []);
+    let body = "";
+    await adviseWithLocalSlm({
+      enabled: true,
+      url: "http://127.0.0.1:11434/v1/chat/completions",
+      summary,
+      candidates: [{ path: "/tmp/x", note: "mysql -uroot -pLEAK75cand" }],
+      fetchImpl: async (_u, init) => {
+        body = String(init.body);
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "{}" } }] }) };
+      },
+    });
+    assert.deepEqual(leaks(body), []);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("R10-B32: executable-config key classifier matches the shared vectors", () => {
+  const v = JSON.parse(
+    fs.readFileSync(new URL("../../../crates/sj-core/tests/fixtures/exec_config_keys.json", import.meta.url), "utf8")
+  );
+  for (const k of v.block) assert.equal(typeof classifyExecutableConfigKey(k), "string", `expected block: ${k}`);
+  for (const k of v.allow) assert.equal(classifyExecutableConfigKey(k), null, `expected allow: ${k}`);
+});
+
+test("R10-B32: repo-local config that can execute commands blocks the proof and no command ever runs", { skip: process.platform === "win32" }, async () => {
+  const cases = {
+    uploadpack: (repo, wt, marker) => git(repo, "config", "remote.origin.uploadpack", `touch ${marker}; git-upload-pack`),
+    sshcommand: (repo, wt, marker) => {
+      git(repo, "config", "remote.origin.url", "ssh://example.invalid/x.git");
+      git(repo, "config", "core.sshCommand", `touch ${marker}; false`);
+    },
+    cleanfilter: (repo, wt, marker) => {
+      fs.writeFileSync(path.join(wt, ".gitattributes"), "*.txt filter=evil\n");
+      git(wt, "add", ".gitattributes");
+      git(wt, "commit", "-m", "attr");
+      git(wt, "push");
+      git(repo, "config", "filter.evil.clean", `touch ${marker}; cat`);
+      fs.utimesSync(path.join(wt, "a.txt"), new Date("2020-01-01"), new Date("2020-01-01"));
+    },
+    gitproxy: (repo, wt, marker) => {
+      git(repo, "config", "remote.origin.url", "git://127.0.0.1:9/x.git");
+      git(repo, "config", "core.gitProxy", `touch ${marker}`);
+    },
+    credential: (repo, wt, marker) => git(repo, "config", "credential.helper", `!touch ${marker}`),
+    include: (repo, wt, marker) => git(repo, "config", "include.path", path.join(path.dirname(marker), "inc.cfg")),
+  };
+  for (const [name, arm] of Object.entries(cases)) {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `sj-r10b32-${name}-`)));
+    try {
+      const origin = path.join(base, "origin.git");
+      const repo = path.join(base, "repo");
+      fs.mkdirSync(repo);
+      git(base, "init", "--bare", "-b", "main", origin);
+      git(repo, "init", "-b", "main");
+      fs.writeFileSync(path.join(repo, "a.txt"), "a");
+      git(repo, "add", ".");
+      git(repo, "commit", "-m", "init");
+      git(repo, "remote", "add", "origin", origin);
+      git(repo, "push", "-u", "origin", "main");
+      const wt = path.join(base, "wt");
+      git(repo, "worktree", "add", "-b", "feat", wt);
+      git(wt, "push", "-u", "origin", "feat");
+      const marker = path.join(base, `MARK_${name}`);
+      arm(repo, wt, marker);
+      const proof = await inspectWorktree(wt);
+      const report = await collectOrphans({ targetPath: repo });
+      assert.equal(proof.safeToPrune, false, `${name}: must not be safe`);
+      assert.match(String(proof.configRisk), /repo_config_can_execute/, `${name}: reason`);
+      assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
+      assert.equal(fs.existsSync(marker), false, `${name}: repo config command ran`);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
+  }
+});
+
+test("R10-B34: Node agrees with Rust on remote tags and on amend-before-push (linked worktrees)", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r10b34-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", `b-${name}`, p);
+      git(p, "push", "-u", "origin", `b-${name}`);
+      return p;
+    };
+    const tagged = mk("remote-tag");
+    git(tagged, "checkout", "--detach");
+    fs.writeFileSync(path.join(tagged, "t.txt"), "t");
+    git(tagged, "add", "t.txt");
+    git(tagged, "commit", "-m", "tagged-only");
+    git(tagged, "tag", "pushed-tag");
+    git(tagged, "push", "origin", "pushed-tag");
+    git(tagged, "checkout", "b-remote-tag");
+
+    const amended = mk("amended");
+    fs.writeFileSync(path.join(amended, "x.txt"), "x");
+    git(amended, "add", "x.txt");
+    git(amended, "commit", "-m", "first");
+    git(amended, "commit", "--amend", "-m", "second");
+    git(amended, "push", "origin", "b-amended");
+
+    const lost = mk("lost");
+    git(lost, "checkout", "--detach");
+    fs.writeFileSync(path.join(lost, "y.txt"), "y");
+    git(lost, "add", "y.txt");
+    git(lost, "commit", "-m", "abandoned");
+    git(lost, "checkout", "b-lost");
+
+    assert.equal((await inspectWorktree(tagged)).safeToPrune, true, "commit held by a REMOTE tag is safe");
+    assert.equal((await inspectWorktree(amended)).safeToPrune, true, "amend-before-push must not block forever");
+    assert.equal((await inspectWorktree(lost)).safeToPrune, false, "abandoned detached commit still blocks");
+  } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
 });

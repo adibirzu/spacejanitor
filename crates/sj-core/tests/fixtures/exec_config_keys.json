@@ -1,0 +1,20 @@
+{
+  "comment": "Git config keys (as printed by `git config --name-only`) that can make git EXECUTE a command during a read-only proof (status/ls-remote). A repository whose local or worktree config sets any of them is blocked with repo_config_can_execute. Run by crates/sj-core (executable_config_key) and packages/core (classifyExecutableConfigKey).",
+  "block": [
+    "filter.evil.clean", "filter.evil.smudge", "filter.evil.process",
+    "remote.origin.uploadpack", "remote.origin.receivepack", "remote.origin.vcs", "remote.origin.proxy",
+    "core.sshcommand", "core.gitproxy", "core.askpass", "core.pager", "core.editor", "core.alternaterefscommand",
+    "credential.helper", "credential.https://example.com.helper", "credential.usehttppath",
+    "url.evil:.insteadof", "url.evil:.pushinsteadof",
+    "include.path", "includeif.gitdir:/x/.path",
+    "diff.external", "diff.x.textconv", "diff.x.command",
+    "gpg.program", "gpg.ssh.program", "gpg.x509.program",
+    "uploadpack.packobjectshook", "http.proxy", "http.sslcertpasswordprotected", "ssh.variant.x"
+  ],
+  "allow": [
+    "core.bare", "core.filemode", "core.repositoryformatversion", "core.worktree", "core.fsmonitor", "core.hookspath",
+    "remote.origin.url", "remote.origin.fetch", "branch.main.remote", "branch.main.merge", "user.name", "user.email",
+    "filter.x.required", "diff.x.binary", "http.sslverify", "extensions.worktreeconfig", "pull.rebase", "init.defaultbranch",
+    "gc.auto", "commit.gpgsign"
+  ]
+}

@@ -62,9 +62,11 @@ const M = buildSecretMatchers();
  */
 export function redactSecrets(input) {
   if (typeof input !== "string" || !input) return "";
-  // a lone attached short-flag credential ("-pSECRET", "-uadmin:SECRET", "-tTOKEN")
-  if (/^-[ptu][^\s=-]\S*$/i.test(input)) return `${input.slice(0, 2)}<REDACTED>`;
   return input
+    // attached short-flag credentials inside any string, token by token (shell strings, lone argv)
+    .replace(/(^|\s)(-[ptu]\S+)/gi, (m, ws, tok) =>
+      isAttachedShortCredential(tok) ? `${ws}${tok.slice(0, 2)}<REDACTED>` : m
+    )
     .replace(M.pemRe, "<REDACTED>")
     .replace(M.urlCredsRe, "$1<REDACTED>@")
     .replace(M.urlQueryRe, "$1<REDACTED>")
@@ -74,6 +76,24 @@ export function redactSecrets(input) {
     .replace(M.bearerRe, "$1 <REDACTED>")
     .replace(M.assignRe, "$1$2<REDACTED>")
     .replace(M.vendorRe, "<REDACTED>");
+}
+
+// Words that merely START with p/t/u after a single dash and are ordinary flags, not credentials.
+const KNOWN_SHORT_WORDS = new Set([
+  "-transport", "-timeout", "-tls", "-tlsverify", "-url", "-update", "-path", "-port", "-tags", "-test",
+  "-time", "-target", "-type", "-text", "-tree", "-pthread", "-print", "-prune", "-perm", "-user",
+]);
+
+/**
+ * "-pSECRET" (mysql), "-tTOKEN", "-uadmin:SECRET", "-p-dashedSecret": an attached single-letter
+ * credential flag. "-p=…"/"-p" alone are handled elsewhere; single-dash credential flag NAMES
+ * (-token, -api-key) and well-known flag words (-timeout, -port, ...) are not values.
+ */
+function isAttachedShortCredential(tok) {
+  const m = /^-([ptu])([^\s=].*)$/i.exec(tok);
+  if (!m) return false;
+  if (SINGLE_DASH_CRED_FLAG_RE.test(tok)) return false;
+  return !KNOWN_SHORT_WORDS.has(tok.split("=")[0].toLowerCase());
 }
 
 const USER_FLAG_RE = /^(?:-u|--user|--proxy-user)$/i;
@@ -104,7 +124,7 @@ export function redactArgv(args) {
     const a = list[i];
     // attached short-flag credentials: -pSECRET (mysql), -tTOKEN, -uadmin:SECRET. Treated as
     // credential-bearing on purpose; false positives such as -p8080 are acceptable.
-    if (/^-[ptu][^\s=-]/i.test(a) && !SINGLE_DASH_CRED_FLAG_RE.test(a)) {
+    if (isAttachedShortCredential(a)) {
       out.push(`${a.slice(0, 2)}<REDACTED>`);
       continue;
     }

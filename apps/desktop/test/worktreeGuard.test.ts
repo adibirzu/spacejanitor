@@ -4,7 +4,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { worktreePruneBlockReason } from "../src/worktreeGuard";
+import { removeWorktreeSafely, worktreePruneBlockReason } from "../src/worktreeGuard";
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync(
@@ -114,6 +114,40 @@ test("R9-B27: guard is not fooled by a lying core.fsmonitor and never runs the h
     fs.rmSync(marker, { force: true });
     assert.notEqual(await worktreePruneBlockReason(wt), null);
     assert.equal(fs.existsSync(marker), false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R10: removeWorktreeSafely removes a worktree placed BESIDE the repo, and the guard blocks locked and exec-config worktrees", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-guard-rm-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name: string) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", `b-${name}`, p);
+      git(p, "push", "-u", "origin", `b-${name}`);
+      return p;
+    };
+    const beside = mk("beside");
+    const locked = mk("locked");
+    git(repo, "worktree", "lock", locked);
+    assert.equal(await worktreePruneBlockReason(beside), null);
+    assert.equal(await worktreePruneBlockReason(locked), "worktree_locked");
+    await removeWorktreeSafely(beside);
+    assert.equal(fs.existsSync(beside), false);
+    git(repo, "config", "core.sshCommand", "false");
+    const other = mk("other");
+    assert.match(String(await worktreePruneBlockReason(other)), /repo_config_can_execute/);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

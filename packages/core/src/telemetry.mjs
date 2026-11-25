@@ -176,9 +176,14 @@ export async function collectTrash({ homeDir = os.homedir() } = {}) {
   };
 }
 
-async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000, env } = {}) {
+async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000, env, input } = {}) {
   try {
-    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout, maxBuffer, ...(env ? { env } : {}) });
+    const pending = execFileAsync(cmd, args, { cwd, timeout, maxBuffer, ...(env ? { env } : {}) });
+    if (input !== undefined && pending.child?.stdin) {
+      pending.child.stdin.on("error", () => {});
+      pending.child.stdin.end(input);
+    }
+    const { stdout } = await pending;
     return { ok: true, stdout: stdout.trim() };
   } catch {
     return { ok: false, stdout: "" };
@@ -197,11 +202,101 @@ const GIT_SAFE_ARGS = [
 ];
 
 function gitSafeEnv() {
-  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" };
+  const env = {
+    ...process.env,
+    GIT_TERMINAL_PROMPT: "0",
+    GIT_OPTIONAL_LOCKS: "0",
+    // isolated global/system config and a non-interactive ssh: a proof can neither be steered by, nor hang on, ambient config
+    GIT_CONFIG_GLOBAL: os.devNull,
+    GIT_CONFIG_SYSTEM: os.devNull,
+    GIT_CONFIG_NOSYSTEM: "1",
+    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
+  };
   for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
     delete env[k];
   }
   return env;
+}
+
+const EXEC_CONFIG_PATTERNS = [
+  /^filter\..+\.(clean|smudge|process)$/,
+  /^remote\..+\.(uploadpack|receivepack|vcs|proxy)$/,
+  /^core\.(sshcommand|gitproxy|askpass|pager|editor|alternaterefscommand)$/,
+  /^credential\./,
+  /^url\..+\.(insteadof|pushinsteadof)$/,
+  /^include\./,
+  /^includeif\./,
+  /^diff\.external$/,
+  /^diff\..+\.(textconv|command)$/,
+  /^gpg\.(.+\.)?program$/,
+  /^uploadpack\./,
+  /^http\.(proxy|sslcertpasswordprotected)$/,
+  /^ssh\./,
+];
+
+/** Returns the offending (lowercased) key when a git config key can make git execute a command, else null. */
+export function classifyExecutableConfigKey(key) {
+  const k = String(key).toLowerCase();
+  return EXEC_CONFIG_PATTERNS.some((re) => re.test(k)) ? k : null;
+}
+
+/**
+ * Read the repo-local and worktree config WITHOUT running anything (git config --file only parses) and
+ * report the first key that could execute a command. Unreadable config fails closed.
+ */
+async function executableConfigRisk(gitDir) {
+  const files = [];
+  let commonDir = gitDir;
+  try {
+    const rel = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
+    if (rel) commonDir = path.resolve(gitDir, rel);
+  } catch {
+    // no commondir file: this IS the common dir
+  }
+  files.push(path.join(commonDir, "config"));
+  const wtCfg = path.join(gitDir, "config.worktree");
+  if (fs.existsSync(wtCfg)) files.push(wtCfg);
+  for (const f of files) {
+    if (!fs.existsSync(f)) continue;
+    const res = await safeExecResult("git", ["config", "--file", f, "--list", "--name-only", "-z"], os.tmpdir(), { env: gitSafeEnv() });
+    if (!res.ok) return "repo_config_can_execute:unreadable_config";
+    for (const key of res.stdout.split("\0")) {
+      const hit = key && classifyExecutableConfigKey(key);
+      if (hit) return `repo_config_can_execute:${hit}`;
+    }
+  }
+  return null;
+}
+
+function resolveCommonDir(gitDir) {
+  try {
+    const rel = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
+    return rel ? path.resolve(gitDir, rel) : gitDir;
+  } catch {
+    return gitDir;
+  }
+}
+
+/** git against the SHARED git dir (branch reflogs live there and outlive a linked worktree). */
+function gitProofCommon(commonDir, args, opts = {}) {
+  return safeExecResult("git", [...GIT_SAFE_ARGS, "--git-dir", commonDir, ...args], os.tmpdir(), { ...opts, env: gitSafeEnv() });
+}
+
+/** Heads and tags the remotes actually hold (one ls-remote per remote), limited to objects we have. */
+async function remoteTagAndHeadTips(G, remotes) {
+  const tips = new Set();
+  for (const remote of remotes) {
+    const r = await G(["ls-remote", "--heads", "--tags", "--", remote], { timeout: 15000 });
+    if (!r.ok) continue;
+    for (const line of r.stdout.split(/\r?\n/)) {
+      const sha = line.split(/\s+/)[0];
+      if (/^[0-9a-f]{40,64}$/i.test(sha)) tips.add(sha);
+    }
+  }
+  if (tips.size === 0) return [];
+  const present = await G(["cat-file", "--batch-check"], { input: [...tips].join("\n") + "\n" });
+  if (!present.ok) return [];
+  return present.stdout.split(/\r?\n/).filter((l) => l && !l.endsWith(" missing")).map((l) => l.split(/\s+/)[0]);
 }
 
 function resolveWorktreeGitDir(wtPath) {
@@ -265,35 +360,63 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false 
   if (!wtPath || !fs.existsSync(wtPath)) return unverified();
   const gitDir = resolveWorktreeGitDir(wtPath);
   if (!gitDir) return unverified();
+  locked = locked || fs.existsSync(path.join(gitDir, "locked"));
+  const configRisk = await executableConfigRisk(gitDir);
+  if (configRisk) return unverified({ configRisk });
   const G = (args, opts) => gitProof(wtPath, gitDir, args, opts);
 
   const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes, flagsRes, extraRefsRes, reflogRes] = await Promise.all([
     G(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"]),
     G(["remote"]),
-    // branches AND tags: a tag-only commit is lost when the worktree goes
-    G(["rev-list", "--branches", "--tags", "--not", "--remotes", "--count"]),
+    G(["rev-list", "--branches", "--not", "--remotes", "--count"]),
     G(["rev-list", "HEAD", "--not", "--remotes", "--count"]),
     G(["stash", "list"]),
     G(["symbolic-ref", "-q", "HEAD"]),
     G(["rev-parse", "--verify", "-q", "HEAD"]),
     // lowercase tags = assume-unchanged, "S" = skip-worktree: git status stays clean while edits exist
     G(["ls-files", "-v", "-z"], { maxBuffer: 64 * 1024 * 1024, timeout: 15000 }),
-    G(["for-each-ref", "--format=%(objectname)", "refs/worktree", "refs/bisect", "refs/rewritten"]),
+    // tags and per-worktree ref namespaces: lost with the worktree unless a remote holds them
+    G(["for-each-ref", "--format=%(objectname)", "refs/tags", "refs/worktree", "refs/bisect", "refs/rewritten"]),
     // commits made on a detached HEAD and then left behind live only in this worktree's HEAD reflog
     G(["reflog", "show", "--format=%H", "HEAD"], { maxBuffer: 8 * 1024 * 1024 }),
   ]);
   if (![statusRes, remotesRes, branchesRes, headRes, stashRes, flagsRes, extraRefsRes, reflogRes].every((r) => r.ok)) {
     return unverified({ hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false });
   }
-  const extraShas = [
-    ...new Set([...extraRefsRes.stdout.split(/\s+/), ...reflogRes.stdout.split(/\s+/)].filter(Boolean)),
-  ];
+  const refShas = [...new Set(extraRefsRes.stdout.split(/\s+/).filter(Boolean))];
+  const reflogShas = [...new Set(reflogRes.stdout.split(/\s+/).filter(Boolean))];
   let extraUnpushed = false;
-  if (extraShas.length > 3000 || extraShas.some((x) => !/^[0-9a-f]{7,64}$/i.test(x))) {
+  if (refShas.length + reflogShas.length > 3000 || [...refShas, ...reflogShas].some((x) => !/^[0-9a-f]{7,64}$/i.test(x))) {
     extraUnpushed = true; // cannot verify: fail closed
-  } else if (extraShas.length > 0) {
-    const r = await G(["rev-list", "--count", ...extraShas, "--not", "--remotes"]);
-    extraUnpushed = !r.ok || !Number.isFinite(Number(r.stdout)) || Number(r.stdout) > 0;
+  } else {
+    // shas travel on stdin (Windows command lines are short); remote tags are only fetched lazily
+    const commonDir = resolveCommonDir(gitDir);
+    const sharedG = commonDir !== gitDir ? (args, opts) => gitProofCommon(commonDir, args, opts) : null;
+    let remoteTips = null;
+    const getRemoteTips = async () => {
+      if (remoteTips === null) remoteTips = await remoteTagAndHeadTips(G, remotesRes.stdout.split(/\s+/).filter(Boolean));
+      return remoteTips;
+    };
+    const unreachable = async (run, shas, pre = [], notArgs = ["--remotes"]) => {
+      if (shas.length === 0) return 0;
+      const count = async (tips) => {
+        const input = shas.join("\n") + "\n" + tips.map((t) => `^${t}`).join("\n") + (tips.length ? "\n" : "");
+        const r = await run(["rev-list", "--count", ...pre, "--stdin", "--not", ...notArgs], { input });
+        const n = Number(r.stdout);
+        return r.ok && Number.isFinite(n) ? n : Infinity;
+      };
+      const n = await count([]);
+      if (n === 0) return 0;
+      return count(await getRemoteTips());
+    };
+    if ((await unreachable(G, refShas)) > 0) extraUnpushed = true;
+    if (!extraUnpushed && reflogShas.length) {
+      // linked worktree: commits still held by the SHARED reflogs (amend/rebase before push) are not lost
+      const n = sharedG
+        ? await unreachable(sharedG, reflogShas, ["--single-worktree"], ["--reflog", "--remotes"])
+        : await unreachable(G, reflogShas);
+      if (n > 0) extraUnpushed = true;
+    }
   }
   const lines = statusRes.stdout.split(/\r?\n/).filter(Boolean);
   const hasIgnored = lines.some((l) => l.startsWith("!!"));
@@ -321,6 +444,29 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false 
     safeToPrune:
       !hasDirty && !hasIgnored && !hasIndexFlags && hasRemote && !hasUnpushed && !hasStashes && onBranch && !locked && proofStatus === "verified",
   };
+}
+
+/**
+ * `git worktree remove` for a linked worktree, run against the MAIN repository with explicit
+ * --git-dir/--work-tree and the same neutralised config as the proofs (no --force: git itself still
+ * refuses dirty or locked worktrees). Works for worktrees placed beside the repo as well as inside it.
+ */
+export async function removeLinkedWorktree(wtPath) {
+  const gitDir = resolveWorktreeGitDir(wtPath);
+  if (!gitDir) return { ok: false, error: "worktree_git_dir_unresolvable" };
+  const commonDir = resolveCommonDir(gitDir);
+  if (commonDir === gitDir || path.basename(commonDir) !== ".git") return { ok: false, error: "main_repo_unresolvable" };
+  const mainWorkTree = path.dirname(commonDir);
+  try {
+    await execFileAsync(
+      "git",
+      [...GIT_SAFE_ARGS, "--git-dir", commonDir, "--work-tree", mainWorkTree, "worktree", "remove", wtPath],
+      { cwd: mainWorkTree, timeout: 15000, env: gitSafeEnv() }
+    );
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, error: err instanceof Error ? err.message.split("\n")[0] : "worktree_remove_failed" };
+  }
 }
 
 export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14 } = {}) {

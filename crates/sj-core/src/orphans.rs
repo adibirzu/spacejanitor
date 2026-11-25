@@ -10,7 +10,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::{OsStr, OsString};
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
-use std::process::Command;
+use std::io::{Read, Write};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
+
+/// Hard per-git-call timeout and per-repo proof budget. A proof that cannot finish fails closed.
+const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
+const REPO_PROOF_BUDGET: Duration = Duration::from_secs(90);
 
 #[derive(Debug, Clone)]
 pub struct OrphanOptions {
@@ -116,7 +122,132 @@ fn resolve_relative_from_dir(base_dir: &Path, rel: &Path) -> PathBuf {
     base_dir.join(rel)
 }
 
+/// Git config keys (lowercased `section.subsection.key`) that can make git EXECUTE a command or be
+/// steered somewhere else during a read-only proof. Shared vectors:
+/// crates/sj-core/tests/fixtures/exec_config_keys.json.
+pub fn executable_config_key(key: &str) -> Option<String> {
+    let k = key.to_ascii_lowercase();
+    let ends = |suffixes: &[&str]| suffixes.iter().any(|s| k.ends_with(&format!(".{s}")));
+    let hit = (k.starts_with("filter.") && ends(&["clean", "smudge", "process"]))
+        || (k.starts_with("remote.") && ends(&["uploadpack", "receivepack", "vcs", "proxy"]))
+        || matches!(
+            k.as_str(),
+            "core.sshcommand" | "core.gitproxy" | "core.askpass" | "core.pager" | "core.editor"
+                | "core.alternaterefscommand" | "diff.external" | "gpg.program"
+                | "http.proxy" | "http.sslcertpasswordprotected"
+        )
+        || k.starts_with("credential.")
+        || (k.starts_with("url.") && ends(&["insteadof", "pushinsteadof"]))
+        || k.starts_with("include.")
+        || k.starts_with("includeif.")
+        || (k.starts_with("diff.") && ends(&["textconv", "command"]))
+        || (k.starts_with("gpg.") && ends(&["program"]))
+        || k.starts_with("uploadpack.")
+        || k.starts_with("ssh.");
+    hit.then_some(k)
+}
+
+/// Parse (never execute) the repo-local and per-worktree config and return the first key that could
+/// run a command. An unreadable config fails closed.
+fn executable_config_risk(git_ctx: &GitExecContext) -> Option<String> {
+    let mut common = git_ctx.git_dir.clone();
+    if let Ok(rel) = std::fs::read_to_string(git_ctx.git_dir.join("commondir")) {
+        let rel = rel.trim();
+        if !rel.is_empty() {
+            common = resolve_relative_from_dir(&git_ctx.git_dir, Path::new(rel));
+        }
+    }
+    let mut files = vec![common.join("config")];
+    let wt_cfg = git_ctx.git_dir.join("config.worktree");
+    if wt_cfg.exists() {
+        files.push(wt_cfg);
+    }
+    for f in files {
+        if !f.exists() {
+            continue;
+        }
+        let out = Command::new("git")
+            .args(["config", "--file"])
+            .arg(&f)
+            .args(["--list", "--name-only", "-z"])
+            .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output();
+        let Ok(out) = out else {
+            return Some("repo_config_can_execute:unreadable_config".to_string());
+        };
+        if !out.status.success() {
+            return Some("repo_config_can_execute:unreadable_config".to_string());
+        }
+        for key in String::from_utf8_lossy(&out.stdout).split('\0') {
+            if key.is_empty() {
+                continue;
+            }
+            if let Some(hit) = executable_config_key(key) {
+                return Some(format!("repo_config_can_execute:{hit}"));
+            }
+        }
+    }
+    None
+}
+
+/// Run a command with a hard timeout, optional stdin, and stdout capture on a reader thread (so a
+/// large output cannot deadlock the wait loop). Timeout kills the child and reports `git_timeout`.
+fn run_with_timeout(
+    mut cmd: Command,
+    input: Option<Vec<u8>>,
+    timeout: Duration,
+) -> Result<(bool, String), SjError> {
+    cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    let mut child = cmd.spawn()?;
+    if let (Some(data), Some(mut si)) = (input, child.stdin.take()) {
+        std::thread::spawn(move || {
+            let _ = si.write_all(&data);
+        });
+    }
+    let mut so = child
+        .stdout
+        .take()
+        .ok_or_else(|| SjError::Git("git_stdout_unavailable".to_string()))?;
+    let reader = std::thread::spawn(move || {
+        let mut buf = Vec::new();
+        let _ = so.read_to_end(&mut buf);
+        buf
+    });
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait()? {
+            Some(status) => {
+                let out = reader.join().unwrap_or_default();
+                return Ok((status.success(), String::from_utf8_lossy(&out).into_owned()));
+            }
+            None => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(SjError::Git("git_timeout".to_string()));
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+}
+
 fn run_git_raw_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_git_raw_ctx_in(git_ctx, args, None)
+}
+
+fn run_git_raw_ctx_in<I, S>(
+    git_ctx: &GitExecContext,
+    args: I,
+    input: Option<Vec<u8>>,
+) -> Result<(bool, String), SjError>
 where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
@@ -147,13 +278,65 @@ where
         .arg(&git_ctx.work_tree)
         .args(args)
         .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
     if let Some(ref alt) = git_ctx.alternate_object_dirs {
         cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt);
     }
-    let out = cmd.output()?;
-    let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
-    Ok((out.status.success(), stdout))
+    run_with_timeout(cmd, input, GIT_CALL_TIMEOUT)
+}
+
+/// Of the given object ids, keep those that exist in this repository (remote tips we never fetched
+/// cannot be negative revs).
+fn present_objects(git_ctx: &GitExecContext, ids: &[String]) -> Vec<String> {
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    let input = ids.join("\n") + "\n";
+    let Ok((true, out)) = run_git_raw_ctx_in(git_ctx, ["cat-file", "--batch-check"], Some(input.into_bytes()))
+    else {
+        return Vec::new();
+    };
+    out.lines()
+        .filter(|l| !l.ends_with(" missing"))
+        .filter_map(|l| l.split_whitespace().next())
+        .map(str::to_string)
+        .collect()
+}
+
+/// How many of `shas` are NOT reachable from any of `tips` (plus `extra_not` pseudo-args such as
+/// `--reflog`). One git process for any number of commits; Err(()) = could not be determined.
+fn count_unreachable(
+    git_ctx: &GitExecContext,
+    shas: &[String],
+    tips: &[String],
+    pre_args: &[&str],
+    not_args: &[&str],
+) -> Result<u64, ()> {
+    if shas.is_empty() {
+        return Ok(0);
+    }
+    let mut input = String::new();
+    for s in shas {
+        input.push_str(s);
+        input.push('\n');
+    }
+    for t in tips {
+        input.push('^');
+        input.push_str(t);
+        input.push('\n');
+    }
+    let mut args: Vec<&str> = vec!["rev-list", "--count"];
+    args.extend_from_slice(pre_args);
+    args.push("--stdin");
+    if !not_args.is_empty() {
+        args.push("--not");
+        args.extend_from_slice(not_args);
+    }
+    match run_git_raw_ctx_in(git_ctx, args, Some(input.into_bytes())) {
+        Ok((true, out)) => out.trim().parse::<u64>().map_err(|_| ()),
+        _ => Err(()),
+    }
 }
 
 fn run_git_ctx<I, S>(git_ctx: &GitExecContext, args: I) -> Result<(bool, String), SjError>
@@ -177,11 +360,12 @@ fn sha256_hex_str(input: &str) -> String {
     out
 }
 
-/// Every commit-ish that removing the repo/worktree could orphan besides refs/heads: tags and the
-/// per-worktree ref namespaces (refs/worktree, refs/bisect, refs/rewritten) plus this checkout's HEAD
-/// reflog (commits made on a detached HEAD and then left behind). Err = could not enumerate.
-fn collect_extra_local_commits(git_ctx: &GitExecContext) -> Result<Vec<String>, String> {
-    let mut shas: BTreeSet<String> = BTreeSet::new();
+/// Commits that removing the repo/worktree could orphan besides refs/heads: (a) tags and the
+/// per-worktree ref namespaces (refs/worktree, refs/bisect, refs/rewritten) and (b) this checkout's
+/// HEAD reflog (commits made on a detached HEAD and then left behind). Err = could not enumerate.
+fn collect_extra_local_commits(
+    git_ctx: &GitExecContext,
+) -> Result<(Vec<String>, Vec<String>), String> {
     let (ok, out) = run_git_raw_ctx(
         git_ctx,
         [
@@ -197,20 +381,51 @@ fn collect_extra_local_commits(git_ctx: &GitExecContext) -> Result<Vec<String>, 
     if !ok {
         return Err("git_for_each_ref_failed".to_string());
     }
-    shas.extend(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string));
+    let refs: BTreeSet<String> = out
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
     let (rok, rout) = run_git_raw_ctx(git_ctx, ["reflog", "show", "--format=%H", "HEAD"])
         .map_err(|_| "git_reflog_failed".to_string())?;
     if !rok {
         return Err("git_reflog_failed".to_string());
     }
-    shas.extend(rout.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string));
-    if shas.len() > 3000 {
+    let reflog: BTreeSet<String> = rout
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(str::to_string)
+        .collect();
+    if refs.len() + reflog.len() > 3000 {
         return Err("too_many_local_commits_to_verify".to_string());
     }
-    if shas.iter().any(|s| !s.chars().all(|c| c.is_ascii_hexdigit())) {
+    if refs
+        .iter()
+        .chain(reflog.iter())
+        .any(|s| !s.chars().all(|c| c.is_ascii_hexdigit()))
+    {
         return Err("malformed_ref_listing".to_string());
     }
-    Ok(shas.into_iter().collect())
+    Ok((refs.into_iter().collect(), reflog.into_iter().collect()))
+}
+
+/// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
+/// survive the worktree being removed). None for a standalone repo.
+fn shared_git_ctx(git_ctx: &GitExecContext) -> Option<GitExecContext> {
+    let rel = std::fs::read_to_string(git_ctx.git_dir.join("commondir")).ok()?;
+    let rel = rel.trim();
+    if rel.is_empty() {
+        return None;
+    }
+    let common = resolve_relative_from_dir(&git_ctx.git_dir, Path::new(rel));
+    let work_tree = common.parent().map(Path::to_path_buf).unwrap_or_else(|| common.clone());
+    Some(GitExecContext {
+        work_tree,
+        git_dir: common,
+        alternate_object_dirs: None,
+    })
 }
 
 /// Linked worktrees of this repository as (path, locked) from `git worktree list --porcelain`.
@@ -514,6 +729,7 @@ fn validate_single_repo_at(
     ctx: &ProtectionContext,
 ) -> Result<OrphanCandidate, Vec<String>> {
     let mut reasons = Vec::new();
+    let proof_start = Instant::now();
 
     let prot = check_path_protection(logical_repo, ctx);
     if prot.protected {
@@ -533,6 +749,12 @@ fn validate_single_repo_at(
             return Err(reasons);
         }
     };
+
+    // Block BEFORE any git invocation that could execute repo-controlled config.
+    if let Some(risk) = executable_config_risk(&git_ctx) {
+        reasons.push(risk);
+        return Err(reasons);
+    }
 
     let Ok((head_ok, head_before)) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"])
     else {
@@ -641,8 +863,8 @@ fn validate_single_repo_at(
     let extra_commits = collect_extra_local_commits(&git_ctx);
     let mut all_branches_verified = false;
     if let Ok(ref local_branches) = refs_before {
-        if !remotes.is_empty() {
-            let mut remote_heads: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        if !remotes.is_empty() && proof_start.elapsed() < REPO_PROOF_BUDGET {
+            let mut remote_tips: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut remote_query_failed = false;
             for remote_name in &remotes {
                 let target_override = if actual_repo != logical_repo {
@@ -665,10 +887,13 @@ fn validate_single_repo_at(
                     .as_ref()
                     .map(|p| p.as_os_str())
                     .unwrap_or_else(|| OsStr::new(remote_name));
+                // heads and tags only: hosted remotes also expose refs/pull/* by the thousand
                 match run_git_raw_ctx(
                     &git_ctx,
                     [
                         OsStr::new("ls-remote"),
+                        OsStr::new("--heads"),
+                        OsStr::new("--tags"),
                         OsStr::new("--"),
                         ls_target,
                     ],
@@ -679,7 +904,7 @@ fn validate_single_repo_at(
                             .filter_map(|l| l.split_whitespace().next())
                             .map(str::to_string)
                             .collect::<Vec<_>>();
-                        remote_heads.insert(remote_name.clone(), tips);
+                        remote_tips.insert(remote_name.clone(), present_objects(&git_ctx, &tips));
                     }
                     _ => {
                         remote_query_failed = true;
@@ -688,28 +913,38 @@ fn validate_single_repo_at(
             }
 
             if !remote_query_failed {
-                let is_pushed_to_tips = |local_sha: &str, tips: &[String]| -> bool {
-                    tips.iter().any(|rsha| {
-                        rsha == local_sha
-                            || run_git_ctx(
-                                &git_ctx,
-                                ["merge-base", "--is-ancestor", local_sha, rsha],
-                            )
-                            .map(|(ok, _)| ok)
-                            .unwrap_or(false)
-                    })
-                };
+                let all_tips: Vec<String> = remote_tips
+                    .values()
+                    .flatten()
+                    .cloned()
+                    .collect::<BTreeSet<_>>()
+                    .into_iter()
+                    .collect();
 
-                // tags, per-worktree refs and the HEAD reflog must also be contained in some remote ref
-                let extra_ok = match &extra_commits {
-                    Ok(list) => list.iter().all(|sha| {
-                        remote_heads
-                            .values()
-                            .any(|tips| is_pushed_to_tips(sha, tips))
-                    }),
-                    Err(_) => false,
+                // tags and per-worktree refs: contained in some remote head/tag
+                let (ref_shas, reflog_shas) = match &extra_commits {
+                    Ok(v) => v.clone(),
+                    Err(_) => (vec![String::new()], Vec::new()),
                 };
-                if !extra_ok {
+                let refs_ok = ref_shas.is_empty()
+                    || (ref_shas[0] != String::new()
+                        && count_unreachable(&git_ctx, &ref_shas, &all_tips, &[], &[]) == Ok(0));
+                // HEAD reflog: for a linked worktree, commits still held by the SHARED reflogs (branch
+                // reflogs live in the common git dir and outlive the worktree) are not lost
+                let reflog_ok = if reflog_shas.is_empty() {
+                    true
+                } else if let Some(shared) = shared_git_ctx(&git_ctx) {
+                    count_unreachable(
+                        &shared,
+                        &reflog_shas,
+                        &all_tips,
+                        &["--single-worktree"],
+                        &["--reflog"],
+                    ) == Ok(0)
+                } else {
+                    count_unreachable(&git_ctx, &reflog_shas, &all_tips, &[], &[]) == Ok(0)
+                };
+                if !(refs_ok && reflog_ok) {
                     reasons.push("unpushed_tag_worktree_ref_or_reflog_commit".to_string());
                 }
 
@@ -722,19 +957,19 @@ fn validate_single_repo_at(
                     .ok()
                     .filter(|(ok, out)| *ok && !out.is_empty())
                     .map(|(_, out)| out);
-
-                    if let Some(rem) = remote_cfg {
-                        remote_heads
-                            .get(&rem)
-                            .is_some_and(|tips| is_pushed_to_tips(local_sha, tips))
-                    } else {
-                        remote_heads
-                            .values()
-                            .any(|tips| is_pushed_to_tips(local_sha, tips))
-                    }
+                    let tips: &[String] = match remote_cfg.as_ref() {
+                        Some(rem) => remote_tips.get(rem).map(Vec::as_slice).unwrap_or(&[]),
+                        None => &all_tips,
+                    };
+                    !tips.is_empty()
+                        && count_unreachable(&git_ctx, std::slice::from_ref(local_sha), tips, &[], &[])
+                            == Ok(0)
                 });
             }
         }
+    }
+    if proof_start.elapsed() >= REPO_PROOF_BUDGET {
+        reasons.push("proof_time_budget_exceeded".to_string());
     }
     if !all_branches_verified {
         reasons.push("remote_unverified_or_unpushed".to_string());

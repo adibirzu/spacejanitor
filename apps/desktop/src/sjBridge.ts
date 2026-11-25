@@ -7,6 +7,12 @@ import { promisify } from "node:util";
 const core = require("@spacejanitor/core");
 const execFileAsync = promisify(execFile);
 
+function rustTimeoutMs(method: string): number {
+  const fromEnv = Number(process.env.SPACEJANITOR_SJ_TIMEOUT_MS);
+  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
+  return method === "orphans" ? 60000 : 6000;
+}
+
 // Reports that may carry command lines / config values get a second redaction pass in the
 // main process, regardless of what the sidecar already did.
 const REDACTED_METHODS = new Set(["mcp-audit", "memory", "blockers", "summary"]);
@@ -150,14 +156,19 @@ export class SjBridge {
       const timer = setTimeout(() => {
         this.pending.delete(id);
         reject(new Error("sidecar_timeout"));
-      }, 6000);
+      }, rustTimeoutMs(method));
       this.pending.set(id, { method, resolve, reject, timer });
       const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
       this.proc.stdin.write(payload);
     });
   }
 
+  // "timed_out" | "error" when the Rust binary ran but could not finish: destructive-action proofs
+  // must not silently fall back to the weaker Node answer.
+  private lastRustFailure: string | null = null;
+
   private async callOneShot(method: string, params: Record<string, unknown>): Promise<Record<string, unknown> | null> {
+    this.lastRustFailure = null;
     if (!this.binaryPath) return null;
     const cmdMap: Record<string, string[]> = {
       doctor: ["doctor", "--json"],
@@ -172,17 +183,32 @@ export class SjBridge {
     if (!args) return null;
     try {
       const { stdout } = await execFileAsync(this.binaryPath, args, {
-        timeout: 6000,
+        timeout: rustTimeoutMs(method),
         maxBuffer: 4 * 1024 * 1024,
       });
       const parsed = JSON.parse(stdout);
       if (parsed && typeof parsed === "object" && parsed.schema) {
         return finalizeSidecarReport(method, parsed);
       }
-    } catch {
+    } catch (err) {
+      const e = err as NodeJS.ErrnoException & { killed?: boolean; signal?: string };
+      if (e && e.code !== "ENOENT") {
+        this.lastRustFailure = e.code === "ETIMEDOUT" || e.killed || e.signal ? "timed_out" : "error";
+      }
       return null;
     }
     return null;
+  }
+
+  private failClosed(method: string, report: Record<string, unknown>): Record<string, unknown> {
+    const failure = this.lastRustFailure;
+    const candidates = (report as { candidates?: Array<Record<string, unknown>> }).candidates;
+    if (method !== "orphans" || !failure || !Array.isArray(candidates)) return report;
+    return {
+      ...report,
+      rustProof: failure,
+      candidates: candidates.map((c) => ({ ...c, safeToPrune: false, proofStatus: `rust_proof_${failure}` })),
+    };
   }
 
   async invoke(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
@@ -206,7 +232,7 @@ export class SjBridge {
       case "blockers":
         return core.collectBlockers();
       case "orphans":
-        return core.collectOrphans(params);
+        return this.failClosed(method, await core.collectOrphans(params));
       case "trash":
         return core.collectTrash(params);
       case "mcp-audit":

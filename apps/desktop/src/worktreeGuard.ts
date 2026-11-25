@@ -11,6 +11,8 @@ export async function worktreePruneBlockReason(worktreePath: string): Promise<st
     const proof = await core.inspectWorktree(worktreePath);
     if (proof && proof.safeToPrune === true && proof.proofStatus === "verified") return null;
     if (!proof) return "worktree_proof_unavailable";
+    if (proof.configRisk) return String(proof.configRisk);
+    if (proof.locked) return "worktree_locked";
     if (proof.hasIgnored) return "worktree_has_ignored_files";
     if (proof.hasIndexFlags) return "worktree_index_flags_hide_changes";
     if (!proof.clean) return "worktree_not_clean";
@@ -22,4 +24,10 @@ export async function worktreePruneBlockReason(worktreePath: string): Promise<st
   } catch {
     return "worktree_proof_error";
   }
+}
+
+/** Remove a linked worktree via the main repository (explicit --git-dir/--work-tree, neutralised config). */
+export async function removeWorktreeSafely(worktreePath: string): Promise<void> {
+  const res = await core.removeLinkedWorktree(worktreePath);
+  if (!res.ok) throw new Error(res.error || "worktree_remove_failed");
 }
