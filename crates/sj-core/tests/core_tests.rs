@@ -3068,3 +3068,35 @@ fn protect_handles_windows_extended_prefixes_driveless_roots_and_unix_backslash_
         );
     }
 }
+
+#[test]
+fn protect_covers_claude_state_files_and_app_support_pure_string_windows_and_posix() {
+    use sj_core::is_protected_path;
+    let home = "/Users/tester";
+    for p in [
+        "/Users/tester/.claude.json",
+        "/Users/tester/.claude/skills/x/SKILL.md",
+        "/Users/tester/Library/Application Support/Claude",
+        "/Users/tester/Library/Application Support/Claude/config.json",
+        "/Users/tester/library/application support/claude/Local Storage",
+        "~/.claude.json",
+    ] {
+        assert!(is_protected_path(p, home, &[]).protected, "{p}");
+    }
+    // Windows-semantics mirror of the two historically red Windows CI cases:
+    // these are pure string checks and must hold on every host OS.
+    for p in [
+        "/",
+        "/etc/passwd",
+        "/tmp/foo/../../etc/passwd",
+        "C:\\Windows\\System32",
+    ] {
+        assert!(
+            is_protected_path(p, "/home/developer", &[]).protected,
+            "{p}"
+        );
+    }
+    assert!(
+        !is_protected_path("/Users/tester/Library/Application Support/Other", home, &[]).protected
+    );
+}
