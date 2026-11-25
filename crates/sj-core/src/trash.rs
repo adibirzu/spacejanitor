@@ -1,5 +1,5 @@
 use crate::protect::{
-    check_dir_descendants_safe, check_path_protection, is_quarantine_stage_name, is_symlink_path,
+    check_dir_descendants_safe, check_path_protection_anchored, is_quarantine_stage_name, is_symlink_path,
     ProtectionContext,
 };
 use crate::{SjError, SCHEMA_TRASH_V1};
@@ -136,7 +136,7 @@ pub fn discover_trash_at(
             continue;
         }
 
-        let verdict = check_path_protection(&path, ctx);
+        let verdict = check_path_protection_anchored(&path, ctx);
         let desc_verdict = if !is_sym && !verdict.protected && meta.is_dir() {
             Some(check_dir_descendants_safe(&path, ctx, 100_000))
         } else {

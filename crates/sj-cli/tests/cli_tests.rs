@@ -771,3 +771,61 @@ fn cli_protect_with_no_paths_is_a_usage_error() {
     let out = run_protect("/Users/alice", &["--json"]);
     assert_ne!(out.status.code(), Some(0));
 }
+
+#[test]
+fn cli_plan_excludes_keepass_vaults_and_key_material_in_trash() {
+    // cross-family review blocker 1: *.kdbx was planned (and deletable) once the JS denylist was gone.
+    // (Credential-NAMED files inside ~/.Trash, e.g. ~/.Trash/.netrc, were never covered by the JS
+    // denylist either: its home rules are anchored at ~/.netrc itself. The home-anchored cases are pinned
+    // by the shared protect vectors.)
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    for f in ["passwords.kdbx", "server.pem", "id_rsa_backup", "junk.bin"] {
+        fs::write(trash.join(f), "x").unwrap();
+    }
+    let out = Command::new(sj_bin())
+        .args(["plan", home.to_str().unwrap(), "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let planned: Vec<String> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(planned, vec!["junk.bin".to_string()], "only the harmless item may be planned: {v}");
+    assert_eq!(v["protected_exclusions"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn cli_protect_honours_custom_exact_dynamic_and_glob_rules() {
+    let out = run_protect(
+        "/Users/alice",
+        &[
+            "--json",
+            "--exact", "/data/keep",
+            "--dynamic", "/work/active",
+            "--glob", "*.secret-ish",
+            "--",
+            "/data/keep/sub",
+            "/work/active/src",
+            "/Users/alice/a.secret-ish",
+            "/data/other",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flags: Vec<bool> = v["results"].as_array().unwrap().iter().map(|r| r["protected"].as_bool().unwrap()).collect();
+    assert_eq!(flags, vec![true, true, true, false]);
+}

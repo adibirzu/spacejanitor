@@ -1,6 +1,6 @@
 use crate::orphans::capture_git_snapshot_identity_staged;
 use crate::plan::{PlanItem, TargetSnapshot};
-use crate::protect::{check_path_protection, is_symlink_path, ProtectionContext};
+use crate::protect::{check_path_protection_anchored, is_symlink_path, ProtectionContext};
 use crate::SjError;
 use sha2::{Digest, Sha256};
 use std::io::{Read, Seek, SeekFrom};
@@ -386,7 +386,7 @@ mod unix_impl {
                 )));
             }
             let child_full_path = dir_path.join(&name_str);
-            let prot = check_path_protection(&child_full_path, state.ctx);
+            let prot = check_path_protection_anchored(&child_full_path, state.ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -554,7 +554,7 @@ mod unix_impl {
 
         for sub in &manifest.dirs {
             let sub_path = dir_path.join(&sub.name_str);
-            let prot = check_path_protection(&sub_path, ctx);
+            let prot = check_path_protection_anchored(&sub_path, ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -592,7 +592,7 @@ mod unix_impl {
 
         for file in &manifest.files {
             let file_path = dir_path.join(&file.name_str);
-            let prot = check_path_protection(&file_path, ctx);
+            let prot = check_path_protection_anchored(&file_path, ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -696,7 +696,7 @@ mod unix_impl {
 
         for sub in &manifest.dirs {
             let sub_path = dir_path.join(&sub.name_str);
-            let prot = check_path_protection(&sub_path, ctx);
+            let prot = check_path_protection_anchored(&sub_path, ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -760,7 +760,7 @@ mod unix_impl {
 
         for file in &manifest.files {
             let file_path = dir_path.join(&file.name_str);
-            let prot = check_path_protection(&file_path, ctx);
+            let prot = check_path_protection_anchored(&file_path, ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -1188,7 +1188,7 @@ mod unix_impl {
         allowed_trash_roots: &[PathBuf],
     ) -> Result<(), SjError> {
         let target = Path::new(&item.path);
-        let prot = check_path_protection(target, ctx);
+        let prot = check_path_protection_anchored(target, ctx);
         if prot.protected {
             return Err(SjError::ProtectedPath(prot.reason));
         }
@@ -1220,7 +1220,7 @@ mod unix_impl {
                         target.display()
                     )));
                 };
-                let prot_canon = check_path_protection(&canon_target, ctx);
+                let prot_canon = check_path_protection_anchored(&canon_target, ctx);
                 if prot_canon.protected {
                     return Err(SjError::ProtectedPath(prot_canon.reason));
                 }
@@ -1250,7 +1250,7 @@ mod unix_impl {
             }
             "orphan_worktree" => {
                 let canon_target = std::fs::canonicalize(target)?;
-                let prot_canon = check_path_protection(&canon_target, ctx);
+                let prot_canon = check_path_protection_anchored(&canon_target, ctx);
                 if prot_canon.protected {
                     return Err(SjError::ProtectedPath(prot_canon.reason));
                 }
@@ -1506,7 +1506,7 @@ mod unix_impl {
                         "orphan directory identity changed during git checks".to_string(),
                     ));
                 }
-                let prot_after = check_path_protection(&canon_target, ctx);
+                let prot_after = check_path_protection_anchored(&canon_target, ctx);
                 if prot_after.protected {
                     return Err(SjError::ProtectedPath(prot_after.reason));
                 }
@@ -1727,7 +1727,7 @@ pub(crate) fn capture_snapshot_portable(
             target.display()
         )));
     }
-    let prot = check_path_protection(target, ctx);
+    let prot = check_path_protection_anchored(target, ctx);
     if prot.protected {
         return Err(SjError::ProtectedPath(prot.reason));
     }
@@ -1789,7 +1789,7 @@ pub(crate) fn capture_snapshot_portable(
                     entry_path.display()
                 )));
             }
-            let prot = check_path_protection(&entry_path, ctx);
+            let prot = check_path_protection_anchored(&entry_path, ctx);
             if prot.protected {
                 return Err(SjError::ProtectedPath(format!(
                     "protected_descendant:{}",
@@ -1890,7 +1890,7 @@ pub(crate) fn safe_remove_plan_item(
     ctx: &ProtectionContext,
     allowed_trash_roots: &[PathBuf],
 ) -> Result<(), SjError> {
-    let prot = check_path_protection(Path::new(&item.path), ctx);
+    let prot = check_path_protection_anchored(Path::new(&item.path), ctx);
     if prot.protected {
         return Err(SjError::ProtectedPath(prot.reason));
     }

@@ -475,13 +475,22 @@ fn protect_normalizes_traversal_case_relative_and_system_volumes_data() {
             "{sys_data} must stay protected"
         );
     }
+    let mac_ctx = ProtectionContext::new(PathBuf::from("/Users/developer"), vec![]);
     assert!(
         !check_path_protection(
+            Path::new("/System/Volumes/Data/Users/developer/.cache/npm"),
+            &mac_ctx
+        )
+        .protected,
+        "the current user's cache under /System/Volumes/Data should be allowed"
+    );
+    assert!(
+        check_path_protection(
             Path::new("/System/Volumes/Data/Users/developer/.cache/npm"),
             &ctx
         )
         .protected,
-        "user cache under /System/Volumes/Data should be allowed"
+        "another account's home under /System/Volumes/Data stays protected"
     );
 }
 
@@ -2197,28 +2206,164 @@ fn staged_orphan_execution_preserves_relative_git_remote_and_worktree_gitdir() {
 }
 
 
+fn shared_protect_vectors() -> serde_json::Value {
+    serde_json::from_str(include_str!("fixtures/protect_vectors.json")).unwrap()
+}
+
+fn vector_list(v: &serde_json::Value, key: &str) -> Vec<String> {
+    v[key]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|x| x.as_str().unwrap().to_string())
+        .collect()
+}
+
+/// Pure string tests: run on EVERY platform (including Windows) with no filesystem access.
 #[test]
 fn shared_protect_vectors_match_node_implementation() {
     use sj_core::protect::is_protected_path;
-    let raw = include_str!("fixtures/protect_vectors.json");
-    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let v = shared_protect_vectors();
     let home = v["home"].as_str().unwrap();
-    for p in v["protected"].as_array().unwrap() {
-        let p = p.as_str().unwrap();
+    for p in vector_list(&v, "protected") {
         assert!(
-            is_protected_path(p, home, &[]).protected,
-            "shared vector expected protected: {p}"
+            is_protected_path(&p, home, &[]).protected,
+            "shared vector expected protected: {p:?}"
         );
     }
-    for p in v["unprotected"].as_array().unwrap() {
-        let p = p.as_str().unwrap();
+    for p in vector_list(&v, "unprotected") {
+        let verdict = is_protected_path(&p, home, &[]);
         assert!(
-            !is_protected_path(p, home, &[]).protected,
-            "shared vector expected unprotected: {p}"
+            !verdict.protected,
+            "shared vector expected unprotected: {p:?} ({})",
+            verdict.reason
         );
     }
 }
 
+/// The same vectors through the filesystem-aware gate that `sj protect` and `sj plan --execute` use.
+#[test]
+fn shared_protect_vectors_hold_through_the_filesystem_aware_gate() {
+    let v = shared_protect_vectors();
+    let ctx = ProtectionContext::new(PathBuf::from(v["home"].as_str().unwrap()), vec![]);
+    for p in vector_list(&v, "protected") {
+        assert!(
+            check_path_protection(Path::new(&p), &ctx).protected,
+            "fs-aware gate expected protected: {p:?}"
+        );
+    }
+    for p in vector_list(&v, "unprotected") {
+        let verdict = check_path_protection(Path::new(&p), &ctx);
+        assert!(!verdict.protected, "fs-aware gate expected unprotected: {p:?} ({})", verdict.reason);
+    }
+}
+
+#[cfg(not(windows))]
+#[test]
+fn shared_posix_host_vectors_reject_drive_letter_strings() {
+    let v = shared_protect_vectors();
+    let ctx = ProtectionContext::new(PathBuf::from(v["home"].as_str().unwrap()), vec![]);
+    for p in vector_list(&v, "posix_host_protected") {
+        assert!(check_path_protection(Path::new(&p), &ctx).protected, "expected protected on POSIX: {p:?}");
+    }
+}
+
+#[test]
+fn custom_exact_dynamic_and_glob_rules_are_honoured() {
+    let home = PathBuf::from("/Users/alice");
+    let ctx = ProtectionContext::new(home.clone(), vec![PathBuf::from("/data/keep")])
+        .with_dynamic_paths(vec![PathBuf::from("/work/active")])
+        .with_glob_patterns(vec!["*.secret-ish".to_string(), "*/vault/*".to_string()]);
+    for p in [
+        "/data/keep",
+        "/data/keep/sub/file",
+        "/work/active/src",
+        "/Users/alice/a/b.secret-ish",
+        "/Users/alice/vault/x",
+    ] {
+        assert!(check_path_protection(Path::new(p), &ctx).protected, "expected protected: {p}");
+    }
+    assert!(!check_path_protection(Path::new("/data/other"), &ctx).protected);
+    assert!(!check_path_protection(Path::new("/work/archived"), &ctx).protected);
+}
+
+#[cfg(unix)]
+#[test]
+fn tilde_symlink_dotdot_is_judged_on_the_os_resolved_path() {
+    use std::os::unix::fs::symlink;
+    let base = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+    let home = base.join("home");
+    for d in [
+        "Library/Caches/Homebrew",
+        "Library/Caches/pnpm",
+        "Library/Keychains",
+        "Library/Mail",
+        "AppData/Local/npm-cache",
+        "AppData/Roaming",
+        ".cache/npm",
+        ".ssh/sub",
+    ] {
+        fs::create_dir_all(home.join(d)).unwrap();
+    }
+    symlink(home.join("Library/Keychains"), home.join("Library/Caches/Homebrew/to-keychains")).unwrap();
+    symlink(&home, home.join("Library/Caches/pnpm/to-home")).unwrap();
+    symlink(home.join(".ssh"), home.join("Library/Caches/pnpm/to-ssh")).unwrap();
+    symlink("/", home.join("Library/Caches/pnpm/to-root")).unwrap();
+    symlink(home.join("AppData/Roaming"), home.join("AppData/Local/npm-cache/to-roaming")).unwrap();
+    symlink(home.join(".ssh/sub"), home.join(".cache/npm/to-ssh-sub")).unwrap();
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+    for c in [
+        "~/Library/Caches/Homebrew/to-keychains/..",
+        "~/Library/Caches/Homebrew/to-keychains/../Mail",
+        "~/Library/Caches/pnpm/to-home/..",
+        "~/Library/Caches/pnpm/to-ssh/..",
+        "~/Library/Caches/pnpm/to-root/..",
+        "~/AppData/Local/npm-cache/to-roaming/..",
+        "~/.cache/npm/to-ssh-sub/..",
+    ] {
+        assert!(check_path_protection(Path::new(c), &ctx).protected, "tilde form must be protected: {c}");
+    }
+    assert!(!check_path_protection(Path::new("~/Library/Caches/Homebrew"), &ctx).protected);
+    assert!(!check_path_protection(Path::new("~/.cache/npm"), &ctx).protected);
+    // a symlink inside an allow-listed cache pointing at a sensitive dir stays denied
+    fs::remove_dir_all(home.join("Library/Caches/pnpm")).unwrap();
+    symlink(home.join("Library/Keychains"), home.join("Library/Caches/pnpm")).unwrap();
+    assert!(check_path_protection(&home.join("Library/Caches/pnpm/x"), &ctx).protected);
+}
+
+#[cfg(unix)]
+#[test]
+fn dangling_and_looping_symlinks_and_control_characters_fail_closed() {
+    use std::os::unix::fs::symlink;
+    let base = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+    let home = base.join("home");
+    fs::create_dir_all(home.join(".cache")).unwrap();
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+    let h = home.to_string_lossy().to_string();
+    assert!(check_path_protection(Path::new(&format!("{h}/.cache/a\u{0}b")), &ctx).protected);
+    assert!(check_path_protection(Path::new(&format!("{h}/.cache/a\nb")), &ctx).protected);
+    symlink(base.join("nowhere"), home.join(".cache/dangling")).unwrap();
+    symlink(home.join(".cache/loop2"), home.join(".cache/loop1")).unwrap();
+    symlink(home.join(".cache/loop1"), home.join(".cache/loop2")).unwrap();
+    assert!(check_path_protection(&home.join(".cache/dangling"), &ctx).protected);
+    assert!(check_path_protection(&home.join(".cache/dangling/x"), &ctx).protected);
+    assert!(check_path_protection(&home.join(".cache/loop1"), &ctx).protected);
+    // a dangling symlink among the ROOTS (~/.npmrc) must not block unrelated cleanups
+    symlink(base.join("nowhere2"), home.join(".npmrc")).unwrap();
+    fs::create_dir_all(home.join(".cache/vite")).unwrap();
+    assert!(!check_path_protection(&home.join(".cache/vite"), &ctx).protected);
+}
+
+#[cfg(unix)]
+#[test]
+fn relative_paths_are_rejected_not_resolved_against_cwd() {
+    let ctx = ProtectionContext::new(PathBuf::from("/Users/alice"), vec![]);
+    for p in ["relative/path", "./x", "../x", "~bob/Library/Keychains/login.keychain-db"] {
+        let v = check_path_protection(Path::new(p), &ctx);
+        assert!(v.protected, "{p}");
+        assert!(v.reason.contains("relative"), "{p}: {}", v.reason);
+    }
+}
 
 #[test]
 fn shared_descendant_vectors_match_node_implementation() {

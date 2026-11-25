@@ -105,6 +105,15 @@ enum Commands {
         /// Paths to evaluate
         #[arg(required = true, num_args = 1.., last = true)]
         paths: Vec<PathBuf>,
+        /// Extra user-protected path (the path and everything below it); repeatable
+        #[arg(long = "exact")]
+        exact: Vec<PathBuf>,
+        /// Extra runtime-protected path (for example an active worktree); repeatable
+        #[arg(long = "dynamic")]
+        dynamic: Vec<PathBuf>,
+        /// Extra case-insensitive wildcard pattern (`*`, `?`) matched on the path and its last segment; repeatable
+        #[arg(long = "glob")]
+        glob: Vec<String>,
         /// Also walk each directory and block when any descendant is protected, a symlink or unreadable
         #[arg(long, default_value_t = false)]
         descendants: bool,
@@ -211,15 +220,23 @@ fn run() -> Result<(), CliError> {
         }
         Commands::Protect {
             paths,
+            exact,
+            dynamic,
+            glob,
             descendants,
             max_entries,
             json,
         } => {
+            let mut pctx = ctx.clone();
+            pctx.exact_paths.extend(exact);
+            pctx.dynamic_paths = dynamic;
+            pctx.glob_patterns = glob;
+            let ctx = &pctx;
             let mut results = Vec::with_capacity(paths.len());
             for p in &paths {
-                let mut verdict = check_path_protection(p, &ctx);
+                let mut verdict = check_path_protection(p, ctx);
                 if !verdict.protected && descendants {
-                    verdict = check_dir_descendants_safe(p, &ctx, max_entries);
+                    verdict = check_dir_descendants_safe(p, ctx, max_entries);
                 }
                 results.push(serde_json::json!({
                     "path": p.to_string_lossy(),
