@@ -207,11 +207,15 @@ function gitSafeEnv() {
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",
     // isolated global/system config and a non-interactive ssh: a proof can neither be steered by, nor hang on, ambient config
-    GIT_CONFIG_GLOBAL: os.devNull,
-    GIT_CONFIG_SYSTEM: os.devNull,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
   };
+  // Git for Windows does not reliably accept a device path as a config file, so global-config
+  // isolation is POSIX-only; the repo-config gate (executableConfigRisk) is what protects Windows.
+  if (process.platform !== "win32") {
+    env.GIT_CONFIG_GLOBAL = os.devNull;
+    env.GIT_CONFIG_SYSTEM = os.devNull;
+  }
   for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
     delete env[k];
   }
