@@ -131,7 +131,9 @@ test("R10-B34: a hanging Rust sj makes the orphan report fail closed (sj_timeout
   if (process.platform === "win32") return;
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-bridge-timeout-")));
   const prev = process.env.SPACEJANITOR_SJ_TIMEOUT_MS;
+  const prevNoSj = process.env.SPACEJANITOR_NO_SJ;
   try {
+    delete process.env.SPACEJANITOR_NO_SJ; // this case pins a hanging binary explicitly
     const fake = path.join(base, "sj");
     fs.writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
     process.env.SPACEJANITOR_SJ_TIMEOUT_MS = "300";
@@ -143,6 +145,7 @@ test("R10-B34: a hanging Rust sj makes the orphan report fail closed (sj_timeout
   } finally {
     if (prev === undefined) delete process.env.SPACEJANITOR_SJ_TIMEOUT_MS;
     else process.env.SPACEJANITOR_SJ_TIMEOUT_MS = prev;
+    if (prevNoSj !== undefined) process.env.SPACEJANITOR_NO_SJ = prevNoSj;
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
