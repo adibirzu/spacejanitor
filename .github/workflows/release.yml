@@ -45,9 +45,31 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           /tmp/gitleaks git --no-banner -v
 
+  verify-tests:
+    name: Test gate (Node, Rust, Desktop)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install workspace dependencies
+        run: npm ci
+      - name: Node tests
+        run: npm test
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Desktop typecheck
+        run: npm run desktop:typecheck
+      - name: Desktop tests
+        run: npm run desktop:test
+
   rust-cli-matrix:
     name: Build sj CLI (${{ matrix.artifact }})
-    needs: hygiene-and-secrets
+    needs: [hygiene-and-secrets, verify-tests]
     strategy:
       fail-fast: false
       matrix:

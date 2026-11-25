@@ -12,6 +12,7 @@ export async function worktreePruneBlockReason(worktreePath: string): Promise<st
     if (proof && proof.safeToPrune === true && proof.proofStatus === "verified") return null;
     if (!proof) return "worktree_proof_unavailable";
     if (proof.hasIgnored) return "worktree_has_ignored_files";
+    if (proof.hasIndexFlags) return "worktree_index_flags_hide_changes";
     if (!proof.clean) return "worktree_not_clean";
     if (proof.hasStashes) return "worktree_has_stashes";
     if (proof.hasUnpushed) return "worktree_has_unpushed_commits";

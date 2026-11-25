@@ -4,7 +4,7 @@ use sj_core::{
         build_remediation_plan, execute_plan_item, execute_plan_item_with_roots, ExecutionGate,
         PlanOptions,
     },
-    protect::{check_path_protection, ProtectionContext},
+    protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions, ScanStatus, ScanThresholds},
     trash::discover_trash_at,
     SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
@@ -2215,6 +2215,92 @@ fn shared_protect_vectors_match_node_implementation() {
         assert!(
             !is_protected_path(p, home, &[]).protected,
             "shared vector expected unprotected: {p}"
+        );
+    }
+}
+
+
+#[test]
+fn shared_descendant_vectors_match_node_implementation() {
+    let raw = include_str!("fixtures/descendant_vectors.json");
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    for case in v["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        for entry in case["entries"].as_array().unwrap() {
+            let e = entry.as_str().unwrap();
+            if let Some(link) = e.strip_prefix("link:") {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink("/", project.join(link)).unwrap();
+            } else if let Some(dir) = e.strip_suffix('/') {
+                fs::create_dir_all(project.join(dir)).unwrap();
+            } else {
+                let f = project.join(e);
+                fs::create_dir_all(f.parent().unwrap()).unwrap();
+                fs::write(f, "x").unwrap();
+            }
+        }
+        let ctx = ProtectionContext::new(home, vec![]);
+        let verdict = check_dir_descendants_safe(&project, &ctx, 100_000);
+        let expect = case["protected"].as_bool().unwrap();
+        #[cfg(not(unix))]
+        if name.contains("symlink") {
+            continue;
+        }
+        assert_eq!(verdict.protected, expect, "descendant vector '{name}': {verdict:?}");
+    }
+}
+
+#[test]
+fn orphan_blocks_assume_unchanged_and_skip_worktree_entries() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    for (name, flag) in [
+        ("assume_repo", "--assume-unchanged"),
+        ("skip_repo", "--skip-worktree"),
+        ("control_repo", ""),
+    ] {
+        let bare_remote = remotes_dir.join(format!("{name}.git"));
+        fs::create_dir_all(&bare_remote).unwrap();
+        run_git(&bare_remote, &["init", "--bare"]);
+        let repo = workspace_dir.join(name);
+        run_git(&workspace_dir, &["clone", bare_remote.to_str().unwrap(), name]);
+        let file = format!("{name}.txt");
+        fs::write(repo.join(&file), "original\n").unwrap();
+        run_git(&repo, &["add", &file]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]);
+        if !flag.is_empty() {
+            run_git(&repo, &["update-index", flag, &file]);
+            fs::write(repo.join(&file), "UNCOMMITTED EDIT\n").unwrap();
+        }
+    }
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report.safe_to_prune.iter().any(|c| c.path.ends_with("control_repo")),
+        "control repo (clean, pushed, no flags) must stay safe: {:?}",
+        report.blocked
+    );
+    for name in ["assume_repo", "skip_repo"] {
+        assert!(
+            !report.safe_to_prune.iter().any(|c| c.path.ends_with(name)),
+            "{name} hides edits behind index flags and must not be safe_to_prune"
+        );
+        assert!(
+            report.blocked.iter().any(|b| b.path.ends_with(name)
+                && b.reasons.iter().any(|r| r == "index_flags_hide_changes")),
+            "{name} must be blocked with index_flags_hide_changes: {:?}",
+            report.blocked
         );
     }
 }

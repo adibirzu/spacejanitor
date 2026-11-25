@@ -509,6 +509,21 @@ fn validate_single_repo_at(
         }
     }
 
+    // Index flags (assume-unchanged = lowercase tag, skip-worktree = 'S') keep `git status` clean while
+    // the file holds uncommitted edits, so any flagged entry (or a failed listing) blocks the prune.
+    let (flags_ok, flags_out) = run_git_raw_ctx(&git_ctx, ["ls-files", "-v", "-z"])
+        .unwrap_or((false, String::new()));
+    if !flags_ok
+        || flags_out.split('\0').any(|e| {
+            e.chars()
+                .next()
+                .map(|c| c.is_ascii_lowercase() || c == 'S')
+                .unwrap_or(false)
+        })
+    {
+        reasons.push("index_flags_hide_changes".to_string());
+    }
+
     let (remote_ok, remote_out) =
         run_git_ctx(&git_ctx, ["remote"]).unwrap_or((false, String::new()));
     let remotes: Vec<String> = if remote_ok {

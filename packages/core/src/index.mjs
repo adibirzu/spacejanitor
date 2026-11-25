@@ -13,6 +13,7 @@ import {
   normalizeReportEnvelope,
 } from "./telemetry.mjs";
 import {
+  findProtectedDescendant as _findProtectedDescendant,
   createRemediationPlan as _createRemediationPlan,
   verifyRemediationGate as _verifyRemediationGate,
 } from "./remediation.mjs";
@@ -22,13 +23,13 @@ import {
   adviseWithLocalSlm as _adviseWithLocalSlm,
 } from "./slm.mjs";
 import { formatToon } from "./toon.mjs";
-import { redactSecrets } from "./redact.mjs";
+import { redactSecrets, redactArgv } from "./redact.mjs";
 import { DEFAULT_PROTECTED_PATTERNS, isProtectedPath } from "./protect.mjs";
 
 export const SCHEMA_VERSIONS = SCHEMA_VERSIONS_EXT;
 
 export { DEFAULT_PROTECTED_PATTERNS, isProtectedPath };
-export { redactSecrets };
+export { redactSecrets, redactArgv };
 
 export {
   inspectWorktree,
@@ -75,4 +76,8 @@ export function redactSlmPayload(value) {
 
 export function adviseWithLocalSlm(options = {}) {
   return _adviseWithLocalSlm({ ...options, redactFn: redactSecrets, isProtectedFn: isProtectedPath });
+}
+
+export function findProtectedDescendant(dirPath, options = {}) {
+  return _findProtectedDescendant(dirPath, { ...options, isProtectedFn: isProtectedPath });
 }

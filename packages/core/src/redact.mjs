@@ -72,3 +72,40 @@ export function redactSecrets(input) {
     .replace(M.assignRe, "$1$2<REDACTED>")
     .replace(M.vendorRe, "<REDACTED>");
 }
+
+const CRED_FLAG_RE = new RegExp(`^(?:-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS})|-t|-p)$`, "i");
+const CRED_FLAG_EQ_RE = new RegExp(`^(-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS}))=[\\s\\S]*$`, "i");
+const CRED_ASSIGN_ARG_RE = new RegExp(`^([A-Za-z0-9_.-]{0,64}(?:${NAME_WORDS})s?)=[\\s\\S]*$`, "i");
+
+/**
+ * Redact an argv array while keeping argument boundaries: the whole argument that holds a credential
+ * value is replaced, so a value containing spaces ("--password", "word1 word2") cannot leak its
+ * trailing words the way it does after the arguments are joined into one string.
+ */
+export function redactArgv(args) {
+  const out = [];
+  const list = Array.isArray(args) ? args.map(String) : [];
+  for (let i = 0; i < list.length; i++) {
+    const a = list[i];
+    if (CRED_FLAG_RE.test(a)) {
+      out.push(a);
+      if (i + 1 < list.length && !list[i + 1].startsWith("--")) {
+        out.push("<REDACTED>");
+        i++;
+      }
+      continue;
+    }
+    const eq = a.match(CRED_FLAG_EQ_RE);
+    if (eq) {
+      out.push(`${eq[1]}=<REDACTED>`);
+      continue;
+    }
+    const asg = !a.startsWith("-") && a.match(CRED_ASSIGN_ARG_RE);
+    if (asg) {
+      out.push(`${asg[1]}=<REDACTED>`);
+      continue;
+    }
+    out.push(redactSecrets(a));
+  }
+  return out;
+}

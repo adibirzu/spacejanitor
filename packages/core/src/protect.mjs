@@ -242,6 +242,19 @@ export function isProtectedPath(candidatePath, options = {}) {
   }
 }
 
+function evaluateDescendantName(raw) {
+  const lexical = raw.replace(/\\/g, "/").replace(/\/+$/, "");
+  const base = path.posix.basename(lexical);
+  const allGlobs = DEFAULT_PROTECTED_PATTERNS.globPatterns;
+  for (const pat of allGlobs) {
+    const re = globToRegExp(pat);
+    if (re.test(lexical) || re.test(base)) {
+      return { protected: true, reason: `protected_glob:${pat}` };
+    }
+  }
+  return { protected: false, reason: "" };
+}
+
 function evaluateProtection(candidatePath, options = {}) {
   const raw = String(candidatePath || "").trim();
   if (/[\u0000-\u001f\u007f]/.test(raw)) {
@@ -254,6 +267,12 @@ function evaluateProtection(candidatePath, options = {}) {
   const expanded = expandHome(raw, homeDir);
   if (!isAbsoluteInput(expanded)) {
     return { protected: true, reason: "relative_path_rejected" };
+  }
+
+  if (options.descendantOfJudged) {
+    // Fast path for entries below a candidate that was already judged in full: only name-based rules
+    // (credential directories, key/env/VM files, stage dirs) can newly apply to a descendant.
+    return evaluateDescendantName(raw);
   }
 
   // A drive-letter path means nothing to a POSIX kernel (it is relative to the cwd), so it cannot be

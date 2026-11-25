@@ -568,3 +568,88 @@ test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("R7-B23: index flags (assume-unchanged, skip-worktree) that can hide edits make a worktree NOT safe", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r7b23-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    fs.writeFileSync(path.join(repo, "b.txt"), "b");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", `b-${name}`, p);
+      git(p, "push", "-u", "origin", `b-${name}`);
+      return p;
+    };
+    const control = mk("control");
+    const assume = mk("assume");
+    const skip = mk("skip");
+    assert.equal((await inspectWorktree(control)).safeToPrune, true);
+    git(assume, "update-index", "--assume-unchanged", "a.txt");
+    fs.writeFileSync(path.join(assume, "a.txt"), "UNCOMMITTED EDIT");
+    git(skip, "update-index", "--skip-worktree", "b.txt");
+    fs.writeFileSync(path.join(skip, "b.txt"), "UNCOMMITTED EDIT");
+    // git status stays clean in both - that is the whole problem
+    assert.equal(git(assume, "status", "--porcelain").trim(), "");
+    for (const [name, p] of Object.entries({ assume, skip })) {
+      const proof = await inspectWorktree(p);
+      assert.equal(proof.safeToPrune, false, `${name} must not be safe`);
+      assert.equal(proof.hasIndexFlags, true, `${name} must report hasIndexFlags`);
+    }
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R7-B24: credential values containing spaces never reach reports, the IPC summary or the SLM payload", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r7-"));
+  const W = ["spacedWordOne", "spacedWordTwo"];
+  const secretsIn = (text) => W.filter((w) => text.includes(w));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          sep: { command: "x", args: ["--password", W.join(" ")] },
+          eq: { command: "x", args: [`--api-key=${W.join(" ")}`] },
+          tok: { command: "x", args: ["--access_token", W.join(" "), "--verbose"] },
+          dash: { command: "x", args: ["-p", W.join(" ")] },
+          envarg: { command: "docker", args: ["run", "-e", `DB_PASSWORD=${W.join(" ")}`, "img"] },
+          quoted: { command: "x", args: [`--secret="${W.join(" ")}"`] },
+        },
+      })
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    assert.deepEqual(secretsIn(JSON.stringify(audit)), [], "report leak");
+    assert.ok(JSON.stringify(audit).includes("--verbose"), "unrelated args preserved");
+    for (const srv of audit.servers) assert.equal(srv.hasSecretRisk, true, srv.name);
+
+    const summary = await collectSummary({ configDirs: [tmpDir], targetPath: tmpDir });
+    assert.deepEqual(secretsIn(JSON.stringify(summary)), [], "IPC summary leak");
+    assert.equal(summary.mcpAudit.secretRiskCount, 6);
+
+    let body = "";
+    await adviseWithLocalSlm({
+      enabled: true,
+      url: "http://127.0.0.1:11434/v1/chat/completions",
+      summary,
+      candidates: [],
+      fetchImpl: async (_u, init) => {
+        body = String(init.body);
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "{}" } }] }) };
+      },
+    });
+    assert.ok(body.length > 0, "SLM request was made");
+    assert.deepEqual(secretsIn(body), [], "SLM payload leak");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

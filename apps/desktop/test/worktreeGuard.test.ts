@@ -52,3 +52,37 @@ test("R6-B21: desktop prune guard blocks ignored, untracked and unpushed worktre
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("R7-B23: guard blocks a worktree whose edits hide behind assume-unchanged / skip-worktree", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-guard-flags-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name: string) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", `b-${name}`, p);
+      git(p, "push", "-u", "origin", `b-${name}`);
+      return p;
+    };
+    const control = mk("control");
+    const assume = mk("assume");
+    const skip = mk("skip");
+    assert.equal(await worktreePruneBlockReason(control), null);
+    git(assume, "update-index", "--assume-unchanged", "a.txt");
+    fs.writeFileSync(path.join(assume, "a.txt"), "EDIT");
+    git(skip, "update-index", "--skip-worktree", "a.txt");
+    fs.writeFileSync(path.join(skip, "a.txt"), "EDIT");
+    assert.equal(await worktreePruneBlockReason(assume), "worktree_index_flags_hide_changes");
+    assert.equal(await worktreePruneBlockReason(skip), "worktree_index_flags_hide_changes");
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

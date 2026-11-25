@@ -1,5 +1,5 @@
 import { isProtectedPath } from "./protect.mjs";
-import { redactSecrets } from "./redact.mjs";
+import { redactSecrets, redactArgv } from "./redact.mjs";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -176,9 +176,9 @@ export async function collectTrash({ homeDir = os.homedir() } = {}) {
   };
 }
 
-async function safeExecResult(cmd, args, cwd) {
+async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000 } = {}) {
   try {
-    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout: 3000, maxBuffer: 1024 * 1024 });
+    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout, maxBuffer });
     return { ok: true, stdout: stdout.trim() };
   } catch {
     return { ok: false, stdout: "" };
@@ -209,13 +209,14 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
     hasUnpushed: true,
     hasIgnored: false,
     hasStashes: false,
+    hasIndexFlags: false,
     proofStatus: "unverified",
     safeToPrune: false,
     ...extra,
   });
   if (!wtPath || !fs.existsSync(wtPath)) return unverified();
 
-  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes] = await Promise.all([
+  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes, flagsRes] = await Promise.all([
     safeExecResult("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"], wtPath),
     safeExecResult("git", ["remote"], wtPath),
     safeExecResult("git", ["rev-list", "--branches", "--not", "--remotes", "--count"], wtPath),
@@ -223,8 +224,10 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
     safeExecResult("git", ["stash", "list"], wtPath),
     safeExecResult("git", ["symbolic-ref", "-q", "HEAD"], wtPath),
     safeExecResult("git", ["rev-parse", "--verify", "-q", "HEAD"], wtPath),
+    // lowercase tags = assume-unchanged, "S" = skip-worktree: git status stays clean while edits exist
+    safeExecResult("git", ["ls-files", "-v", "-z"], wtPath, { maxBuffer: 64 * 1024 * 1024, timeout: 15000 }),
   ]);
-  if (![statusRes, remotesRes, branchesRes, headRes, stashRes].every((r) => r.ok)) {
+  if (![statusRes, remotesRes, branchesRes, headRes, stashRes, flagsRes].every((r) => r.ok)) {
     return unverified({ hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false });
   }
   const lines = statusRes.stdout.split(/\r?\n/).filter(Boolean);
@@ -232,6 +235,7 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
   const hasDirty = lines.some((l) => !l.startsWith("!!"));
   const hasRemote = remotesRes.stdout.length > 0;
   const hasStashes = stashRes.stdout.length > 0;
+  const hasIndexFlags = flagsRes.stdout.split("\0").some((e) => /^[a-zS]/.test(e));
   const branchCount = Number(branchesRes.stdout);
   const headCount = Number(headRes.stdout);
   const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
@@ -240,15 +244,16 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
   const proofStatus = countsValid ? "verified" : "unverified";
   return {
     ...base,
-    clean: !hasDirty && !hasIgnored,
+    clean: !hasDirty && !hasIgnored && !hasIndexFlags,
     hasRemote,
     hasUnpushed,
     hasIgnored,
     hasStashes,
+    hasIndexFlags,
     detachedHead: !onBranch,
     proofStatus,
     safeToPrune:
-      !hasDirty && !hasIgnored && hasRemote && !hasUnpushed && !hasStashes && onBranch && proofStatus === "verified",
+      !hasDirty && !hasIgnored && !hasIndexFlags && hasRemote && !hasUnpushed && !hasStashes && onBranch && proofStatus === "verified",
   };
 }
 
@@ -555,8 +560,12 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
     const combinedRaw = [cfg?.url ? String(cfg.url) : "", ...argsList]
       .filter(Boolean)
       .join(" ");
+    // Redact per ARGUMENT before joining so a credential value with spaces cannot leak its tail.
+    const boundarySafe = [cfg?.url ? String(cfg.url) : "", ...redactArgv(argsList)]
+      .filter(Boolean)
+      .join(" ");
     const safeName = redactFn(String(name));
-    const stripped = stripUrlPaths(redactFn(combinedRaw));
+    const stripped = stripUrlPaths(redactFn(boundarySafe));
     const redactedArgs = stripped.text;
     const rawCommand = String(cfg?.command || "");
     const redactedCommand = redactFn(rawCommand);
