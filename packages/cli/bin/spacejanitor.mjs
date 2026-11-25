@@ -22,6 +22,7 @@ import {
   formatToon,
   normalizeReportEnvelope,
   runSjSync,
+  buildSjPlanArgs,
 } from "../../core/src/index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -158,7 +159,7 @@ async function main(argv) {
       return 1;
     }
     try {
-      report = runSjSync(["plan", "--json", ...(includeOrphans ? ["--include-orphans"] : []), targetPath], { timeoutMs: 60000 });
+      report = runSjSync(buildSjPlanArgs({ root: targetPath, includeTrash: true, includeOrphans }), { timeoutMs: 60000 });
       if (report.schema !== "spacejanitor.proposal.v1") throw Object.assign(new Error("sj_unparseable"), { reason: "sj_unparseable" });
     } catch (err) {
       const reason = (err && err.reason) || "sj_unavailable";

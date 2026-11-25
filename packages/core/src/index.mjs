@@ -20,6 +20,7 @@ import {
 } from "./slm.mjs";
 import { formatToon } from "./toon.mjs";
 import { redactSecrets, redactArgv } from "./redact.mjs";
+import { buildSjPlanArgs } from "./sjPlanArgs.mjs";
 import { findProtectedDescendant, isProtectedPath, protectPaths, protectRuleArgs } from "./protect.mjs";
 import {
   SjGateError,
@@ -33,7 +34,7 @@ import {
 
 export const SCHEMA_VERSIONS = SCHEMA_VERSIONS_EXT;
 
-export { findProtectedDescendant, isProtectedPath, protectPaths, protectRuleArgs };
+export { findProtectedDescendant, isProtectedPath, protectPaths, protectRuleArgs, buildSjPlanArgs };
 export { SjGateError, activeSjBinary, configureSjBinary, resolveSjBinary, runSj, runSjSync, sjBinaryProblem };
 export { redactSecrets, redactArgv };
 

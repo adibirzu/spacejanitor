@@ -202,3 +202,30 @@ test("trust: the desktop resolver rejects symlinked, world-writable and director
     fs.rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test("trust: an explicit binaryPath is vetted too, so read-only spawns never run a world-writable or symlinked sj", async () => {
+  if (process.platform === "win32") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-bridge-explicit-"));
+  try {
+    const marker = path.join(dir, "RAN");
+    const body = `#!/bin/sh\necho ran >> "${marker}"\necho '{"schema":"spacejanitor.doctor.v1"}'\n`;
+    const ww = path.join(dir, "ww-sj");
+    fs.writeFileSync(ww, body);
+    fs.chmodSync(ww, 0o777);
+    const real = path.join(dir, "real-sj");
+    fs.writeFileSync(real, body, { mode: 0o755 });
+    const link = path.join(dir, "link-sj");
+    fs.symlinkSync(real, link);
+    for (const p of [ww, link]) {
+      const bridge = new SjBridge({ binaryPath: p });
+      const doc = await bridge.invoke("doctor");
+      bridge.dispose();
+      assert.equal(doc.source, "node-fallback", p);
+      assert.equal(fs.existsSync(marker), false, `${p} must never be executed`);
+    }
+  } finally {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    require("@spacejanitor/core").configureSjBinary(undefined);
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

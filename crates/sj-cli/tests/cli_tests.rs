@@ -905,3 +905,132 @@ fn cli_selection_token_for_one_item_cannot_execute_another_selection() {
     assert!(!a.exists());
     assert!(b.exists());
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
+    use std::os::unix::fs::symlink;
+    let v: serde_json::Value = serde_json::from_str(include_str!("../../sj-core/tests/fixtures/protect_vectors.json")).unwrap();
+    for case in v["fs_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+        let abs = |rel: &str| -> std::path::PathBuf {
+            if Path::new(rel).is_absolute() { Path::new(rel).to_path_buf() } else { root.join(rel) }
+        };
+        for step in case["setup"].as_array().unwrap() {
+            if let Some(d) = step["dir"].as_str() {
+                fs::create_dir_all(abs(d)).unwrap();
+            } else if let Some(l) = step["link"].as_str() {
+                fs::create_dir_all(abs(l).parent().unwrap()).unwrap();
+                symlink(abs(step["target"].as_str().unwrap()), abs(l)).unwrap();
+            }
+        }
+        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(|c| abs(c)).unwrap_or_else(|| root.clone());
+        fs::create_dir_all(&cwd).unwrap();
+        let home = abs(case["home"].as_str().unwrap());
+        let list = |k: &str| -> Vec<String> {
+            case.get("options")
+                .and_then(|o| o.get(k))
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().map(|y| y.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        let check = |p: &str| -> bool {
+            let mut cmd = Command::new(sj_bin());
+            cmd.current_dir(&cwd).env("HOME", &home).env("USERPROFILE", &home).args(["protect", "--json"]);
+            for e in list("exact") { cmd.arg(format!("--exact={e}")); }
+            for e in list("dynamic") { cmd.arg(format!("--dynamic={e}")); }
+            for e in list("glob") { cmd.arg(format!("--glob={e}")); }
+            cmd.arg("--").arg(abs(p));
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            j["results"][0]["protected"].as_bool().unwrap()
+        };
+        for p in case["protected"].as_array().unwrap() {
+            assert!(check(p.as_str().unwrap()), "{name}: expected protected: {p}");
+        }
+        for p in case["unprotected"].as_array().unwrap() {
+            assert!(!check(p.as_str().unwrap()), "{name}: expected unprotected: {p}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_rules() {
+    // cross-family review R3 blocker 1: both shapes were planned (and deletable) at 8f61e92
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(trash.join("other_dir")).unwrap();
+    for keep in ["keep_via_sym_dotdot", "keep_via_rel_exact", "free.bin"] {
+        if keep.ends_with(".bin") {
+            fs::write(trash.join(keep), "x").unwrap();
+        } else {
+            fs::create_dir_all(trash.join(keep)).unwrap();
+            fs::write(trash.join(keep).join("precious.txt"), "p").unwrap();
+        }
+    }
+    symlink(trash.join("other_dir"), home.join("to_trash_other")).unwrap();
+    let rel_trash = trash.strip_prefix(&home).unwrap().to_string_lossy().into_owned();
+    let out = Command::new(sj_bin())
+        .current_dir(&home)
+        .args(["plan", home.to_str().unwrap(), "--json"])
+        .arg("--exact=~/to_trash_other/../keep_via_sym_dotdot")
+        .arg(format!("--exact=./{rel_trash}/keep_via_rel_exact"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let planned: Vec<String> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert!(!planned.contains(&"keep_via_sym_dotdot".to_string()), "{planned:?}");
+    assert!(!planned.contains(&"keep_via_rel_exact".to_string()), "{planned:?}");
+    assert!(planned.contains(&"free.bin".to_string()), "{planned:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it() {
+    // cross-family review R3 blocker 2: callers must pass --include-trash next to --include-orphans
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("old_log.txt"), "x").unwrap();
+    let planned = |extra: &[&str]| -> usize {
+        let mut args = vec!["plan", home.to_str().unwrap(), "--json"];
+        args.extend_from_slice(extra);
+        let out = Command::new(sj_bin())
+            .args(&args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["items"].as_array().unwrap().len()
+    };
+    assert_eq!(planned(&[]), 1, "default: trash only");
+    assert_eq!(planned(&["--include-trash"]), 1);
+    assert_eq!(planned(&["--include-orphans"]), 0, "documented sj semantics: orphans INSTEAD of trash");
+    assert_eq!(planned(&["--include-trash", "--include-orphans"]), 1, "trash plus orphans keeps the trash item");
+}

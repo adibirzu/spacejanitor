@@ -1,5 +1,5 @@
 {
-  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep. Every rule of the former JS denylist (main a66538f packages/core/src/protect.mjs) has a vector here; the Rust gate is the only implementation. Sections: protected/unprotected run as pure string tests on every platform; posix_host_protected needs POSIX path semantics (drive letters are meaningless there). Note: there was no config/protected.json on main. fs_cases (Unix only) are built under a scratch root: paths are relative to it, 'home' is the synthetic home, link entries are symlinks (target relative to the root unless absolute), options mirror --exact/--dynamic/--glob; a candidate listed under protected must be judged protected, under unprotected must not.",
+  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep. Every rule of the former JS denylist (main a66538f packages/core/src/protect.mjs) has a vector here; the Rust gate is the only implementation. Sections: protected/unprotected run as pure string tests on every platform; posix_host_protected needs POSIX path semantics (drive letters are meaningless there). Note: there was no config/protected.json on main. fs_cases (Unix only) are built under a scratch root: paths are relative to it, 'home' is the synthetic home, link entries are symlinks (target relative to the root unless absolute), options mirror --exact/--dynamic/--glob; a candidate listed under protected must be judged protected, under unprotected must not. A fs_case with 'cwd' (relative to the scratch root) runs with that working directory: relative custom rules are anchored to the cwd exactly like main's path.resolve did, then resolved in OS order (symlink target first, then ..); the Rust core harness skips cwd cases (a process cwd is not thread safe) and crates/sj-cli/tests/cli_tests.rs runs them through the binary.",
   "home": "/Users/alice",
   "protected": [
     "/",
@@ -340,6 +340,152 @@
         "home/.ssh/id_x"
       ],
       "unprotected": []
+    },
+    {
+      "name": "relative --exact rule is anchored to the cwd",
+      "home": "home",
+      "cwd": "ws",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ws/keep"
+        },
+        {
+          "dir": "ws/other"
+        }
+      ],
+      "options": {
+        "exact": [
+          "./keep"
+        ]
+      },
+      "protected": [
+        "ws/keep/precious.txt",
+        "ws/keep"
+      ],
+      "unprotected": [
+        "ws/other/x"
+      ]
+    },
+    {
+      "name": "relative --dynamic rule given through a symlink",
+      "home": "home",
+      "cwd": "ws",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/real"
+        },
+        {
+          "dir": "ws"
+        },
+        {
+          "link": "ws/link",
+          "target": "ext/real"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "link"
+        ]
+      },
+      "protected": [
+        "ext/real/src",
+        "ws/link/src"
+      ],
+      "unprotected": [
+        "ext/idle/src"
+      ]
+    },
+    {
+      "name": "exact rule with symlink then .. is resolved in OS order (reviewer repro R3-1)",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.Trash/other_dir"
+        },
+        {
+          "dir": "home/.Trash/keep_via_sym_dotdot"
+        },
+        {
+          "link": "home/to_trash_other",
+          "target": "home/.Trash/other_dir"
+        }
+      ],
+      "options": {
+        "exact": [
+          "~/to_trash_other/../keep_via_sym_dotdot"
+        ]
+      },
+      "protected": [
+        "home/.Trash/keep_via_sym_dotdot/precious_a.txt"
+      ],
+      "unprotected": [
+        "home/.Trash/unrelated/x"
+      ]
+    },
+    {
+      "name": "dynamic rule with symlink then ..",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/deep/x"
+        },
+        {
+          "dir": "ext/deep/sibling"
+        },
+        {
+          "link": "ws_link",
+          "target": "ext/deep/x"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "ws_link/../sibling"
+        ]
+      },
+      "protected": [
+        "ext/deep/sibling/f"
+      ],
+      "unprotected": [
+        "ext/deep/x/f",
+        "ext/other/f"
+      ]
+    },
+    {
+      "name": "glob rule matches through a symlinked parent",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ext/projreal/secret"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/proj",
+          "target": "ext/projreal"
+        }
+      ],
+      "options": {
+        "glob": [
+          "*/projreal/secret/*"
+        ]
+      },
+      "protected": [
+        "home/proj/secret/f",
+        "ext/projreal/secret/f"
+      ],
+      "unprotected": [
+        "home/proj/public/f"
+      ]
     }
   ]
 }

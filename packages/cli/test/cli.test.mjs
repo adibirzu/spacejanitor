@@ -136,3 +136,25 @@ test("R10-B34: when the Rust sj hangs the CLI reports sj_timeout with no candida
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("B-R3-2: remediate asks sj for trash with and without --include-orphans (orphans are only an extra)", { skip: process.platform === "win32" }, () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-cli-args-")));
+  try {
+    const log = path.join(base, "argv.log");
+    const fake = path.join(base, "sj");
+    fs.writeFileSync(
+      fake,
+      `#!/bin/sh\necho "$@" >> "${log}"\necho '{"schema":"spacejanitor.proposal.v1","mode":"dry-run","mutated":false,"plan_sha256":"${"a".repeat(64)}","items":[],"protected_exclusions":[]}'\n`,
+      { mode: 0o755 }
+    );
+    const env = { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_NO_SJ: "", HOME: base };
+    runCli(["remediate", "--json", "--path", base], env);
+    runCli(["remediate", "--json", "--path", base, "--include-orphans"], env);
+    const lines = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(lines.length, 2);
+    assert.ok(lines[0].includes("--include-trash") && !lines[0].includes("--include-orphans"), lines[0]);
+    assert.ok(lines[1].includes("--include-trash") && lines[1].includes("--include-orphans"), lines[1]);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

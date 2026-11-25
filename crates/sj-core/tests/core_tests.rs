@@ -2274,6 +2274,9 @@ fn shared_fs_vectors_resolve_symlink_targets_for_home_subpaths_and_custom_rules(
     use std::os::unix::fs::symlink;
     let v = shared_protect_vectors();
     for case in v["fs_cases"].as_array().unwrap() {
+        if case.get("cwd").is_some() {
+            continue; // run through the binary with a real working directory (crates/sj-cli tests)
+        }
         let name = case["name"].as_str().unwrap();
         let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
         let abs = |rel: &str| -> PathBuf {
@@ -2573,7 +2576,7 @@ fn orphan_blocks_commits_held_only_by_tags_worktree_refs_bisect_refs_or_head_ref
     fs::create_dir_all(&ws).unwrap();
     fs::create_dir_all(root.join("remotes")).unwrap();
 
-    let control = pushed_clone(root, &ws, "control");
+    let _control = pushed_clone(root, &ws, "control");
     let leave_local_commit = |repo: &Path| {
         fs::write(repo.join("local.txt"), "only here\n").unwrap();
         run_git(repo, &["add", "local.txt"]);

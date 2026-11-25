@@ -407,6 +407,8 @@ struct Prepared {
     home_subs: Vec<(String, Vec<String>)>,
     exact: Vec<(String, Vec<String>)>,
     dynamic: Vec<(String, Vec<String>)>,
+    /// set when a custom rule could not be anchored: every path is then denied (fail closed)
+    rule_error: Option<String>,
 }
 
 fn forms_of(textual: &str, resolve: &dyn Fn(&str) -> String) -> Vec<String> {
@@ -447,29 +449,59 @@ fn prepare(homes: Vec<String>, ctx: &ProtectionContext, resolve: &dyn Fn(&str) -
         home_subs.push(((*sub).to_string(), forms));
     }
     let home0 = homes.first().cloned().unwrap_or_default();
-    let user_forms = |paths: &[PathBuf]| -> Vec<(String, Vec<String>)> {
-        paths
-            .iter()
-            .filter_map(|p| {
-                let t = expand_tilde_textual(p.to_string_lossy().trim(), &home0);
-                let n = normalize_lexical(&t).ok()?;
-                Some((p.display().to_string(), forms_of(&n, resolve)))
-            })
-            .collect()
+    // Custom rules (exact / dynamic) follow main's `path.resolve` semantics: `~` expands to the home, a
+    // relative rule is anchored to the CURRENT WORKING DIRECTORY (not the home), and the OS then resolves
+    // it in its own order: components left to right, a symlink replaced by its target BEFORE a following
+    // `..` applies. Both the lexical (dots collapsed) and the OS-resolved form protect, so a custom rule
+    // can only ever protect more. A rule that cannot be anchored fails closed.
+    let mut rule_error: Option<String> = None;
+    let mut user_forms = |paths: &[PathBuf]| -> Vec<(String, Vec<String>)> {
+        let mut out = Vec::new();
+        for p in paths {
+            let t = expand_tilde_textual(p.to_string_lossy().trim(), &home0);
+            let anchored = if is_absolute_textual(&t) {
+                t
+            } else {
+                match std::env::current_dir() {
+                    Ok(cwd) => format!("{}/{t}", cwd.to_string_lossy().trim_end_matches(['/', '\\'])),
+                    Err(_) => {
+                        rule_error = Some(format!("unresolvable_custom_rule:{}", p.display()));
+                        continue;
+                    }
+                }
+            };
+            let Ok(sep) = normalize_separators(&anchored) else {
+                rule_error = Some(format!("unresolvable_custom_rule:{}", p.display()));
+                continue;
+            };
+            let mut forms = vec![collapse_dots(&sep)];
+            let resolved = resolve(&sep); // dots still intact: OS order
+            if !resolved.is_empty() && !forms.iter().any(|x| key(x) == key(&resolved)) {
+                forms.push(resolved);
+            }
+            out.push((p.display().to_string(), forms));
+        }
+        out
     };
+    let exact = user_forms(&ctx.exact_paths);
+    let dynamic = user_forms(&ctx.dynamic_paths);
     Prepared {
         homes,
         system_roots: norm_roots(PROTECTED_SYSTEM_ROOTS),
         exact_only: norm_roots(PROTECTED_EXACT_ONLY_ROOTS),
         foreign: norm_roots(PROTECTED_FOREIGN_HOME_ROOTS),
         home_subs,
-        exact: user_forms(&ctx.exact_paths),
-        dynamic: user_forms(&ctx.dynamic_paths),
+        exact,
+        dynamic,
+        rule_error,
     }
 }
 
 /// Pure rule evaluation over already-normalised candidate forms (`cands`).
 fn evaluate(cands: &[String], prep: &Prepared, ctx: &ProtectionContext) -> ProtectionVerdict {
+    if let Some(reason) = &prep.rule_error {
+        return ProtectionVerdict::deny(reason.clone());
+    }
     let homes = &prep.homes;
     let in_any_home = |c: &str| homes.iter().any(|h| same_or_child(c, h));
 

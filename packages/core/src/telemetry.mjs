@@ -1,4 +1,4 @@
-import { isProtectedPath } from "./protect.mjs";
+import { isProtectedPath, protectPaths } from "./protect.mjs";
 import { SjGateError, runSj } from "./sjGate.mjs";
 import { redactSecrets, redactArgv } from "./redact.mjs";
 import { execFile } from "node:child_process";
@@ -82,6 +82,15 @@ export function collectDoctor({ version = "0.1.0", schemas = SCHEMA_VERSIONS_EXT
   };
 }
 
+/**
+ * Judge many paths with ONE sj spawn when the stock gate is in use (an injected predicate, used by tests,
+ * is simply mapped). Fails closed like the single-path call.
+ */
+function judgeMany(paths, isProtectedFn, options) {
+  if (isProtectedFn === isProtectedPath) return protectPaths(paths, options);
+  return paths.map((p) => isProtectedFn(p, options));
+}
+
 export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = isProtectedPath } = {}) {
   const resolved = path.resolve(targetPath);
   let freeBytes = 0;
@@ -98,11 +107,16 @@ export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = i
   const topConsumers = [];
   try {
     const entries = fs.readdirSync(resolved, { withFileTypes: true }).slice(0, 40);
-    for (const ent of entries) {
-      if (ent.isSymbolicLink() || !ent.isDirectory()) continue;
+    const dirs = entries.filter((ent) => !ent.isSymbolicLink() && ent.isDirectory());
+    const verdicts = judgeMany(
+      dirs.map((ent) => path.join(resolved, ent.name)),
+      isProtectedFn,
+      {}
+    );
+    for (const [i, ent] of dirs.entries()) {
       const full = path.join(resolved, ent.name);
       const bytes = dirSizeBounded(full, 1);
-      const prot = isProtectedFn(full);
+      const prot = verdicts[i] || { protected: true, reason: "sj_unparseable" };
       topConsumers.push({
         id: `dir-${ent.name}`,
         path: full,
@@ -606,9 +620,10 @@ export async function collectCleanableCaches({ homeDir = os.homedir(), isProtect
     path.join(homeDir, ".gradle", "caches"),
   ];
   const candidates = [];
-  for (const cachePath of knownCaches) {
-    if (!fs.existsSync(cachePath)) continue;
-    const prot = isProtectedFn(cachePath, { homeDir });
+  const present = knownCaches.filter((cachePath) => fs.existsSync(cachePath));
+  const verdicts = judgeMany(present, isProtectedFn, { homeDir });
+  for (const [i, cachePath] of present.entries()) {
+    const prot = verdicts[i] || { protected: true };
     if (prot.protected) continue;
     const bytes = dirSizeBounded(cachePath, 2);
     candidates.push({

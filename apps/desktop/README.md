@@ -21,7 +21,7 @@ The desktop app contains **no** protected-path list, descendant walk or worktree
 |------|------|
 | Dry-run plan | `sj plan <root> --json` (add `--include-orphans` only when the opt-in above is on) |
 | Protected-path / descendant checks (read-only annotations) | `sj protect --json [--descendants] -- <path>` |
-| Dry-run for the selection | `sj plan <root> --json --select <path>...` (reports `selection.selection_sha256`, the digest of exactly the selected items incl. their dev/ino/size/mtime/content snapshot: the confirmation token) |
+| Dry-run for the selection (flags from one shared builder: `--include-trash`, plus `--include-orphans` only as an extra when the opt-in is on and a worktree is selected) | `sj plan <root> --json --select <path>...` (reports `selection.selection_sha256`, the digest of exactly the selected items incl. their dev/ino/size/mtime/content snapshot: the confirmation token) |
 | Execute the confirmed selection | `sj plan <root> --execute --confirm --selection-sha256 <token> --select <path>...` (sj rebuilds the plan, refuses unless the same selection hashes to the token, then removes no-follow, entry-by-entry with execute-time re-checks) |
 
 The Electron main process only keeps the two-step session (digest, `CONFIRM-XXXXXXXX` phrase, 5-minute TTL, single use, mutex).

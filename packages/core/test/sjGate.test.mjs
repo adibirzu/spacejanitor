@@ -5,6 +5,9 @@ import path from "node:path";
 import test from "node:test";
 import {
   activeSjBinary,
+  buildSjPlanArgs,
+  collectCleanableCaches,
+  collectDisk,
   collectOrphans,
   configureSjBinary,
   findProtectedDescendant,
@@ -363,21 +366,83 @@ test("gate: shared fs vectors (symlinked home subpaths, symlinked custom rules) 
             fs.symlinkSync(abs(step.target), abs(step.link));
           }
         }
-        const rule = (x) => (x.startsWith("~") || path.isAbsolute(x) ? x : abs(x));
+        // Relative custom rules are passed through RAW and anchored by sj to the working directory.
         const o = {
           homeDir: abs(c.home),
-          exactPaths: (c.options?.exact || []).map(rule),
-          dynamicProtectedPaths: (c.options?.dynamic || []).map(rule),
+          exactPaths: c.options?.exact || [],
+          dynamicProtectedPaths: c.options?.dynamic || [],
           globPatterns: c.options?.glob || [],
         };
-        for (const p of c.protected) {
-          assert.equal(isProtectedPath(abs(p), o).protected, true, `${c.name}: ${p}`);
-          assert.equal(protectPaths([abs(p)], o)[0].protected, true, `${c.name} (batched): ${p}`);
+        const prevCwd = process.cwd();
+        fs.mkdirSync(abs(c.cwd || "."), { recursive: true });
+        process.chdir(abs(c.cwd || "."));
+        try {
+          for (const p of c.protected) {
+            assert.equal(isProtectedPath(abs(p), o).protected, true, `${c.name}: ${p}`);
+            assert.equal(protectPaths([abs(p)], o)[0].protected, true, `${c.name} (batched): ${p}`);
+          }
+          for (const p of c.unprotected) assert.equal(isProtectedPath(abs(p), o).protected, false, `${c.name}: ${p}`);
+        } finally {
+          process.chdir(prevCwd);
         }
-        for (const p of c.unprotected) assert.equal(isProtectedPath(abs(p), o).protected, false, `${c.name}: ${p}`);
       } finally {
         fs.rmSync(root, { recursive: true, force: true });
       }
     }
   });
+});
+
+// ---- B-R3-2: one shared sj plan argument builder ----
+test("plan args: all four orphans x trash combinations; --include-orphans is only ever an extra, never a replacement for trash", () => {
+  const base = { root: "/h" };
+  assert.deepEqual(buildSjPlanArgs({ ...base, includeTrash: true, includeOrphans: false }), ["plan", "/h", "--json", "--include-trash"]);
+  assert.deepEqual(buildSjPlanArgs({ ...base, includeTrash: true, includeOrphans: true }), ["plan", "/h", "--json", "--include-trash", "--include-orphans"]);
+  assert.deepEqual(buildSjPlanArgs({ ...base, includeTrash: false, includeOrphans: true }), ["plan", "/h", "--json", "--include-orphans"]);
+  assert.equal(buildSjPlanArgs({ ...base, includeTrash: false, includeOrphans: false }), null, "nothing selected: nothing to plan");
+  // defaults: trash on, orphans off (unchanged behaviour of a bare plan)
+  assert.deepEqual(buildSjPlanArgs(base), ["plan", "/h", "--json", "--include-trash"]);
+  // rules and selection are appended identically for plan and execute
+  assert.deepEqual(
+    buildSjPlanArgs({ ...base, ruleFlags: ["--exact=/k"], selects: ["/h/a", "/h/b"] }),
+    ["plan", "/h", "--json", "--include-trash", "--exact=/k", "--select", "/h/a", "--select", "/h/b"]
+  );
+});
+
+test("telemetry: collectDisk and collectCleanableCaches judge all entries with ONE sj spawn each (no per-entry fan-out)", posixOnly, async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-batch-"));
+  try {
+    const log = path.join(dir, "calls.log");
+    const fake = path.join(dir, "sj");
+    fs.writeFileSync(
+      fake,
+      `#!/usr/bin/env node
+const fs = require("node:fs");
+const argv = process.argv.slice(2);
+fs.appendFileSync(${JSON.stringify(log)}, argv.join(" ") + "\\n");
+const paths = argv.slice(argv.indexOf("--") + 1);
+console.log(JSON.stringify({ schema: "spacejanitor.protect.v1", results: paths.map((p) => ({ path: p, protected: false, reason: "" })) }));
+`,
+      { mode: 0o755 }
+    );
+    const work = path.join(dir, "work");
+    for (const n of ["a", "b", "c", "d"]) fs.mkdirSync(path.join(work, n), { recursive: true });
+    const home = path.join(dir, "home");
+    for (const c of [".cache/npm", ".cache/pip", ".cache/yarn"]) fs.mkdirSync(path.join(home, c), { recursive: true });
+    const prevNoSj = process.env.SPACEJANITOR_NO_SJ;
+    delete process.env.SPACEJANITOR_NO_SJ;
+    configureSjBinary(fake);
+    try {
+      const disk = await collectDisk({ targetPath: work });
+      assert.equal(disk.topConsumers.length, 4);
+      const caches = await collectCleanableCaches({ homeDir: home });
+      assert.equal(caches.length, 3);
+    } finally {
+      configureSjBinary(undefined);
+      if (prevNoSj !== undefined) process.env.SPACEJANITOR_NO_SJ = prevNoSj;
+    }
+    const calls = fs.readFileSync(log, "utf8").trim().split("\n");
+    assert.equal(calls.length, 2, `expected exactly 2 sj spawns, got: ${calls.join(" | ")}`);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

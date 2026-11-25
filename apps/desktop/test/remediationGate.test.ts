@@ -114,7 +114,7 @@ test("plan: sizes, kinds and the confirmation token come from sj; the token is s
   assert.equal(plan.confirmationPhrase, `CONFIRM-${plan.planSha256.slice(0, 8).toUpperCase()}`);
   const sentToSj = world.calls[0];
   assert.deepEqual(sentToSj.slice(0, 3), ["plan", "/h", "--json"]);
-  assert.deepEqual(sentToSj.slice(3), ["--select", A]);
+  assert.deepEqual(sentToSj.slice(3), ["--include-trash", "--select", A]);
 });
 
 test("B-R2-1: the token for A cannot execute A+B or B (nothing is deleted), and each selection has its own token", async () => {
@@ -328,14 +328,32 @@ test("partial results from sj are reported per item (redacted) and unreported it
   ]);
 });
 
-test("orphan worktrees are planned and executed only with the main-process opt-in (default OFF: no --include-orphans)", async () => {
-  for (const enabled of [false, true]) {
-    const world = sjWorld([A]);
-    const gate = await gateFor(world, { orphanScanEnabled: () => enabled });
-    const plan = await gate.createDryRunPlan([cand(A)]);
+test("B-R3-2: all orphans x trash combinations build the right sj plan flags on plan AND execute; orphans are only an extra", async () => {
+  const WT = "/h/wt/feature";
+  const cases: Array<{ name: string; orphansOn: boolean; select: Array<ReturnType<typeof cand>>; flags: string[] | null }> = [
+    { name: "orphans off, trash selected (default, unchanged)", orphansOn: false, select: [cand(A)], flags: ["--include-trash"] },
+    { name: "orphans on, trash only selected (no git needed)", orphansOn: true, select: [cand(A)], flags: ["--include-trash"] },
+    { name: "orphans on, trash + worktree selected", orphansOn: true, select: [cand(A), cand(WT, 1, "git-worktree")], flags: ["--include-trash", "--include-orphans"] },
+    { name: "orphans on, worktree only selected", orphansOn: true, select: [cand(WT, 1, "git-worktree")], flags: ["--include-orphans"] },
+    { name: "orphans off, worktree only (nothing sj may plan)", orphansOn: false, select: [cand(WT, 1, "git-worktree")], flags: null },
+  ];
+  for (const c of cases) {
+    const world = sjWorld([A, WT]);
+    const gate = new RemediationGate({ runSj: world.run, planRoot: "/h", orphanScanEnabled: () => c.orphansOn });
+    gate.registerApprovedCandidates([cand(A), cand(WT, 1, "git-worktree")]);
+    const plan = await gate.createDryRunPlan(c.select);
+    const include = (call: string[]) => call.filter((a) => a.startsWith("--include-"));
+    if (c.name.includes("nothing sj may plan")) {
+      assert.equal(world.calls.length, 0, c.name);
+      assert.equal(plan.items.length, 0);
+      assert.equal(plan.blockedItems[0].reason, "not_in_sj_plan");
+      assert.equal((await gate.run({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase })).error, "empty_or_missing_plan");
+      continue;
+    }
+    assert.equal(plan.items.length, c.select.length, c.name);
     await gate.run({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
-    assert.equal(world.calls.length, 2);
-    for (const c of world.calls) assert.equal(c.includes("--include-orphans"), enabled, c.join(" "));
+    assert.equal(world.calls.length, 2, c.name);
+    for (const call of world.calls) assert.deepEqual(include(call), c.flags, `${c.name}: ${call.join(" ")}`);
   }
 });
 

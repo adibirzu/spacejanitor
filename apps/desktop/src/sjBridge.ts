@@ -100,7 +100,10 @@ export class SjBridge {
   private readonly pending = new Map<number, PendingRpc>();
 
   constructor(options: { binaryPath?: string | null } = {}) {
-    this.binaryPath = options.binaryPath !== undefined ? options.binaryPath : resolveSjBinary();
+    const requested = options.binaryPath !== undefined ? options.binaryPath : resolveSjBinary();
+    // An explicit path gets the same trust checks as a resolved one (regular file, not a symlink, not
+    // group/world writable, ...): read-only spawns must not run a binary the gate itself would refuse.
+    this.binaryPath = requested && core.sjBinaryProblem(requested) === null ? requested : null;
     // Every safety decision in this process (core protect checks, orphan proofs, plan/execute) runs
     // through exactly this binary. null pins the gate closed: destructive actions are refused.
     core.configureSjBinary(this.binaryPath);

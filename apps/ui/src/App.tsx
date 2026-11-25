@@ -499,6 +499,7 @@ export const App: React.FC = () => {
       </main>
 
       <RemediationModal
+        key={activePlan ? activePlan.planSha256 : "none"}
         plan={activePlan}
         onClose={() => setActivePlan(null)}
         onExecute={handleExecute}

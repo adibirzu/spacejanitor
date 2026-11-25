@@ -133,16 +133,23 @@ export interface RuleOptions {
   globPatterns?: string[];
 }
 
-/** Same flags on every call path (plan, execute, annotation): custom rules only ever protect more. */
-function planArgs(root: string, orphans: boolean, rules: string[], selects: string[] = []): string[] {
-  return [
-    "plan",
+/**
+ * Same argument builder (core `buildSjPlanArgs`, shared with the CLI) on every call path: trash is always
+ * requested for the kinds the user selected and orphans are only an extra. Null means nothing to ask sj.
+ */
+function planArgs(
+  root: string,
+  kinds: { trash: boolean; orphans: boolean },
+  rules: string[],
+  selects: string[] = []
+): string[] | null {
+  return core.buildSjPlanArgs({
     root,
-    "--json",
-    ...(orphans ? ["--include-orphans"] : []),
-    ...rules,
-    ...selects.flatMap((p) => ["--select", p]),
-  ];
+    includeTrash: kinds.trash,
+    includeOrphans: kinds.orphans,
+    ruleFlags: rules,
+    selects,
+  });
 }
 
 function uiKind(sjKind: string): RemediationCandidate["kind"] {
@@ -150,7 +157,7 @@ function uiKind(sjKind: string): RemediationCandidate["kind"] {
 }
 
 interface ActivePlan {
-  orphans: boolean;
+  kinds: { trash: boolean; orphans: boolean };
   rules: string[];
   /** paths of exactly the items the confirmation covers (sorted, de-duplicated) */
   paths: string[];
@@ -217,12 +224,19 @@ export class RemediationGate {
     }
 
     const root = this.planRoot;
-    // Orphan worktrees are planned only when the main-process opt-in is on (default OFF: trash only).
-    const orphans = this.orphanScanEnabled() === true;
+    // Kinds follow the selection: trash/files are planned as trash; orphan worktrees only when the
+    // main-process opt-in is ON (default OFF) and a worktree was actually selected, as an extra.
+    const selectedKinds = [...wanted].map((p) => this.approved.get(p)?.kind);
+    const kinds = {
+      trash: selectedKinds.some((k) => k !== "git-worktree"),
+      orphans: this.orphanScanEnabled() === true && selectedKinds.some((k) => k === "git-worktree"),
+    };
     const paths = [...wanted].sort();
-    const sjPlan = parseSjPlan(
-      await this.runSj(planArgs(root, orphans, this.ruleFlags, paths), { timeoutMs: PLAN_TIMEOUT_MS })
-    );
+    const args = planArgs(root, kinds, this.ruleFlags, paths);
+    const sjPlan: SjPlan = args
+      ? parseSjPlan(await this.runSj(args, { timeoutMs: PLAN_TIMEOUT_MS }))
+      : // nothing sj can plan for this selection: every path is reported as not planned, no process runs
+        { planSha256: "0".repeat(64), items: [], exclusions: [], selection: { sha256: "0".repeat(64), paths: [], unmatched: paths } };
     // The confirmation token is sj's digest of exactly the selected items (path, kind, size and the
     // dev/ino/mtime/content snapshot). It differs for A, A+B and B, is identical for a reordered or
     // duplicated selection, and changes if a selected item changed on disk.
@@ -262,7 +276,7 @@ export class RemediationGate {
       sha: token,
       root,
       items: selected,
-      orphans,
+      kinds,
       rules: this.ruleFlags,
       paths: [...plannedPaths].sort(),
     };
@@ -304,7 +318,7 @@ export class RemediationGate {
       // ONE sj call for exactly the confirmed selection. sj rebuilds the plan, recomputes the digest
       // of those items and refuses (exit 2, nothing touched) if it differs from what was confirmed.
       const out = await this.runSj(
-        [...planArgs(active.root, active.orphans, active.rules, active.paths), "--execute", "--confirm", "--selection-sha256", active.sha],
+        [...(planArgs(active.root, active.kinds, active.rules, active.paths) ?? []), "--execute", "--confirm", "--selection-sha256", active.sha],
         { timeoutMs: EXECUTE_TIMEOUT_MS }
       );
       const executed = Array.isArray(out.executed_items) ? (out.executed_items as Array<{ path?: unknown }>) : null;
