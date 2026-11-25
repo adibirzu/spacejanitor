@@ -1,4 +1,4 @@
-import { RemediationCandidate, RuleOptions } from "./remediationGate";
+import { candidateKind, RemediationCandidate, RuleOptions } from "./remediationGate";
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const core = require("@spacejanitor/core");
@@ -80,17 +80,19 @@ export function annotateSummary(summary: Record<string, unknown>, protect: Prote
 export function approvedFromSummary(summary: Record<string, unknown>): RemediationCandidate[] {
   const trash = (summary.trash as { candidates?: Row[] } | undefined)?.candidates;
   const orphans = (summary.orphans as { candidates?: Row[] } | undefined)?.candidates;
-  const rows: Row[] = [
-    ...(Array.isArray(trash) ? trash : []),
-    ...(Array.isArray(orphans) ? orphans.filter((o) => o.safeToPrune === true) : []),
+  // Source decides the family: every row of summary.orphans is an orphan (git-worktree) whatever kind string the
+  // report carried (sj reports standalone clones as "git-repo"); trash rows keep their own file/dir kind.
+  const rows: Array<{ row: Row; orphan: boolean }> = [
+    ...(Array.isArray(trash) ? trash : []).map((row) => ({ row, orphan: false })),
+    ...(Array.isArray(orphans) ? orphans.filter((o) => o.safeToPrune === true) : []).map((row) => ({ row, orphan: true })),
   ];
   return rows
-    .filter((r) => r.selectable === true && typeof r.path === "string" && r.path !== "" && r.protected !== true)
-    .map((r) => ({
+    .filter(({ row: r }) => r.selectable === true && typeof r.path === "string" && r.path !== "" && r.protected !== true)
+    .map(({ row: r, orphan }) => ({
       id: String(r.id ?? r.path),
       path: String(r.path),
       bytes: Number(r.bytes) || 0,
-      kind: (r.kind === "dir" || r.kind === "git-worktree" ? r.kind : "file") as RemediationCandidate["kind"],
+      kind: orphan ? ("git-worktree" as const) : candidateKind(r.kind),
     }));
 }
 

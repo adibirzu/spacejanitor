@@ -152,6 +152,16 @@ function planArgs(
   });
 }
 
+/**
+ * One mapping for every producer of candidates. sj and core describe orphans as `git-worktree` (linked) or
+ * `git-repo` (verified standalone clone); both are orphan kinds that need `--include-orphans` and must never be
+ * downgraded to a plain file.
+ */
+export function candidateKind(kind: unknown): RemediationCandidate["kind"] {
+  if (kind === "git-worktree" || kind === "git-repo") return "git-worktree";
+  return kind === "dir" ? "dir" : "file";
+}
+
 function uiKind(sjKind: string): RemediationCandidate["kind"] {
   return sjKind === "orphan_worktree" ? "git-worktree" : "file";
 }
@@ -202,7 +212,7 @@ export class RemediationGate {
           id: String(c.id ?? c.path),
           path: c.path,
           bytes: Number(c.bytes) || 0,
-          kind: c.kind === "dir" || c.kind === "git-worktree" ? c.kind : "file",
+          kind: candidateKind(c.kind),
         });
       }
     }
