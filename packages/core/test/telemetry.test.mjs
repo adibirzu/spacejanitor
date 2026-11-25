@@ -538,7 +538,8 @@ test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed
     const stashed = mk("wt-stashed", "b-stashed");
     // proof for the clean worktree is taken BEFORE any sibling gets an unpushed branch (the unpushed
     // check is repo-wide, as in the Rust core)
-    assert.equal((await inspectWorktree(clean)).safeToPrune, true, "clean pushed worktree is safe");
+    const cleanProof = await inspectWorktree(clean);
+    assert.equal(cleanProof.safeToPrune, true, `clean pushed worktree is safe: ${JSON.stringify(cleanProof)}`);
     fs.writeFileSync(path.join(ignored, "db.secret"), "precious");
     fs.mkdirSync(path.join(ignored, "local-data"));
     fs.writeFileSync(path.join(untracked, "notes.txt"), "n");
