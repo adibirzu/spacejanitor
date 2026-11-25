@@ -113,6 +113,18 @@ fn redact_secret_preview(_val: &str) -> String {
     "[REDACTED]".to_string()
 }
 
+/// A key name is only ever echoed when it is a plain identifier. Anything that
+/// could carry value text (colons, glued values, long tokens, known secret
+/// prefixes) is replaced by a fixed label.
+fn is_plain_identifier(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 48
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+        && !looks_like_secret_value(raw)
+}
+
 fn safe_arg_key_name(arg: &str) -> String {
     if let Some(scheme_idx) = arg.find("://") {
         let after = &arg[scheme_idx + 3..];
@@ -126,11 +138,15 @@ fn safe_arg_key_name(arg: &str) -> String {
         return "url-secret".to_string();
     }
     if arg.starts_with('-') {
-        let flag = arg.split('=').next().unwrap_or("--flag").trim();
+        let flag = arg.split(['=', ':']).next().unwrap_or("--flag").trim();
         if flag.eq_ignore_ascii_case("-h") || flag.eq_ignore_ascii_case("--header") {
             return "--header".to_string();
         }
-        if !flag.contains(['/', ':', '?', '@', ' ']) {
+        if !flag.starts_with("--") && !flag.contains(['=', ':']) && flag.len() > 2 && arg == flag {
+            // glued short flag such as `-pSECRET`: keep only the letter
+            return flag.chars().take(2).collect();
+        }
+        if is_plain_identifier(flag) {
             return flag.to_string();
         }
         return "cli-flag".to_string();
@@ -145,7 +161,7 @@ fn safe_arg_key_name(arg: &str) -> String {
         }
     }
     if let Some((k, _)) = arg.split_once('=') {
-        if !k.is_empty() && !k.contains(['/', ':', '?', '@', ' ']) {
+        if is_plain_identifier(k) {
             return k.to_string();
         }
     }
@@ -164,9 +180,14 @@ fn redact_arg_token(arg: &str) -> (String, Option<(String, String)>) {
         if (is_sensitive_env_key(k) || looks_like_secret_value(v))
             && !k.contains(['/', ':', '?', '@'])
         {
+            let key = if is_plain_identifier(k) {
+                k.to_string()
+            } else {
+                "inline-secret".to_string()
+            };
             return (
-                format!("{k}=<REDACTED>"),
-                Some((k.to_string(), redact_secret_preview(v))),
+                format!("{key}=<REDACTED>"),
+                Some((key, redact_secret_preview(v))),
             );
         }
     }
@@ -204,6 +225,25 @@ fn sanitize_args(
                 } else {
                     "<REDACTED>".to_string()
                 });
+                // `Authorization:Bearer` / `Authorization:` split from its value
+                // by the JSON array: the next element is the credential.
+                if let Some((hdr, rest)) = arg.split_once(':') {
+                    let hdr_low = hdr.trim().to_ascii_lowercase();
+                    let rest_low = rest.trim().to_ascii_lowercase();
+                    if matches!(
+                        hdr_low.as_str(),
+                        "authorization"
+                            | "x-api-key"
+                            | "x-auth-token"
+                            | "cookie"
+                            | "proxy-authorization"
+                    ) && matches!(
+                        rest_low.as_str(),
+                        "" | "bearer" | "basic" | "token" | "digest"
+                    ) {
+                        redact_next_flag = Some("header-value".to_string());
+                    }
+                }
                 continue;
             }
             findings.push(SecretFinding {
@@ -222,7 +262,7 @@ fn sanitize_args(
             out.push(arg.clone());
             continue;
         }
-        if !arg.contains('=') && is_sensitive_flag_name(&low, false) {
+        if is_plain_identifier(arg) && is_sensitive_flag_name(&low, false) {
             redact_next_flag = Some(arg.clone());
             out.push(arg.clone());
             continue;
@@ -1083,5 +1123,40 @@ DOCS_API_KEY = "{dummy_secret_a}"
         assert_eq!(parse_bsd_etime("05:30"), Some(330));
         assert_eq!(parse_bsd_etime("02:05:30"), Some(7530));
         assert_eq!(parse_bsd_etime("3-02:05:30"), Some(3 * 86400 + 7530));
+    }
+
+    #[test]
+    fn mcp_audit_f2_key_name_never_carries_secret_bearing_text() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("mcp.json"),
+            r#"{
+  "mcpServers": {
+    "colon-flag": { "command": "tool", "args": ["--token:CFGPROBE80zz", "next-arg"] },
+    "glued-short": { "command": "mysql", "args": ["-pCFGPROBE81zz"] },
+    "hdr-nospace": { "command": "npx", "args": ["mcp-remote", "https://example.com/mcp", "--header", "Authorization:Bearer", "CFGPROBE82zz"] },
+    "exa": { "command": "npx", "args": ["-y", "mcp-remote", "https://mcp.exa.ai/mcp?exaApiKey=CFGPROBE84zz"] },
+    "url-cred": { "command": "npx", "args": ["https://alice:CFGPROBE85zz@example.com/mcp"] },
+    "kv-url": { "command": "npx", "args": ["--endpoint=https://u:CFGPROBE86zz@h/x", "TOKEN_X=CFGPROBE87zz"] }
+  }
+}"#,
+        )
+        .unwrap();
+        let opts = McpAuditOptions {
+            config_dirs: vec![tmp.path().to_path_buf()],
+        };
+        let report = audit_mcp_with_processes(&opts, &[]).unwrap();
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("CFGPROBE"), "secret text leaked: {json}");
+        for f in &report.secret_findings {
+            assert!(
+                f.key_name.len() <= 64
+                    && f.key_name
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')),
+                "unsafe key_name {:?}",
+                f.key_name
+            );
+        }
     }
 }

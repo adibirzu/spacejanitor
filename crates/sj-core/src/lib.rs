@@ -59,6 +59,24 @@ fn redact_url_userinfo(token: &str) -> String {
     token.to_string()
 }
 
+fn is_sensitive_query_key(k_low: &str) -> bool {
+    const NEEDLES: &[&str] = &[
+        "token",
+        "secret",
+        "key",
+        "pass",
+        "pwd",
+        "auth",
+        "credential",
+        "sig",
+        "dsn",
+        "session",
+        "cookie",
+        "bearer",
+    ];
+    NEEDLES.iter().any(|n| k_low.contains(n))
+}
+
 fn redact_url_query_params(token: &str) -> String {
     let Some(q_idx) = token.find('?') else {
         return token.to_string();
@@ -72,20 +90,7 @@ fn redact_url_query_params(token: &str) -> String {
     for pair in query.split('&') {
         if let Some((k, _v)) = pair.split_once('=') {
             let k_low = k.to_ascii_lowercase();
-            if matches!(
-                k_low.as_str(),
-                "api_key"
-                    | "apikey"
-                    | "token"
-                    | "secret"
-                    | "access_token"
-                    | "key"
-                    | "password"
-                    | "passwd"
-                    | "auth"
-                    | "auth_token"
-                    | "client_secret"
-            ) {
+            if is_sensitive_query_key(&k_low) {
                 parts.push(format!("{k}=<REDACTED>"));
                 continue;
             }
@@ -223,6 +228,14 @@ pub fn redact_secrets(input: &str) -> String {
                         redact_next = true;
                         continue;
                     }
+                    if matches!(
+                        rest.trim().to_ascii_lowercase().as_str(),
+                        "bearer" | "basic" | "token" | "digest"
+                    ) {
+                        tokens.push(format!("{hdr}: <REDACTED>"));
+                        redact_next = true;
+                        continue;
+                    }
                     let redacted_hdr = format!("{hdr}: <REDACTED>");
                     tokens.push(match outer_quote {
                         Some(q) => format!("{q}{redacted_hdr}{q}"),
@@ -261,6 +274,23 @@ pub fn redact_secrets(input: &str) -> String {
             }
         }
 
+        if part.starts_with('-')
+            && !part.starts_with("--")
+            && part.len() > 2
+            && low.starts_with("-p")
+        {
+            // glued short password flag, e.g. `mysql -pSECRET`
+            tokens.push("-p<REDACTED>".to_string());
+            continue;
+        }
+        if part.starts_with("--") && !part.contains('=') && !part.contains("://") {
+            if let Some((lhs, _rhs)) = part.split_once(':') {
+                if is_sensitive_flag_name(&lhs.to_ascii_lowercase(), true) {
+                    tokens.push(format!("{lhs}:<REDACTED>"));
+                    continue;
+                }
+            }
+        }
         if part.starts_with('-') {
             if let Some((lhs, _rhs)) = part.split_once('=') {
                 if is_sensitive_flag_name(&lhs.to_ascii_lowercase(), true) {
@@ -321,6 +351,31 @@ pub fn redact_secrets(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    #[test]
+    fn redact_f3_widened_allowlist_covers_probe_leaks() {
+        let cases = [
+            "npx mcp-remote https://h/x --header Authorization:Bearer PROBE07zz",
+            "npx mcp-remote https://h/x --header Authorization:Basic PROBE08zz",
+            "tool --token:PROBE80zz next",
+            "mysql -pPROBE81zz",
+            "npx -y mcp-remote https://mcp.exa.ai/mcp?exaApiKey=PROBE84zz",
+            "curl https://h/x?access_key=PROBE85zz&ok=1",
+            "curl https://h/x?sig=PROBE86zz&client_secret_v2=PROBE87zz",
+            "curl https://h/x?X-Amz-Signature=PROBE88zz",
+        ];
+        for c in cases {
+            let out = redact_secrets(c);
+            assert!(!out.contains("PROBE"), "leak in {c:?} -> {out:?}");
+        }
+        // non-sensitive query params and flags stay readable
+        let keep = redact_secrets("curl https://h/x?page=2&sort=asc --verbose");
+        assert!(
+            keep.contains("page=2") && keep.contains("sort=asc"),
+            "{keep}"
+        );
+    }
     use super::*;
 
     const TEST_HOME: &str = "/home/developer";

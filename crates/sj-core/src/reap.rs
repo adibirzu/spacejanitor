@@ -509,9 +509,17 @@ mod tests {
             orphan(202, me, "python3 train.py"),
             orphan(203, None, "node /opt/x/mcp-server.js"),
             orphan(204, other, "node /opt/x/mcp-server.js"),
-            orphan(205, me, "npx -y @modelcontextprotocol/server-filesystem /tmp"),
+            orphan(
+                205,
+                me,
+                "npx -y @modelcontextprotocol/server-filesystem /tmp",
+            ),
             orphan(206, me, "node /opt/x/mcp-server.js"),
-            orphan(207, me, "/Applications/Codex.app/Contents/MacOS/codex app-server --mcp"),
+            orphan(
+                207,
+                me,
+                "/Applications/Codex.app/Contents/MacOS/codex app-server --mcp",
+            ),
             orphan(208, me, "codex-code-mode-host --mcp"),
         ];
         let plan = build_reap_plan_from_processes(30, &procs, 999).unwrap();
