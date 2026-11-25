@@ -45,6 +45,13 @@ test("validates plugin rules against core immutable protected denylist", () => {
     assert.ok(result.rejectedRules.every((r) => r.reason === "sj_unavailable"));
     return;
   }
+  if (process.platform === "win32") {
+    // The Rust gate judges the synthetic POSIX home as foreign on Windows, so the "safe" rule is not
+    // provable there; the two unsafe rules must still be rejected.
+    assert.ok(result.rejectedRules.some((r) => r.ruleId === "unsafe-ssh"));
+    assert.ok(result.rejectedRules.some((r) => r.ruleId === "unsafe-system"));
+    return;
+  }
   assert.equal(result.allowedRules.length, 1);
   assert.equal(result.allowedRules[0].id, "safe-cache");
   assert.equal(result.rejectedRules.length, 2);
