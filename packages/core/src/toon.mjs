@@ -41,6 +41,12 @@ export function formatToon(rawReport) {
       lines.push(`  - ${s.name} (x${s.duplicateCount})${s.hasSecretRisk ? " [SECRET_RISK]" : ""}`);
     }
   } else if (report.schema === "spacejanitor.orphans.v1") {
+    if (report.scanned === false) {
+      // never a numeric 0: nothing was looked at
+      lines.push(`target: ${report.targetPath} | orphans: not scanned (disabled by default)`);
+      lines.push("  - orphan scanning runs git inside repositories found on disk; opt in with --include-orphans (experimental)");
+      return lines.join("\n");
+    }
     lines.push(`target: ${report.targetPath} | candidates: ${(report.candidates || []).length}`);
     for (const c of (report.candidates || []).slice(0, 10)) {
       lines.push(`  - ${c.path} [clean=${c.clean} pushed=${!c.hasUnpushed} safe=${c.safeToPrune}]`);
@@ -58,7 +64,11 @@ export function formatToon(rawReport) {
   } else if (report.schema === "spacejanitor.summary.v1") {
     lines.push(`disk_free_gib: ${report.disk?.freeGiB} [${report.disk?.status}]`);
     lines.push(`memory: [${report.memory?.status}] | blockers: [${report.blockers?.status}]`);
-    lines.push(`orphans: ${report.orphans?.candidates?.length ?? 0} | mcp_servers: ${report.mcpAudit?.totalServers ?? 0}`);
+    const orphanText =
+      report.orphans?.scanned === false
+        ? "not scanned (disabled by default)"
+        : String(report.orphans?.candidates?.length ?? 0);
+    lines.push(`orphans: ${orphanText} | mcp_servers: ${report.mcpAudit?.totalServers ?? 0}`);
   }
 
   return lines.join("\n");

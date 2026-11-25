@@ -49,3 +49,20 @@ export class OrphanScanSetting {
     return this.enabled;
   }
 }
+
+/**
+ * The ONLY way the renderer-facing IPC may change the setting. Turning scanning ON needs a
+ * main-process confirmation (a native dialog carrying the warning, Cancel as the default); a call with
+ * no confirmation function, a cancelled dialog or a non-boolean value leaves it OFF. Turning it OFF
+ * never asks.
+ */
+export async function setOrphanScanWithConfirmation(
+  setting: OrphanScanSetting,
+  requested: unknown,
+  confirm?: (warning: string) => Promise<boolean>
+): Promise<boolean> {
+  if (requested !== true) return setting.set(false);
+  if (!confirm) return setting.get();
+  const ok = await confirm(OrphanScanSetting.WARNING);
+  return ok === true ? setting.set(true) : setting.get();
+}

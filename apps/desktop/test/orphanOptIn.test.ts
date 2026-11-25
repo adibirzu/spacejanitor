@@ -5,7 +5,7 @@ import path from "node:path";
 import test from "node:test";
 import { executePlanItems } from "../src/executor";
 import { sanitizeIpcParams } from "../src/ipcValidation";
-import { OrphanScanSetting } from "../src/orphanSetting";
+import { OrphanScanSetting, setOrphanScanWithConfirmation } from "../src/orphanSetting";
 import { RemediationCandidate, RemediationGate } from "../src/remediationGate";
 import { SjBridge } from "../src/sjBridge";
 import { worktreePruneBlockReason } from "../src/worktreeGuard";
@@ -90,19 +90,73 @@ test("worktree prune is blocked and spawns no git unless scanning is enabled", s
     gate.registerApprovedCandidates(cands);
     const plan = gate.createDryRunPlan(cands);
     const auth = gate.authorizeExecute({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
-    if (auth.allowed) {
-      const res = await executePlanItems(auth.plan!, auth.identities!, {
-        homeDir: path.join(dir, "home"),
-        isInsideOsTrash: () => false,
-        trashItem: async () => {},
-        removeWorktree: async () => {
-          throw new Error("must not be called");
-        },
-        orphanScanEnabled: () => false,
-      });
-      assert.equal(res.removed.length, 0);
-      assert.equal(res.failed[0].error, "orphan_scanning_disabled");
-    }
+    assert.equal(auth.allowed, true, `gate must authorize so the executor assertions below actually run: ${auth.reason}`);
+    const res = await executePlanItems(auth.plan!, auth.identities!, {
+      homeDir: path.join(dir, "home"),
+      isInsideOsTrash: () => false,
+      trashItem: async () => {},
+      removeWorktree: async () => {
+        throw new Error("must not be called");
+      },
+      orphanScanEnabled: () => false,
+    });
+    assert.equal(res.removed.length, 0);
+    assert.equal(res.failed[0].error, "orphan_scanning_disabled");
     assert.equal(fs.existsSync(marker), false);
+  });
+});
+
+test("enabling orphan scanning needs a main-process confirmation: cancel keeps it off, confirm turns it on, no confirmation does nothing", async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-confirm-"));
+  try {
+    const s = new OrphanScanSetting(path.join(dir, "settings.json"));
+    let shown = "";
+    // plain renderer call: no confirmation function available -> stays off
+    assert.equal(await setOrphanScanWithConfirmation(s, true, undefined), false);
+    assert.equal(s.get(), false);
+    // user cancels the native dialog
+    assert.equal(await setOrphanScanWithConfirmation(s, true, async () => false), false);
+    assert.equal(s.get(), false);
+    // junk is never "true"
+    assert.equal(await setOrphanScanWithConfirmation(s, "true" as unknown as boolean, async () => true), false);
+    // user confirms, and the dialog carried the warning
+    assert.equal(
+      await setOrphanScanWithConfirmation(s, true, async (warning) => {
+        shown = warning;
+        return true;
+      }),
+      true
+    );
+    assert.equal(s.get(), true);
+    assert.match(shown, /runs git inside repositories found on disk/);
+    // turning it off never asks
+    let asked = false;
+    assert.equal(
+      await setOrphanScanWithConfirmation(s, false, async () => {
+        asked = true;
+        return true;
+      }),
+      false
+    );
+    assert.equal(asked, false);
+    assert.equal(s.get(), false);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("real Rust binary path, defaults: summary and orphans say scanned:false and git is only ever asked for --version", skip, async () => {
+  const repoRoot = path.resolve(__dirname, "../../../..");
+  const exe = [path.join(repoRoot, "target", "release", "sj"), path.join(repoRoot, "target", "debug", "sj")].find((p) => fs.existsSync(p));
+  if (!exe) return; // Rust binary not built in this job; covered where it is
+  await withGitShim(async ({ dir, marker }) => {
+    const bridge = new SjBridge({ binaryPath: exe });
+    const summary = (await bridge.invoke("summary", { targetPath: dir })) as { orphans: { scanned?: boolean } };
+    const orphans = (await bridge.invoke("orphans", { targetPath: dir })) as { scanned?: boolean };
+    bridge.dispose();
+    assert.equal(summary.orphans.scanned, false);
+    assert.equal(orphans.scanned, false);
+    const calls = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").split("\n").filter(Boolean) : [];
+    for (const c of calls) assert.equal(c.trim(), "--version", `unexpected git call: ${c}`);
   });
 });

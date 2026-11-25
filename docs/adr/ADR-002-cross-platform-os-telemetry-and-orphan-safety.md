@@ -29,7 +29,7 @@ Every collector emits normalized DTOs conforming to `spacejanitor.*.v1` contract
 ### 2. Non-Blocking Lock & Git Safety Invariants
 
 - **Ban `lsof +D`:** SpaceJanitor **never** runs `lsof +D` recursive directory tree scans. Active directory usage is detected via O(N processes) CWD inspection (`/proc/<pid>/cwd` on Linux, `lsof -Fn -d cwd` without `+D` on macOS, process command/working-dir queries on Windows).
-- **Recursive Git Safety Proof:** A candidate worktree or directory flagged for pruning **must pass all checks** across the root and every nested `.git` repository up to depth 5:
+- **Recursive Git Safety Proof (opt-in, off by default, see issue #12):** the proof runs git inside repositories found on disk, so it is disabled unless explicitly enabled. A candidate worktree or directory flagged for pruning **must pass all checks** across the root and every nested `.git` repository up to depth 5:
   1. Valid git worktree (`git rev-parse --is-inside-work-tree`)
   2. Zero modified/untracked files (`git status --porcelain` is empty)
   3. At least one configured remote (`git remote` non-empty)

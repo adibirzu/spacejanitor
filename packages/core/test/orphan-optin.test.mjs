@@ -94,10 +94,41 @@ test("CLI: summary and orphans spawn no git by default; --include-orphans opts i
   assert.equal(fs.existsSync(marker), true);
 }));
 
-test("R11: an attached short-flag credential after NAME= in a shell string is redacted (OPTS=-pSECRET)", () => {
-  for (const s of ["OPTS=-pLEAK90secret mysql db", "sh -c 'OPTS=-uadmin:LEAK91pw mysql'", "X=-tLEAK92tok run"]) {
+test("R11/R12: an attached short-flag credential after NAME= (any quoting/separator) is redacted", () => {
+  for (const s of [
+    "OPTS=-pLEAK90secret mysql db", "sh -c 'OPTS=-uadmin:LEAK91pw mysql'", "X=-tLEAK92tok run",
+    'OPTS="-pLEAK93q"', "OPTS='-pLEAK94q'", "a=b,OPTS=-pLEAK95c", "--opts=-pLEAK96x", "--opts='-pLEAK97y'",
+  ]) {
     const out = redactSecrets(s);
     assert.ok(!/LEAK9\d/.test(out), `leak: ${s} => ${out}`);
   }
   assert.equal(redactSecrets("OPTS=-timeout mysql"), "OPTS=-timeout mysql");
 });
+
+test("R12-B38: default text output says 'not scanned', never a numeric 0 (summary and orphans, with and without Rust sj)", skipWin, withGitShim(async ({ dir, shimPath }) => {
+  const sjBin = path.resolve(new URL("../../../target/release/sj", import.meta.url).pathname);
+  const modes = [{ SPACEJANITOR_NO_SJ: "1" }, fs.existsSync(sjBin) ? { SPACEJANITOR_NO_SJ: "", SPACEJANITOR_SJ_BIN: sjBin } : null].filter(Boolean);
+  for (const extra of modes) {
+    const run = (args) =>
+      spawnSync(process.execPath, [CLI, ...args], { encoding: "utf8", timeout: 60000, env: { ...process.env, PATH: shimPath, HOME: dir, ...extra } });
+    const summary = run(["summary", "--path", dir]);
+    assert.equal(summary.status, 0, summary.stderr);
+    assert.match(summary.stdout, /orphans: not scanned \(disabled by default\)/, summary.stdout);
+    assert.doesNotMatch(summary.stdout, /orphans: 0/);
+    const orphans = run(["orphans", "--path", dir]);
+    assert.equal(orphans.status, 0, orphans.stderr);
+    assert.match(orphans.stdout, /not scanned \(disabled by default\)/, orphans.stdout);
+    assert.doesNotMatch(orphans.stdout, /candidates: 0/);
+  }
+}));
+
+test("R12: doctor's only git call is `git --version` (no git command touches a repository by default)", skipWin, withGitShim(async ({ dir, marker, shimPath }) => {
+  const r = spawnSync(process.execPath, [CLI, "doctor", "--json"], {
+    encoding: "utf8",
+    timeout: 60000,
+    env: { ...process.env, PATH: shimPath, HOME: dir, SPACEJANITOR_NO_SJ: "1" },
+  });
+  assert.equal(r.status, 0, r.stderr);
+  const calls = fs.existsSync(marker) ? fs.readFileSync(marker, "utf8").split("\n").filter(Boolean) : [];
+  for (const c of calls) assert.equal(c.trim(), "--version", `unexpected git call: ${c}`);
+}));

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, IpcMainInvokeEvent, Menu, nativeImage, session, shell, Tray } from "electron";
+import { app, BrowserWindow, dialog, ipcMain, IpcMainInvokeEvent, Menu, nativeImage, session, shell, Tray } from "electron";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -14,7 +14,7 @@ import {
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
 import { executePlanItems } from "./executor";
 import { removeWorktreeSafely } from "./worktreeGuard";
-import { OrphanScanSetting } from "./orphanSetting";
+import { OrphanScanSetting, setOrphanScanWithConfirmation } from "./orphanSetting";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
 
@@ -129,6 +129,7 @@ function refreshTrayMenu(): void {
 
 async function runQuickAudit(): Promise<void> {
   try {
+    // Tray refresh deliberately does NOT pass the orphan setting: it never scans orphans (default OFF).
     const summary = await bridge.invoke("summary", {});
     const status = String(summary.status || "OK");
     const disk = summary.disk as { freeGiB?: number } | undefined;
@@ -255,9 +256,24 @@ function registerIpcHandlers(): void {
     assertAuthorizedSender(event);
     return { enabled: orphanScan.get(), warning: OrphanScanSetting.WARNING };
   });
-  ipcMain.handle("sj:orphan-scan-set", (event, payload: { enabled?: unknown }) => {
+  ipcMain.handle("sj:orphan-scan-set", async (event, payload: { enabled?: unknown }) => {
     assertAuthorizedSender(event);
-    return { enabled: orphanScan.set(payload?.enabled === true), warning: OrphanScanSetting.WARNING };
+    // Enabling needs a native confirmation owned by the main process; a renderer script cannot supply it.
+    const enabled = await setOrphanScanWithConfirmation(orphanScan, payload?.enabled, async (warning) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      const opts = {
+        type: "warning" as const,
+        buttons: ["Cancel", "Enable experimental scan"],
+        defaultId: 0,
+        cancelId: 0,
+        noLink: true,
+        message: "Enable orphan repository scanning?",
+        detail: warning,
+      };
+      const res = win ? await dialog.showMessageBox(win, opts) : await dialog.showMessageBox(opts);
+      return res.response === 1;
+    });
+    return { enabled, warning: OrphanScanSetting.WARNING };
   });
   ipcMain.handle("sj:slm-get-config", (event) => {
     assertAuthorizedSender(event);
