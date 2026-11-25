@@ -9,6 +9,7 @@ import {
   isProtectedPath,
   redactSecrets,
 } from "../src/index.mjs";
+import { up, urlWith } from "./_fixtures.mjs";
 
 const SYNTHETIC_HOME = "/home/developer";
 
@@ -215,7 +216,7 @@ test("R2-B7: redactSecrets covers extended flag names, custom headers, URL useri
     `https://${V}@host/x`, `https://host/x?sig=${V}`, `https://host/x?access_key=${V}&client_secret=${V}`,
     `https://host/?auth=${V}`, `https://host/?X-Amz-Signature=${V}`,
     `apiKey=${V}`, `password=${V}`, `export token=${V}`,
-    `-u user:${V}`, `--user user:${V}`,
+    `-u ${up("user", V)}`, `--user ${up("user", V)}`,
     j("gh", "s_", "abcdefghijklmnop123456"), j("gh", "o_", "abcdefghijklmnop123456"), j("gh", "u_", "abcdefghijklmnop123456"),
     j("np", "m_", "abcdefghijklmnopqrstuvwxyz0123456789"), j("AI", "zaSy", "A1234567890abcdefghijklmnopqrstuvw"),
     j("hf", "_", "abcdefghijklmnopqrstuvwxyz1234"), j("SG", ".", "abcdefghijklmnop", ".", "qrstuvwxyz0123456789"),

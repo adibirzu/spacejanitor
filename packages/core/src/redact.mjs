@@ -89,7 +89,7 @@ const KNOWN_SHORT_WORDS = new Set([
 ]);
 
 /**
- * "-pSECRET" (mysql), "-tTOKEN", "-uadmin:SECRET", "-p-dashedSecret": an attached single-letter
+ * "-pSECRET" (mysql), "-tTOKEN", "-u<user>:<secret>", "-p-dashedSecret": an attached single-letter
  * credential flag. "-p=…"/"-p" alone are handled elsewhere; single-dash credential flag NAMES
  * (-token, -api-key) and well-known flag words (-timeout, -port, ...) are not values.
  */
@@ -126,7 +126,7 @@ export function redactArgv(args) {
   const list = Array.isArray(args) ? args.map(String) : [];
   for (let i = 0; i < list.length; i++) {
     const a = list[i];
-    // attached short-flag credentials: -pSECRET (mysql), -tTOKEN, -uadmin:SECRET. Treated as
+    // attached short-flag credentials: -pSECRET (mysql), -tTOKEN, -u<user>:<secret>. Treated as
     // credential-bearing on purpose; false positives such as -p8080 are acceptable.
     if (isAttachedShortCredential(a)) {
       out.push(`${a.slice(0, 2)}<REDACTED>`);

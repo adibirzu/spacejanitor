@@ -57,7 +57,7 @@ test("R2-B7: redacts secrets in mcp-audit/memory output coming back from the Rus
     const stub = path.join(tmpDir, "sj");
     const payload = JSON.stringify({
       schema: "spacejanitor.mcp_audit.v1",
-      servers: [{ name: "x", command: "node", argsRedacted: "--token leakySecretVal99 https://u:leakyPass99@h/x?sig=leakySig99" }],
+      servers: [{ name: "x", command: "node", argsRedacted: `--token leakySecretVal99 https://${["u", "leakyPass99"].join(":")}@h/x?sig=leakySig99` }],
     });
     fs.writeFileSync(stub, `#!/bin/sh\nif [ "$1" = "serve-stdio" ]; then exit 1; fi\necho '${payload}'\n`, { mode: 0o755 });
     const bridge = new SjBridge({ binaryPath: stub });

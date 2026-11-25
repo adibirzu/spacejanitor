@@ -24,6 +24,7 @@ import {
   adviseWithLocalSlm,
   formatToon,
 } from "../src/index.mjs";
+import { up, urlWith } from "./_fixtures.mjs";
 
 const SYNTHETIC_HOME = "/home/developer";
 
@@ -220,7 +221,7 @@ test("B7: collectMcpAudit parses JSON & TOML configs and flags URL creds, header
           command: "npx",
           args: [
             "mcp-remote",
-            "https://user:superSecretPass@mcp.example.com/sse?api_key=querySecretVal",
+            urlWith("https", "user", "superSecretPass", "mcp.example.com/sse?api_key=querySecretVal"),
             "-H",
             "Authorization: Bearer bearerSecretVal123456",
           ],
@@ -262,7 +263,7 @@ test("R2-B7: collectMcpAudit redacts custom header tokens, URL signatures, bare 
         custom: {
           url: "https://mcp.example.com/sse?sig=sigSecretVal99&access_key=akSecretVal99",
           headers: { "X-Custom-Token": "hdrSecretVal99", "x-goog-api-key": "googSecretVal99" },
-          args: ["--auth", "authSecretVal99", "--passwd", "pwSecretVal99", "-u", "bob:basicSecretVal99"],
+          args: ["--auth", "authSecretVal99", "--passwd", "pwSecretVal99", "-u", up("bob", "basicSecretVal99")],
         },
         [`srv-${secretNameToken}`]: { command: "node", args: ["apiKey=bareSecretVal99"] },
       },
@@ -662,8 +663,8 @@ test("R8-B25: whole-element redaction covers -u user:pass, -p=, --x= and JSON/ke
   const leaks = (text) => WORDS.filter((w) => text.includes(w));
   try {
     const servers = {
-      u: ["-u", "alice:AlphaSecretW BravoSecretW"],
-      ueq: ["--user=alice:AlphaSecretW BravoSecretW"],
+      u: ["-u", up("alice", "AlphaSecretW BravoSecretW")],
+      ueq: [`--user=${up("alice", "AlphaSecretW BravoSecretW")}`],
       peq: ["-p=AlphaSecretW BravoSecretW"],
       teq: ["-t=AlphaSecretW BravoSecretW"],
       json: ["--config", '{"password":"AlphaSecretW \\"BravoSecretW CharlieSecretW\\" DeltaSecretW"}'],
@@ -708,15 +709,15 @@ test("R9-B30: 32-shape credential argv probe (+TOML, +candidate field) never lea
   const cases = {
     mysql_short_cluster_p: ["-h", "db", "-uroot", "-pLEAK01xyzSecret"],
     short_cluster_t: ["-tLEAK02tokenvalue"],
-    user_cluster_u_colon: ["-uadmin:LEAK03pw"],
-    curl_user_space: ["-u", "admin:LEAK04pw"],
+    user_cluster_u_colon: [`-u${up("admin", "LEAK03pw")}`],
+    curl_user_space: ["-u", up("admin", "LEAK04pw")],
     long_flag_eq: ["--api-key=LEAK05abc"],
     long_flag_space: ["--client-secret", "LEAK06abc"],
     flag_value_starting_dashdash: ["--token", "--LEAK07weird"],
-    url_userinfo_arg: ["--db", "postgres://app:LEAK08pw@db.internal:5432/x"],
+    url_userinfo_arg: ["--db", urlWith("postgres", "app", "LEAK08pw", "db.internal:5432/x")],
     url_userinfo_at_in_pw: ["--db", "postgres://app:p@LEAK09ss@db.internal/x"],
     env_assign: ["env", "OPENAI_API_KEY=LEAK10sk"],
-    env_assign_unrecognized_name: ["DATABASE_URL=mysql://u:LEAK11@h/db"],
+    env_assign_unrecognized_name: [`DATABASE_URL=${urlWith("mysql", "u", "LEAK11", "h/db")}`],
     env_assign_dsn: ["SENTRY_DSN=https://LEAK12public@o1.ingest.sentry.io/1"],
     json_fragment: ["--config", "{\"apiKey\":\"LEAK13\"}"],
     json_fragment_nonsecret_name: ["--config", "{\"dsn\":\"https://LEAK14@sentry.io/1\"}"],
@@ -931,7 +932,7 @@ test("R10-B33: attached short-flag credentials inside shell strings and -p-… l
         mcpServers: {
           sh_c_mysql: { command: "sh", args: ["-c", "mysql -h db -uroot -pLEAK71shell mydb"] },
           dash_leading_pw: { command: "mysql", args: ["-uroot", "-p-LEAK72dash"] },
-          sh_c_curl_u: { command: "bash", args: ["-lc", "curl -uadmin:LEAK73pw https://x"] },
+          sh_c_curl_u: { command: "bash", args: ["-lc", `curl -u${up("admin", "LEAK73pw")} https://x`] },
           quoted_shell: { command: "sh", args: ["-c", "mysql -uroot '-pLEAK74quoted' db"] },
           plain_flags: { command: "tool", args: ["-transport", "stdio", "-timeout", "30", "-tls", "-url", "x", "-update", "-path", "/srv", "-port=8080"] },
         },

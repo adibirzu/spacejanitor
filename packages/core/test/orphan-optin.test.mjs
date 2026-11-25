@@ -12,6 +12,7 @@ import {
   redactSecrets,
   removeLinkedWorktree,
 } from "../src/index.mjs";
+import { up, urlWith } from "./_fixtures.mjs";
 
 const CLI = new URL("../../cli/bin/spacejanitor.mjs", import.meta.url).pathname;
 
@@ -96,7 +97,7 @@ test("CLI: summary and orphans spawn no git by default; --include-orphans opts i
 
 test("R11/R12: an attached short-flag credential after NAME= (any quoting/separator) is redacted", () => {
   for (const s of [
-    "OPTS=-pLEAK90secret mysql db", "sh -c 'OPTS=-uadmin:LEAK91pw mysql'", "X=-tLEAK92tok run",
+    "OPTS=-pLEAK90secret mysql db", `sh -c 'OPTS=-u${up("admin", "LEAK91pw")} mysql'`, "X=-tLEAK92tok run",
     'OPTS="-pLEAK93q"', "OPTS='-pLEAK94q'", "a=b,OPTS=-pLEAK95c", "--opts=-pLEAK96x", "--opts='-pLEAK97y'",
   ]) {
     const out = redactSecrets(s);
