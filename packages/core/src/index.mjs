@@ -6,6 +6,8 @@ import {
   collectOrphans,
   inspectWorktree,
   removeLinkedWorktree,
+  ORPHAN_SCAN_WARNING,
+  ORPHAN_SCAN_DISABLED_MESSAGE,
   classifyExecutableConfigKey,
   collectMemory as _collectMemory,
   collectBlockers,
@@ -34,6 +36,8 @@ export { DEFAULT_PROTECTED_PATTERNS, isProtectedPath };
 export { redactSecrets, redactArgv };
 
 export {
+  ORPHAN_SCAN_WARNING,
+  ORPHAN_SCAN_DISABLED_MESSAGE,
   inspectWorktree,
   removeLinkedWorktree,
   classifyExecutableConfigKey,

@@ -14,6 +14,7 @@ import {
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
 import { executePlanItems } from "./executor";
 import { removeWorktreeSafely } from "./worktreeGuard";
+import { OrphanScanSetting } from "./orphanSetting";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
 
@@ -28,6 +29,7 @@ const bridge = new SjBridge({
   binaryPath: resolveSjBinary({ isPackaged: app.isPackaged }),
 });
 const gate = new RemediationGate();
+const orphanScan = new OrphanScanSetting(path.join(app.getPath("userData"), "settings.json"));
 const slmAdvisor = new SlmAdvisorService();
 
 function resolveUiEntry(): { devUrl?: string; indexPath?: string } {
@@ -206,6 +208,8 @@ function registerIpcHandlers(): void {
     } else {
       delete params.targetPath;
     }
+    // Only the main process decides whether git may run inside repositories found on disk (default OFF).
+    if (method === "orphans" || method === "summary") params.includeOrphans = orphanScan.get();
     const result = await bridge.invoke(method, params);
     registerApprovedFromReport(method, result);
     return result;
@@ -241,11 +245,20 @@ function registerIpcHandlers(): void {
         homeDir: os.homedir(),
         isInsideOsTrash,
         trashItem: (p) => shell.trashItem(p),
-        removeWorktree: (p) => removeWorktreeSafely(p),
+        removeWorktree: (p) => removeWorktreeSafely(p, { includeOrphans: orphanScan.get() }),
+        orphanScanEnabled: () => orphanScan.get(),
       })
     );
   });
 
+  ipcMain.handle("sj:orphan-scan-get", (event) => {
+    assertAuthorizedSender(event);
+    return { enabled: orphanScan.get(), warning: OrphanScanSetting.WARNING };
+  });
+  ipcMain.handle("sj:orphan-scan-set", (event, payload: { enabled?: unknown }) => {
+    assertAuthorizedSender(event);
+    return { enabled: orphanScan.set(payload?.enabled === true), warning: OrphanScanSetting.WARNING };
+  });
   ipcMain.handle("sj:slm-get-config", (event) => {
     assertAuthorizedSender(event);
     return slmAdvisor.getConfig();

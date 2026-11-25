@@ -97,7 +97,7 @@ test("R10-B34: a hanging Rust sj makes the orphan proof fail closed and say so (
     fs.writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
     process.env.SPACEJANITOR_SJ_TIMEOUT_MS = "300";
     const bridge = new SjBridge({ binaryPath: fake });
-    const res = (await bridge.invoke("orphans", { targetPath: repo })) as {
+    const res = (await bridge.invoke("orphans", { targetPath: repo, includeOrphans: true })) as {
       rustProof?: string;
       candidates: Array<{ path: string; safeToPrune: boolean }>;
     };

@@ -174,7 +174,7 @@ export class SjBridge {
       doctor: ["doctor", "--json"],
       disk: ["scan", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       trash: ["trash", "--json"],
-      orphans: ["orphans", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
+      orphans: ["orphans", "--include-orphans", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       memory: ["memory", "--json"],
       blockers: ["blockers", "--json"],
       "mcp-audit": ["mcp-audit", "--json"],
@@ -212,6 +212,11 @@ export class SjBridge {
   }
 
   async invoke(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+    // Orphan scanning is OFF unless the main process explicitly opted in: no Rust call, no git, and the
+    // report says "not scanned" instead of an empty "no orphans".
+    if (method === "orphans" && params.includeOrphans !== true) {
+      return core.collectOrphans({ targetPath: params.targetPath });
+    }
     if (this.binaryPath) {
       try {
         return await this.callSidecar(method, params);
@@ -232,7 +237,7 @@ export class SjBridge {
       case "blockers":
         return core.collectBlockers();
       case "orphans":
-        return this.failClosed(method, await core.collectOrphans(params));
+        return this.failClosed(method, await core.collectOrphans({ ...params, includeOrphans: true }));
       case "trash":
         return core.collectTrash(params);
       case "mcp-audit":

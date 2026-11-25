@@ -18,6 +18,7 @@ import {
   collectMcpAudit,
   collectMemory,
   collectOrphans,
+  ORPHAN_SCAN_WARNING,
   collectSummary,
   collectTrash,
   createRemediationPlan,
@@ -42,7 +43,7 @@ function printHelp() {
     "  disk        Audit filesystem capacity and top space consumers",
     "  memory      Audit true RAM footprint (RSS + compressed/swapped)",
     "  blockers    Detect kernel vnode, inotify, handle, and VFS lock blockers",
-    "  orphans     Inspect clean/pushed vs dirty git worktrees and orphan work",
+    "  orphans     Inspect git worktrees/orphan work (OFF by default; needs --include-orphans)",
     "  trash       Inspect OS Trash / Recycle Bin reclamation candidates",
     "  mcp-audit   Audit MCP server fan-out, duplicates, and redacted secret risks",
     "  remediate   Preview dry-run plan (--execute fails closed in Node fallback; use Desktop or Rust sj)",
@@ -52,6 +53,7 @@ function printHelp() {
     "  --json              Emit machine-readable versioned JSON contract",
     "  --fail-on-alert     Exit with code 2 if status is ALERT or CRITICAL",
     "  --path <dir>        Target path for disk/orphans scan",
+    "  --include-orphans   Opt in to orphan scanning: runs git inside repositories found on disk (unreviewed, experimental)",
     "  --execute           Fail-closed execution guard (not implemented in Node AXI CLI)",
     "  --confirm <phrase>  Confirmation phrase from dry-run plan",
     "  --plan-sha256 <sha> SHA-256 digest from dry-run plan",
@@ -170,12 +172,14 @@ async function main(argv) {
   const failOnAlert = flags.has("--fail-on-alert");
   const targetPath = values.get("--path") || process.cwd();
 
+  const includeOrphans = flags.has("--include-orphans");
+  if (includeOrphans) console.error(ORPHAN_SCAN_WARNING);
   let report = null;
 
   if (cmd === "doctor") {
     report = tryRustSj(["doctor"]) || collectDoctor({ version: VERSION });
   } else if (cmd === "summary") {
-    report = await collectSummary({ targetPath });
+    report = await collectSummary({ targetPath, includeOrphans });
   } else if (cmd === "disk") {
     report = tryRustSj(["scan", targetPath]) || (await collectDisk({ targetPath }));
   } else if (cmd === "memory") {
@@ -183,8 +187,11 @@ async function main(argv) {
   } else if (cmd === "blockers") {
     report = tryRustSj(["blockers"]) || (await collectBlockers());
   } else if (cmd === "orphans") {
-    report =
-      tryRustSj(["orphans", targetPath]) || failClosedOnRustFailure(await collectOrphans({ targetPath }));
+    // Off unless --include-orphans: no git is spawned (not by Rust, not by Node) and the report says "not scanned".
+    report = includeOrphans
+      ? tryRustSj(["orphans", targetPath, "--include-orphans"]) ||
+        failClosedOnRustFailure(await collectOrphans({ targetPath, includeOrphans: true }))
+      : await collectOrphans({ targetPath });
   } else if (cmd === "trash") {
     report = tryRustSj(["trash"]) || (await collectTrash());
   } else if (cmd === "mcp-audit") {
@@ -211,7 +218,7 @@ async function main(argv) {
   } else if (cmd === "advise") {
     const slmUrl = values.get("--slm-url") || "";
     const enabled = Boolean(slmUrl);
-    const summary = await collectSummary({ targetPath });
+    const summary = await collectSummary({ targetPath, includeOrphans });
     report = await adviseWithLocalSlm({
       enabled,
       url: slmUrl || "http://127.0.0.1:11434/v1/chat/completions",

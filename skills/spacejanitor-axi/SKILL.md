@@ -14,20 +14,20 @@ Read-only workstation diagnostics and dry-run remediation planner for macOS, Lin
 
 - Before spawning parallel AI coding agents or heavy local builds, check whether disk space, compressed memory, kernel vnodes / `inotify` watches, or MCP process counts are near saturation.
 - When diagnosing why terminals, SSH, or UI are stalling under swap or VFS lock pressure.
-- When locating orphaned clean/pushed git worktrees, OS Trash bloat, or orphaned `PPID=1` background scripts.
+- When locating OS Trash bloat or orphaned `PPID=1` background scripts. (Orphan git worktree scanning is experimental and **off by default**: it runs git inside repositories found on disk; pass `--include-orphans` only for repositories you trust.)
 
 ## Commands
 
 Default output is compact **TOON** (token-efficient line format). Pass `--json` for versioned `spacejanitor.*.v1` JSON envelopes.
 
 ```sh
-npx spacejanitor-axi summary [--json]     # aggregated health across disk, memory, blockers, orphans, mcp
+npx spacejanitor-axi summary [--json]     # aggregated health across disk, memory, blockers, mcp (orphans: not scanned unless --include-orphans)
 npx spacejanitor-axi doctor [--json]      # verify platform, Node runtime, and schema versions
 npx spacejanitor-axi disk [--json]        # storage capacity, thresholds, and top consumers
 npx spacejanitor-axi memory [--json]      # true footprint (RSS + compressed/swap) by process
 npx spacejanitor-axi blockers [--json]    # kernel vnodes / inotify / handles / VFS lock blockers
 npx spacejanitor-axi mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
-npx spacejanitor-axi orphans [--json]     # git worktrees (clean + pushed proof) & stale build trees
+npx spacejanitor-axi orphans --include-orphans [--json]  # EXPERIMENTAL, opt-in: runs git inside repos found on disk; without the flag reports "not scanned"
 npx spacejanitor-axi trash [--json]       # OS Trash / Recycle Bin audit
 npx spacejanitor-axi remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
 ```

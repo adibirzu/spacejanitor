@@ -33,6 +33,7 @@ const deps = (home: string, extra: Record<string, unknown> = {}) => ({
   removeWorktree: async () => {
     throw new Error("unexpected removeWorktree");
   },
+  orphanScanEnabled: () => true,
   ...extra,
 });
 

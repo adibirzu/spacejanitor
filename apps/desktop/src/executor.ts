@@ -11,6 +11,8 @@ export interface ExecutorDeps {
   isInsideOsTrash: (p: string) => boolean;
   trashItem: (p: string) => Promise<void>;
   removeWorktree: (p: string) => Promise<void>;
+  /** orphan/worktree removal runs git in repositories we did not create: OFF unless this returns true */
+  orphanScanEnabled?: () => boolean;
   /** test seam: runs after each item has been handled (while later items are still pending) */
   afterItem?: (item: { path: string }) => void | Promise<void>;
   /** test seam: runs immediately before every unlink/rmdir */
@@ -98,6 +100,9 @@ export async function executePlanItems(
     const deleted: string[] = [];
     const itemDeps: ExecutorDeps = { ...deps, deleted };
     try {
+      if (item.kind === "git-worktree" && deps.orphanScanEnabled?.() !== true) {
+        throw new Error("orphan_scanning_disabled");
+      }
       let st: fs.BigIntStats;
       try {
         st = fs.lstatSync(item.path, { bigint: true });
@@ -117,7 +122,7 @@ export async function executePlanItems(
         if (desc.protected) throw new Error(desc.reason.startsWith("protected_descendant") ? desc.reason : `protected_descendant:${desc.reason}`);
       }
       if (item.kind === "git-worktree") {
-        const blocked = await worktreePruneBlockReason(item.path);
+        const blocked = await worktreePruneBlockReason(item.path, { includeOrphans: true });
         if (blocked) throw new Error(blocked);
         await deps.removeWorktree(item.path);
       } else if (deps.isInsideOsTrash(item.path)) {

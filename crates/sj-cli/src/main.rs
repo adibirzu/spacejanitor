@@ -10,6 +10,9 @@ use sj_core::{
 };
 use std::env;
 use std::path::PathBuf;
+
+const ORPHAN_SCAN_WARNING: &str = "warning: orphan scanning runs git inside repositories found on disk and is unreviewed, experimental behavior (see docs: Known limitations). Only use it on repositories you trust.";
+const ORPHAN_SCAN_DISABLED_MESSAGE: &str = "Orphan scanning runs git inside repositories found on disk and is disabled by default (unreviewed, experimental). Opt in with --include-orphans.";
 use std::process::{Command, ExitCode};
 
 #[derive(Parser)]
@@ -56,6 +59,9 @@ enum Commands {
         /// Maximum nested search depth
         #[arg(long, default_value_t = 5)]
         depth: usize,
+        /// Opt in to scanning: runs git inside repositories found on disk (unreviewed, experimental)
+        #[arg(long, default_value_t = false)]
+        include_orphans: bool,
         /// Emit versioned JSON output
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -68,7 +74,8 @@ enum Commands {
         /// Include OS Trash items in the plan
         #[arg(long, default_value_t = false)]
         include_trash: bool,
-        /// Include safe-to-prune orphan worktrees in the plan
+        /// Opt in to orphan worktrees in the plan: runs git inside repositories found on disk
+        /// (OFF by default; unreviewed, experimental)
         #[arg(long, default_value_t = false)]
         include_orphans: bool,
         /// Override trash directory path
@@ -244,7 +251,32 @@ fn run() -> Result<(), CliError> {
                 );
             }
         }
-        Commands::Orphans { path, depth, json } => {
+        Commands::Orphans {
+            path,
+            depth,
+            include_orphans,
+            json,
+        } => {
+            if !include_orphans {
+                // Off by default: nothing is scanned and git is never spawned.
+                let report = serde_json::json!({
+                    "schema": SCHEMA_ORPHANS_V1,
+                    "root": path.to_string_lossy(),
+                    "scanned": false,
+                    "not_scanned_reason": "orphan_scan_disabled_by_default",
+                    "message": ORPHAN_SCAN_DISABLED_MESSAGE,
+                    "candidates_scanned": 0,
+                    "safe_to_prune": [],
+                    "blocked": [],
+                });
+                if json {
+                    println!("{}", serde_json::to_string_pretty(&report).map_err(SjError::from)?);
+                } else {
+                    println!("orphans: not scanned (disabled by default). {ORPHAN_SCAN_DISABLED_MESSAGE}");
+                }
+                return Ok(());
+            }
+            eprintln!("{ORPHAN_SCAN_WARNING}");
             let report = inspect_orphans(&path, &ctx, &OrphanOptions { max_depth: depth })?;
             if json {
                 println!(
@@ -284,11 +316,15 @@ fn run() -> Result<(), CliError> {
                     "cannot combine --trash-path with --execute; execution is restricted to verified OS Trash roots".to_string(),
                 ));
             }
+            // Orphan scanning is OFF unless explicitly requested; a bare `sj plan` is trash only.
             let (inc_trash, inc_orphans) = if !include_trash && !include_orphans {
-                (true, true)
+                (true, false)
             } else {
                 (include_trash, include_orphans)
             };
+            if inc_orphans {
+                eprintln!("{ORPHAN_SCAN_WARNING}");
+            }
             let opts = PlanOptions {
                 include_trash: inc_trash,
                 include_orphans: inc_orphans,

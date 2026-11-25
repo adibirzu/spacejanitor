@@ -38,16 +38,16 @@ test("R6-B21: desktop prune guard blocks ignored, untracked and unpushed worktre
     const ignored = mk("ignored");
     const untracked = mk("untracked");
     const unpushed = mk("unpushed");
-    assert.equal(await worktreePruneBlockReason(clean), null);
+    assert.equal(await worktreePruneBlockReason(clean, { includeOrphans: true }), null);
     fs.writeFileSync(path.join(ignored, "db.secret"), "precious");
     fs.writeFileSync(path.join(untracked, "n.txt"), "n");
     fs.writeFileSync(path.join(unpushed, "u.txt"), "u");
     git(unpushed, "add", "u.txt");
     git(unpushed, "commit", "-m", "local");
     for (const p of [ignored, untracked, unpushed]) {
-      assert.notEqual(await worktreePruneBlockReason(p), null, `must block ${path.basename(p)}`);
+      assert.notEqual(await worktreePruneBlockReason(p, { includeOrphans: true }), null, `must block ${path.basename(p)}`);
     }
-    assert.notEqual(await worktreePruneBlockReason(path.join(base, "missing")), null);
+    assert.notEqual(await worktreePruneBlockReason(path.join(base, "missing"), { includeOrphans: true }), null);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
@@ -75,13 +75,13 @@ test("R7-B23: guard blocks a worktree whose edits hide behind assume-unchanged /
     const control = mk("control");
     const assume = mk("assume");
     const skip = mk("skip");
-    assert.equal(await worktreePruneBlockReason(control), null);
+    assert.equal(await worktreePruneBlockReason(control, { includeOrphans: true }), null);
     git(assume, "update-index", "--assume-unchanged", "a.txt");
     fs.writeFileSync(path.join(assume, "a.txt"), "EDIT");
     git(skip, "update-index", "--skip-worktree", "a.txt");
     fs.writeFileSync(path.join(skip, "a.txt"), "EDIT");
-    assert.equal(await worktreePruneBlockReason(assume), "worktree_index_flags_hide_changes");
-    assert.equal(await worktreePruneBlockReason(skip), "worktree_index_flags_hide_changes");
+    assert.equal(await worktreePruneBlockReason(assume, { includeOrphans: true }), "worktree_index_flags_hide_changes");
+    assert.equal(await worktreePruneBlockReason(skip, { includeOrphans: true }), "worktree_index_flags_hide_changes");
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
@@ -112,7 +112,7 @@ test("R9-B27: guard is not fooled by a lying core.fsmonitor and never runs the h
     git(wt, "status");
     fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
     fs.rmSync(marker, { force: true });
-    assert.notEqual(await worktreePruneBlockReason(wt), null);
+    assert.notEqual(await worktreePruneBlockReason(wt, { includeOrphans: true }), null);
     assert.equal(fs.existsSync(marker), false);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
@@ -141,13 +141,13 @@ test("R10: removeWorktreeSafely removes a worktree placed BESIDE the repo, and t
     const beside = mk("beside");
     const locked = mk("locked");
     git(repo, "worktree", "lock", locked);
-    assert.equal(await worktreePruneBlockReason(beside), null);
-    assert.equal(await worktreePruneBlockReason(locked), "worktree_locked");
-    await removeWorktreeSafely(beside);
+    assert.equal(await worktreePruneBlockReason(beside, { includeOrphans: true }), null);
+    assert.equal(await worktreePruneBlockReason(locked, { includeOrphans: true }), "worktree_locked");
+    await removeWorktreeSafely(beside, { includeOrphans: true });
     assert.equal(fs.existsSync(beside), false);
     git(repo, "config", "core.sshCommand", "false");
     const other = mk("other");
-    assert.match(String(await worktreePruneBlockReason(other)), /repo_config_can_execute/);
+    assert.match(String(await worktreePruneBlockReason(other, { includeOrphans: true })), /repo_config_can_execute/);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

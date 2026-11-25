@@ -9,6 +9,11 @@ import { promisify } from "node:util";
 const execFileAsync = promisify(execFile);
 const GIB = 1024 ** 3;
 
+export const ORPHAN_SCAN_WARNING =
+  "warning: orphan scanning runs git inside repositories found on disk and is unreviewed, experimental behavior (see Known limitations). Only use it on repositories you trust.";
+export const ORPHAN_SCAN_DISABLED_MESSAGE =
+  "Orphan scanning runs git inside repositories found on disk and is disabled by default (unreviewed, experimental). Opt in explicitly (CLI: --include-orphans; desktop: Settings).";
+
 export const SCHEMA_VERSIONS_EXT = Object.freeze({
   doctor: "spacejanitor.doctor.v1",
   storage: "spacejanitor.storage.v1",
@@ -342,7 +347,7 @@ async function safeExec(cmd, args, cwd) {
  * Mirrors the Rust core (crates/sj-core/src/orphans.rs): dirty, untracked, ignored files, stashes,
  * unpushed commits/branches, no remote and detached/unborn HEAD all block; any git failure blocks.
  */
-export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false } = {}) {
+export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false, includeOrphans = false } = {}) {
   const base = {
     id: `wt-${path.basename(wtPath)}`,
     path: wtPath,
@@ -362,6 +367,8 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false 
     safeToPrune: false,
     ...extra,
   });
+  // OFF unless explicitly opted in: nothing here may run git against a repository we did not create.
+  if (!includeOrphans) return unverified({ proofStatus: "not_scanned", notScannedReason: "orphan_scan_disabled_by_default" });
   if (!wtPath || !fs.existsSync(wtPath)) return unverified();
   const gitDir = resolveWorktreeGitDir(wtPath);
   if (!gitDir) return unverified();
@@ -456,7 +463,8 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false 
  * --git-dir/--work-tree and the same neutralised config as the proofs (no --force: git itself still
  * refuses dirty or locked worktrees). Works for worktrees placed beside the repo as well as inside it.
  */
-export async function removeLinkedWorktree(wtPath) {
+export async function removeLinkedWorktree(wtPath, { includeOrphans = false } = {}) {
+  if (!includeOrphans) return { ok: false, error: "orphan_scanning_disabled" };
   const gitDir = resolveWorktreeGitDir(wtPath);
   if (!gitDir) return { ok: false, error: "worktree_git_dir_unresolvable" };
   const commonDir = resolveCommonDir(gitDir);
@@ -474,9 +482,25 @@ export async function removeLinkedWorktree(wtPath) {
   }
 }
 
-export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14 } = {}) {
+export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14, includeOrphans = false } = {}) {
   const resolved = path.resolve(targetPath);
   const candidates = [];
+
+  if (!includeOrphans) {
+    // Off by default and NOT an empty "no orphans" result: nothing was looked at, and git was not spawned.
+    return {
+      schema: SCHEMA_VERSIONS_EXT.orphans,
+      source: "node-fallback",
+      status: "not_scanned",
+      scanned: false,
+      notScannedReason: "orphan_scan_disabled_by_default",
+      message: ORPHAN_SCAN_DISABLED_MESSAGE,
+      targetPath: resolved,
+      maxAgeDays,
+      candidates,
+      timestamp: new Date().toISOString(),
+    };
+  }
 
   const insideGit = await gitSafeIn(resolved, ["rev-parse", "--is-inside-work-tree"]);
   if (insideGit.ok && insideGit.stdout === "true") {
@@ -492,7 +516,7 @@ export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 
         const wtPath = first.slice("worktree ".length).trim();
         if (!wtPath || wtPath === resolved) continue;
         const locked = lines.some((l) => l === "locked" || l.startsWith("locked "));
-        candidates.push(await inspectWorktree(wtPath, { maxAgeDays, locked }));
+        candidates.push(await inspectWorktree(wtPath, { maxAgeDays, locked, includeOrphans: true }));
       }
     }
   }
@@ -500,6 +524,7 @@ export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 
   return {
     schema: SCHEMA_VERSIONS_EXT.orphans,
     source: "node-fallback",
+    scanned: true,
     targetPath: resolved,
     maxAgeDays,
     candidates,

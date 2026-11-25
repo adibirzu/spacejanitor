@@ -67,6 +67,10 @@ export interface SummaryReport {
     counters: BlockerCounter[];
   };
   orphans: {
+    /** false = orphan scanning is OFF (default): the list below is NOT "no orphans", it was never looked at */
+    scanned?: boolean;
+    notScannedReason?: string;
+    message?: string;
     candidates: OrphanCandidate[];
   };
   trash: {
@@ -106,6 +110,8 @@ export interface SpaceJanitorBridge {
   getSummary: (targetPath?: string) => Promise<SummaryReport>;
   planRemediation: (candidates: DiskConsumer[]) => Promise<RemediationPlan>;
   executeRemediation: (payload: { planSha256: string; phrase: string }) => Promise<Record<string, unknown>>;
+  getOrphanScan: () => Promise<{ enabled: boolean; warning: string }>;
+  setOrphanScan: (enabled: boolean) => Promise<{ enabled: boolean; warning: string }>;
   getSlmConfig: () => Promise<SlmConfig>;
   updateSlmConfig: (config: Partial<SlmConfig>) => Promise<SlmConfig>;
   explainWithSlm: (payload: {

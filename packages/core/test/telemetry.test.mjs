@@ -61,7 +61,7 @@ test("collectors emit valid v1 envelopes with node-fallback source", async () =>
   assert.equal(blockers.schema, "spacejanitor.blockers.v1");
   assert.ok(["OK", "WARN", "CRITICAL"].includes(blockers.status));
 
-  const orphans = await collectOrphans({ targetPath: process.cwd() });
+  const orphans = await collectOrphans({ targetPath: process.cwd(), includeOrphans: true });
   assert.equal(orphans.schema, "spacejanitor.orphans.v1");
   assert.ok(Array.isArray(orphans.candidates));
 
@@ -193,7 +193,7 @@ test("B5: collectOrphans fails closed on git errors and detects unpushed detache
     fs.rmSync(path.join(wtBroken, ".git"), { force: true });
     fs.writeFileSync(path.join(wtBroken, ".git"), "gitdir: /nonexistent/invalid/gitdir\n");
 
-    const report = await collectOrphans({ targetPath: repoDir });
+    const report = await collectOrphans({ targetPath: repoDir, includeOrphans: true });
     const detachedEntry = report.candidates.find((c) => path.basename(c.path) === "wt-detached");
     assert.ok(detachedEntry, "expected detached worktree in candidates");
     assert.equal(detachedEntry.hasUnpushed, true);
@@ -538,7 +538,7 @@ test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed
     const stashed = mk("wt-stashed", "b-stashed");
     // proof for the clean worktree is taken BEFORE any sibling gets an unpushed branch (the unpushed
     // check is repo-wide, as in the Rust core)
-    const cleanProof = await inspectWorktree(clean);
+    const cleanProof = await inspectWorktree(clean, { includeOrphans: true });
     assert.equal(cleanProof.safeToPrune, true, `clean pushed worktree is safe: ${JSON.stringify(cleanProof)}`);
     fs.writeFileSync(path.join(ignored, "db.secret"), "precious");
     fs.mkdirSync(path.join(ignored, "local-data"));
@@ -551,18 +551,18 @@ test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed
     const detached = path.join(base, "wt-detached");
     git(repo, "worktree", "add", "--detach", detached);
 
-    const proof = async (p) => (await inspectWorktree(p)).safeToPrune;
+    const proof = async (p) => (await inspectWorktree(p, { includeOrphans: true })).safeToPrune;
     for (const [name, p] of Object.entries({ ignored, untracked, unpushed, stashed, detached })) {
       assert.equal(await proof(p), false, `${name} must not be safe to prune`);
     }
-    const report = await collectOrphans({ targetPath: repo });
+    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
     const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
     assert.equal(byBase["wt-ignored"].safeToPrune, false);
     assert.equal(byBase["wt-ignored"].hasIgnored, true);
     assert.equal(byBase["wt-stashed"].hasStashes, true);
     assert.equal(report.candidates.some((c) => c.path === repo), false, "main checkout is never listed");
     // from inside a linked worktree the main checkout must still not be offered
-    const fromLinked = await collectOrphans({ targetPath: clean });
+    const fromLinked = await collectOrphans({ targetPath: clean, includeOrphans: true });
     assert.equal(fromLinked.candidates.some((c) => c.path === repo), false);
     // unverifiable path -> not safe
     assert.equal(await proof(path.join(base, "does-not-exist")), false);
@@ -594,7 +594,7 @@ test("R7-B23: index flags (assume-unchanged, skip-worktree) that can hide edits 
     const control = mk("control");
     const assume = mk("assume");
     const skip = mk("skip");
-    assert.equal((await inspectWorktree(control)).safeToPrune, true);
+    assert.equal((await inspectWorktree(control, { includeOrphans: true })).safeToPrune, true);
     git(assume, "update-index", "--assume-unchanged", "a.txt");
     fs.writeFileSync(path.join(assume, "a.txt"), "UNCOMMITTED EDIT");
     git(skip, "update-index", "--skip-worktree", "b.txt");
@@ -602,7 +602,7 @@ test("R7-B23: index flags (assume-unchanged, skip-worktree) that can hide edits 
     // git status stays clean in both - that is the whole problem
     assert.equal(git(assume, "status", "--porcelain").trim(), "");
     for (const [name, p] of Object.entries({ assume, skip })) {
-      const proof = await inspectWorktree(p);
+      const proof = await inspectWorktree(p, { includeOrphans: true });
       assert.equal(proof.safeToPrune, false, `${name} must not be safe`);
       assert.equal(proof.hasIndexFlags, true, `${name} must report hasIndexFlags`);
     }
@@ -808,10 +808,10 @@ test("R9-B27: a lying core.fsmonitor hook cannot hide edits and is never execute
   const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9b27-")));
   try {
     const { repo, wt, marker } = lyingFsmonitorFixture(base);
-    const proof = await inspectWorktree(wt);
+    const proof = await inspectWorktree(wt, { includeOrphans: true });
     assert.equal(fs.existsSync(marker), false, "the repo's fsmonitor hook must not run during the proof");
     assert.equal(proof.safeToPrune, false, "modified tracked file must block the prune");
-    const report = await collectOrphans({ targetPath: repo });
+    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
     assert.equal(fs.existsSync(marker), false, "hook must not run during collectOrphans either");
     assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
   } finally {
@@ -845,7 +845,7 @@ test("R9-B28/B29: commits held only by tags, per-worktree refs, bisect refs or t
     const bis = mk("ref-bisect");
     const rlog = mk("head-reflog");
     const locked = mk("locked");
-    assert.equal((await inspectWorktree(control)).safeToPrune, true, "control must be safe before siblings add local commits");
+    assert.equal((await inspectWorktree(control, { includeOrphans: true })).safeToPrune, true, "control must be safe before siblings add local commits");
     const commit = (p, name) => {
       fs.writeFileSync(path.join(p, name), "x");
       git(p, "add", name);
@@ -872,9 +872,9 @@ test("R9-B28/B29: commits held only by tags, per-worktree refs, bisect refs or t
     // control must still be safe? other worktrees now hold local-only objects, so only per-worktree
     // proofs are asserted here: each of these holds something no branch or remote has.
     for (const [name, p] of Object.entries({ light, ann, wref, bis, rlog })) {
-      assert.equal((await inspectWorktree(p)).safeToPrune, false, `${name} must not be safe`);
+      assert.equal((await inspectWorktree(p, { includeOrphans: true })).safeToPrune, false, `${name} must not be safe`);
     }
-    const report = await collectOrphans({ targetPath: repo });
+    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
     const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
     assert.equal(byBase.locked.safeToPrune, false, "locked worktree must not be safe");
     assert.equal(byBase.locked.locked, true);
@@ -907,7 +907,7 @@ test("R9-note: a config.worktree core.worktree decoy and an inherited GIT_DIR ca
     fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
     fs.writeFileSync(path.join(wt, "untracked_work.txt"), "work");
     process.env.GIT_DIR = path.join(repo, ".git");
-    const proof = await inspectWorktree(wt);
+    const proof = await inspectWorktree(wt, { includeOrphans: true });
     assert.equal(proof.safeToPrune, false);
     // the ONLY thing blocking the prune must be the dirty tree itself, so a redirected proof cannot pass
     assert.equal(proof.clean, false, "dirty edit must be seen through the decoy");
@@ -1013,8 +1013,8 @@ test("R10-B32: repo-local config that can execute commands blocks the proof and 
       git(wt, "push", "-u", "origin", "feat");
       const marker = path.join(base, `MARK_${name}`);
       arm(repo, wt, marker);
-      const proof = await inspectWorktree(wt);
-      const report = await collectOrphans({ targetPath: repo });
+      const proof = await inspectWorktree(wt, { includeOrphans: true });
+      const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
       assert.equal(proof.safeToPrune, false, `${name}: must not be safe`);
       assert.match(String(proof.configRisk), /repo_config_can_execute/, `${name}: reason`);
       assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
@@ -1067,9 +1067,9 @@ test("R10-B34: Node agrees with Rust on remote tags and on amend-before-push (li
     git(lost, "commit", "-m", "abandoned");
     git(lost, "checkout", "b-lost");
 
-    assert.equal((await inspectWorktree(tagged)).safeToPrune, true, "commit held by a REMOTE tag is safe");
-    assert.equal((await inspectWorktree(amended)).safeToPrune, true, "amend-before-push must not block forever");
-    assert.equal((await inspectWorktree(lost)).safeToPrune, false, "abandoned detached commit still blocks");
+    assert.equal((await inspectWorktree(tagged, { includeOrphans: true })).safeToPrune, true, "commit held by a REMOTE tag is safe");
+    assert.equal((await inspectWorktree(amended, { includeOrphans: true })).safeToPrune, true, "amend-before-push must not block forever");
+    assert.equal((await inspectWorktree(lost, { includeOrphans: true })).safeToPrune, false, "abandoned detached commit still blocks");
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

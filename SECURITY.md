@@ -4,12 +4,21 @@
 
 SpaceJanitor inspects local filesystems, git worktrees, running process arguments, and memory counters, and optionally cleans approved targets. Because a system janitor handles high-privilege diagnostics and destructive cleanup actions, SpaceJanitor enforces these invariants by design:
 
-1. **Read-Only Default:** All audit commands, collectors, and dry-run previews execute zero file deletions, zero git mutations, and zero process signals.
+1. **Read-Only Default:** (orphan-repo scanning, which runs git inside repositories found on disk, is a separate opt-in, see Known limitations) All audit commands, collectors, and dry-run previews execute zero file deletions, zero git mutations, and zero process signals.
 2. **Two-Step Execution Gate:** Any destructive action requires explicit confirmation flags in the CLI or a two-step typed confirmation + single-use time-bounded token in the UI.
 3. **Immutable Protected-Path Denylist:** Rules in `packages/core` block removal of SSH keys, GPG keyrings, cloud credential directories, active working directories, and user-declared protected globs—even if a plugin rule explicitly targets them.
 4. **CLI Argument Secret Redaction:** Process inspection collectors (`ps`, `/proc`, WMI/CIM) automatically redact bearer tokens, API key patterns, and inline secret flags before serialization or UI rendering.
 5. **Local-First Execution:** SpaceJanitor sends zero analytics, telemetry, or crash reports to external servers.
 6. **Zero Private Data in Repository:** CI enforces `gitleaks` and `scripts/check-oss-hygiene.mjs` on every pull request so user home directories, private IPs, and tokens never enter version control.
+
+## Known limitations (security-relevant)
+
+- **Orphan-repo scanning is OFF by default (experimental).** Finding and pruning orphan git worktrees runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk, including repositories SpaceJanitor did not create. An independent review showed a repository's own configuration can still steer that git in ways our proofs do not yet block:
+  - **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
+  - **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
+  - **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+
+  Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). Until that is fixed, opt in only for repositories you trust: `spacejanitor orphans --include-orphans`, `sj orphans --include-orphans`, `sj plan --include-orphans`, or the explicit toggle in the desktop app (Disk view). Every opt-in prints or shows a warning. When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash and cache cleanup, the two-step confirmation gate, the protected-path denylist, redaction, MCP audit and the SLM advisor are unaffected.
 
 ## Reporting a Vulnerability
 

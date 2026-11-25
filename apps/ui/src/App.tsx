@@ -34,7 +34,12 @@ const MOCK_SUMMARY: SummaryReport = {
     status: "OK",
     counters: [{ name: "kern.vnodes", current: 42100, max: 263168, percent: 16, status: "OK" }],
   },
-  orphans: { candidates: [] },
+  orphans: {
+    scanned: false,
+    notScannedReason: "orphan_scan_disabled_by_default",
+    message: "Orphan scanning runs git inside repositories found on disk and is disabled by default (unreviewed, experimental).",
+    candidates: [],
+  },
   trash: { totalBytes: 120 * 1024 ** 2, itemCount: 3, candidates: [] },
   mcpAudit: { totalServers: 2, duplicateCount: 0, secretRiskCount: 0, servers: [] },
 };
@@ -46,6 +51,11 @@ export const App: React.FC = () => {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [activePlan, setActivePlan] = useState<RemediationPlan | null>(null);
   const [execResult, setExecResult] = useState<string | null>(null);
+  const [orphanScan, setOrphanScan] = useState<{ enabled: boolean; warning: string }>({
+    enabled: false,
+    warning:
+      "Orphan scanning runs git inside repositories found on disk. It is unreviewed, experimental behavior. Only enable it for repositories you trust.",
+  });
   const [slmConfig, setSlmConfig] = useState<SlmConfig>({
     enabled: false,
     url: "http://127.0.0.1:11434/v1/chat/completions",
@@ -55,12 +65,14 @@ export const App: React.FC = () => {
 
   const refresh = async () => {
     if (window.spaceJanitor) {
-      const [s, slm] = await Promise.all([
+      const [s, slm, os] = await Promise.all([
         window.spaceJanitor.getSummary(),
         window.spaceJanitor.getSlmConfig(),
+        window.spaceJanitor.getOrphanScan(),
       ]);
       setSummary(s);
       setSlmConfig(slm);
+      setOrphanScan(os);
     } else {
       setSummary(MOCK_SUMMARY);
     }
@@ -243,7 +255,11 @@ export const App: React.FC = () => {
                 </div>
                 <div className="kv-row">
                   <span>Git Worktree Orphans</span>
-                  <strong>{summary.orphans.candidates.length}</strong>
+                  {summary.orphans.scanned === false ? (
+                    <strong title={summary.orphans.message}>not scanned (disabled by default)</strong>
+                  ) : (
+                    <strong>{summary.orphans.candidates.length}</strong>
+                  )}
                 </div>
               </div>
 
@@ -283,9 +299,36 @@ export const App: React.FC = () => {
 
         {summary && tab === "disk" && (
           <>
+            <section className="card" data-testid="orphan-scan-card">
+              <div className="card-header">
+                <h2>Git worktree orphans</h2>
+                <span className={`badge ${orphanScan.enabled ? "badge-warn" : "badge-ok"}`}>
+                  {orphanScan.enabled ? "experimental scan ON" : "not scanned"}
+                </span>
+              </div>
+              {summary.orphans.scanned === false && (
+                <p className="muted">
+                  Not scanned (disabled by default): {summary.orphans.message ?? "orphan scanning is off."}
+                </p>
+              )}
+              <p className="muted">{orphanScan.warning}</p>
+              <label>
+                <input
+                  type="checkbox"
+                  checked={orphanScan.enabled}
+                  onChange={async (e) => {
+                    if (!window.spaceJanitor) return;
+                    const next = await window.spaceJanitor.setOrphanScan(e.target.checked);
+                    setOrphanScan(next);
+                    void refresh();
+                  }}
+                />{" "}
+                Enable experimental orphan scanning (runs git in repositories found on disk)
+              </label>
+            </section>
             <section className="card">
               <div className="card-header">
-                <h2>Safe Remediation Candidates (Caches, Trash &amp; Verified Orphans)</h2>
+                <h2>Safe Remediation Candidates (Caches &amp; Trash{orphanScan.enabled ? " & Verified Orphans" : ""})</h2>
                 <button
                   type="button"
                   className="btn-primary"
@@ -296,7 +339,7 @@ export const App: React.FC = () => {
                 </button>
               </div>
               {cleanableCandidates.length === 0 ? (
-                <p className="muted">No allowlisted cleanable caches, trash items, or verified orphan worktrees found.</p>
+                <p className="muted">No allowlisted cleanable caches or trash items found{summary.orphans.scanned === false ? " (orphan worktrees were not scanned: disabled by default)" : ""}.</p>
               ) : (
                 <table className="data-table">
                   <thead>

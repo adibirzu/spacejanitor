@@ -67,6 +67,10 @@ export function redactSecrets(input) {
     .replace(/(^|\s)(-[ptu]\S+)/gi, (m, ws, tok) =>
       isAttachedShortCredential(tok) ? `${ws}${tok.slice(0, 2)}<REDACTED>` : m
     )
+    // NAME=-pSECRET (env-style prefix, no whitespace before the flag), also right after a quote
+    .replace(/(^|[\s'"])([A-Za-z_][A-Za-z0-9_]*=)(-[ptu]\S+)/g, (m, lead, name, tok) =>
+      isAttachedShortCredential(tok) ? `${lead}${name}${tok.slice(0, 2)}<REDACTED>` : m
+    )
     .replace(M.pemRe, "<REDACTED>")
     .replace(M.urlCredsRe, "$1<REDACTED>@")
     .replace(M.urlQueryRe, "$1<REDACTED>")

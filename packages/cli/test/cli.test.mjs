@@ -112,13 +112,13 @@ test("R10-B34: when the Rust proof times out the CLI reports it and fails closed
     g(wt, "push", "-u", "origin", "feat");
 
     // Node alone says SAFE for this worktree
-    const nodeOnly = JSON.parse(runCli(["orphans", "--path", repo, "--json"], { SPACEJANITOR_NO_SJ: "1" }));
+    const nodeOnly = JSON.parse(runCli(["orphans", "--path", repo, "--include-orphans", "--json"], { SPACEJANITOR_NO_SJ: "1" }));
     assert.equal(nodeOnly.candidates.find((c) => c.path === wt)?.safeToPrune, true);
 
     // a "Rust sj" that hangs: the CLI must time out, say so, and refuse to call anything safe
     const fake = path.join(base, "sj");
     fs.writeFileSync(fake, "#!/bin/sh\nsleep 5\n", { mode: 0o755 });
-    const out = JSON.parse(runCli(["orphans", "--path", repo, "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_SJ_TIMEOUT_MS: "300", SPACEJANITOR_NO_SJ: "" }));
+    const out = JSON.parse(runCli(["orphans", "--path", repo, "--include-orphans", "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_SJ_TIMEOUT_MS: "300", SPACEJANITOR_NO_SJ: "" }));
     assert.equal(out.rustProof, "timed_out");
     for (const c of out.candidates) assert.equal(c.safeToPrune, false);
   } finally {

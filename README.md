@@ -16,7 +16,7 @@ Traditional disk cleaners clear browser caches. Developer disk cleaners delete `
 4. **MCP server multiplication** where globally configured stdio MCP servers (`npx` / Node / Python) multiply across dozens of concurrent agent sessions.
 5. **OS Trash & Recycle Bin bloat** sitting silently beside multi-gigabyte container and VM images.
 
-SpaceJanitor **never deletes a file or signals a process by default**. Every sweep produces a deterministic dry-run plan and requires explicit, two-step confirmation gated behind an immutable protected-path denylist.
+Orphan-repo scanning (item 1) is **experimental and off by default**; see [Known limitations](#known-limitations). SpaceJanitor **never deletes a file or signals a process by default**. Every sweep produces a deterministic dry-run plan and requires explicit, two-step confirmation gated behind an immutable protected-path denylist.
 
 ---
 
@@ -77,3 +77,14 @@ cargo test --workspace
 ## License
 
 [MIT](./LICENSE)
+
+---
+
+## Known limitations
+
+- **Orphan-repo scanning is OFF by default (experimental).** Finding and pruning orphan git worktrees runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk, including repositories SpaceJanitor did not create. An independent review showed a repository's own configuration can still steer that git in ways our proofs do not yet block:
+  - **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
+  - **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
+  - **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+
+  Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). Until that is fixed, opt in only for repositories you trust: `spacejanitor orphans --include-orphans`, `sj orphans --include-orphans`, `sj plan --include-orphans`, or the explicit toggle in the desktop app (Disk view). Every opt-in prints or shows a warning. When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash and cache cleanup, the two-step confirmation gate, the protected-path denylist, redaction, MCP audit and the SLM advisor are unaffected.

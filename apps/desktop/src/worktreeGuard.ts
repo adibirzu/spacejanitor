@@ -6,9 +6,14 @@ const core = require("@spacejanitor/core");
  * re-prove at execution time that the worktree holds nothing unrecoverable. Returns null when safe,
  * otherwise a machine-readable reason. Anything that cannot be proven blocks.
  */
-export async function worktreePruneBlockReason(worktreePath: string): Promise<string | null> {
+export async function worktreePruneBlockReason(
+  worktreePath: string,
+  options: { includeOrphans?: boolean } = {}
+): Promise<string | null> {
+  // OFF by default: no git is run against a repository we did not create unless explicitly enabled
+  if (options.includeOrphans !== true) return "orphan_scan_disabled_by_default";
   try {
-    const proof = await core.inspectWorktree(worktreePath);
+    const proof = await core.inspectWorktree(worktreePath, { includeOrphans: true });
     if (proof && proof.safeToPrune === true && proof.proofStatus === "verified") return null;
     if (!proof) return "worktree_proof_unavailable";
     if (proof.configRisk) return String(proof.configRisk);
@@ -27,7 +32,7 @@ export async function worktreePruneBlockReason(worktreePath: string): Promise<st
 }
 
 /** Remove a linked worktree via the main repository (explicit --git-dir/--work-tree, neutralised config). */
-export async function removeWorktreeSafely(worktreePath: string): Promise<void> {
-  const res = await core.removeLinkedWorktree(worktreePath);
+export async function removeWorktreeSafely(worktreePath: string, options: { includeOrphans?: boolean } = {}): Promise<void> {
+  const res = await core.removeLinkedWorktree(worktreePath, { includeOrphans: options.includeOrphans === true });
   if (!res.ok) throw new Error(res.error || "worktree_remove_failed");
 }

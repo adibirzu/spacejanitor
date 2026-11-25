@@ -19,7 +19,8 @@ impl Default for PlanOptions {
     fn default() -> Self {
         Self {
             include_trash: true,
-            include_orphans: true,
+            // off by default: orphan scanning runs git inside repositories found on disk (experimental)
+            include_orphans: false,
             trash_path_override: None,
             orphan_max_depth: 5,
         }

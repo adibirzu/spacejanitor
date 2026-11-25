@@ -22,6 +22,8 @@ export function sanitizeIpcParams(rawParams: unknown): Record<string, unknown> {
   delete params.homeDir;
   delete params.isProtectedFn;
   delete params.redactFn;
+  // orphan scanning is a main-process setting; a renderer can never opt itself in
+  delete params.includeOrphans;
   return params;
 }
 

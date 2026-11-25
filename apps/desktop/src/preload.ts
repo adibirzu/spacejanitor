@@ -11,6 +11,8 @@ export interface SpaceJanitorApi {
   getMcpAudit: () => Promise<Record<string, unknown>>;
   planRemediation: (candidates: Array<Record<string, unknown>>) => Promise<Record<string, unknown>>;
   executeRemediation: (payload: { planSha256: string; phrase: string }) => Promise<Record<string, unknown>>;
+  getOrphanScan: () => Promise<{ enabled: boolean; warning: string }>;
+  setOrphanScan: (enabled: boolean) => Promise<{ enabled: boolean; warning: string }>;
   getSlmConfig: () => Promise<Record<string, unknown>>;
   updateSlmConfig: (config: Record<string, unknown>) => Promise<Record<string, unknown>>;
   explainWithSlm: (payload: Record<string, unknown>) => Promise<Record<string, unknown>>;
@@ -27,6 +29,8 @@ const api: SpaceJanitorApi = {
   getMcpAudit: () => ipcRenderer.invoke("sj:invoke", { method: "mcp-audit", params: {} }),
   planRemediation: (candidates) => ipcRenderer.invoke("sj:plan", { candidates }),
   executeRemediation: (payload) => ipcRenderer.invoke("sj:execute", payload),
+  getOrphanScan: () => ipcRenderer.invoke("sj:orphan-scan-get"),
+  setOrphanScan: (enabled) => ipcRenderer.invoke("sj:orphan-scan-set", { enabled }),
   getSlmConfig: () => ipcRenderer.invoke("sj:slm-get-config"),
   updateSlmConfig: (config) => ipcRenderer.invoke("sj:slm-update-config", config),
   explainWithSlm: (payload) => ipcRenderer.invoke("sj:slm-explain", payload),
