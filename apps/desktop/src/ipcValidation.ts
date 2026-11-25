@@ -60,6 +60,9 @@ export function validateTargetPath(rawPath: unknown): { valid: boolean; reason?:
   if (!trimmed) {
     return { valid: false, reason: "empty_path" };
   }
+  if (trimmed.startsWith("-")) {
+    return { valid: false, reason: "option_like_path_rejected" };
+  }
   if (SHELL_META_RE.test(trimmed)) {
     return { valid: false, reason: "shell_metacharacters_rejected" };
   }

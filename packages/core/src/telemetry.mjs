@@ -412,28 +412,54 @@ function defaultMcpConfigDirs(homeDir = os.homedir()) {
   return [...new Set(candidates)];
 }
 
+// Replace every URL's path/query/fragment by nothing: only scheme://host[:port] is reported, because
+// hosted MCP services often put the bearer secret in the path. Returns the text and whether a
+// secret-looking path/query was dropped.
+function stripUrlPaths(text) {
+  let risky = false;
+  const out = String(text).replace(/\b([a-z][a-z0-9+.-]*:\/\/[^\s/?#"']*)([^\s"']*)/gi, (_m, origin, rest) => {
+    if (/[A-Za-z0-9_-]{16,}|\?[^\s]+=/.test(rest)) risky = true;
+    return rest && rest !== "/" ? `${origin}/<path-omitted>` : origin;
+  });
+  return { text: out, risky };
+}
+
 function parseTomlMcpServers(tomlText) {
   const servers = {};
   let current = null;
+  let currentTable = null;
   for (const rawLine of tomlText.split(/\r?\n/)) {
     const line = rawLine.trim();
     if (!line || line.startsWith("#")) continue;
     const secMatch = line.match(/^\[(?:mcp_servers|mcpServers)\.([^\]]+)\]$/);
     if (secMatch) {
       const name = secMatch[1].replace(/^["']|["']$/g, "");
+      const sub = name.match(/^(.+)\.(env|headers)$/);
+      if (sub) {
+        const parent = servers[sub[1]] || { args: [], env: {} };
+        servers[sub[1]] = parent;
+        parent[sub[2]] = parent[sub[2]] || {};
+        current = parent;
+        currentTable = parent[sub[2]];
+        continue;
+      }
       current = servers[name] || { args: [], env: {} };
       servers[name] = current;
+      currentTable = null;
       continue;
     }
     if (line.startsWith("[")) {
       current = null;
+      currentTable = null;
       continue;
     }
     if (!current) continue;
     const kv = line.match(/^([A-Za-z0-9_.-]+)\s*=\s*(.+)$/);
     if (!kv) continue;
     const [, key, rawVal] = kv;
-    if (key === "command" || key === "url") {
+    if (currentTable) {
+      currentTable[key] = rawVal.replace(/^["']|["']$/g, "");
+    } else if (key === "command" || key === "url") {
       current[key] = rawVal.replace(/^["']|["']$/g, "");
     } else if (key === "args" && rawVal.startsWith("[")) {
       try {
@@ -463,7 +489,8 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
       .filter(Boolean)
       .join(" ");
     const safeName = redactFn(String(name));
-    const redactedArgs = redactFn(combinedRaw);
+    const stripped = stripUrlPaths(redactFn(combinedRaw));
+    const redactedArgs = stripped.text;
     const rawCommand = String(cfg?.command || "");
     const redactedCommand = redactFn(rawCommand);
     const envEntries = cfg?.env && typeof cfg.env === "object" ? Object.entries(cfg.env) : [];
@@ -472,6 +499,7 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
         /KEY|TOKEN|SECRET|PASSWORD|AUTH/i.test(k) || redactFn(String(v)) !== String(v)
     );
     const hasSecretRisk =
+      stripped.risky ||
       redactedArgs !== combinedRaw ||
       redactedCommand !== rawCommand ||
       safeName !== String(name) ||

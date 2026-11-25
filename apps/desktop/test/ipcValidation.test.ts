@@ -32,3 +32,9 @@ test("locks down navigation and external popups", () => {
   assert.equal(isSafeNavigationUrl("https://evil.example/phish"), false);
   assert.equal(isSafeNavigationUrl("javascript:alert(1)"), false);
 });
+
+test("R3-N9: validateTargetPath rejects option-looking values", () => {
+  assert.equal(validateTargetPath("--help").valid, false);
+  assert.equal(validateTargetPath("-x").valid, false);
+  assert.equal(validateTargetPath("/home/developer/-x").valid, true);
+});

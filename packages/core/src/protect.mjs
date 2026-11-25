@@ -31,7 +31,6 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
     "/Program Files (x86)",
     "C:\\",
     "C:\\Windows",
-    "C:\\Users",
     "C:\\Program Files",
     "C:\\Program Files (x86)",
   ]),
@@ -46,6 +45,7 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
     "/mnt",
     "/srv",
     "/tmp",
+    "C:/Users",
   ]),
   // Account roots whose children belong to some other user unless they sit under the current home.
   foreignHomeRoots: Object.freeze(["/Users", "/home", "C:/Users"]),
@@ -115,32 +115,57 @@ function isAbsoluteInput(expanded) {
   return path.isAbsolute(expanded) || /^[A-Za-z]:[\\/]/.test(expanded);
 }
 
-function resolveRealWithAncestor(absPath) {
-  const parts = [];
-  let curr = absPath;
-  while (curr && !fs.existsSync(curr)) {
-    const parent = path.dirname(curr);
-    if (parent === curr) break;
-    parts.unshift(path.basename(curr));
-    curr = parent;
-  }
-  let base = curr;
-  if (curr && fs.existsSync(curr)) {
-    try {
-      base = fs.realpathSync(curr);
-    } catch {
-      base = curr;
+const DATA_VOLUME_RE = /^\/system\/volumes\/data(?=\/|$)/i;
+const WIN_DRIVE_RE = /^[A-Za-z]:[\\/]/;
+
+// Resolve a path the way the OS does: components left to right, a symlink is replaced by its
+// target before a following ".." is applied (so "link/.." is the parent of the link TARGET).
+// Nonexistent tails are appended lexically.
+function resolveOsStyle(absPath) {
+  const root = path.parse(absPath).root;
+  const comps = absPath.slice(root.length).split(/[\\/]+/);
+  let cur = root;
+  let exists = true;
+  for (const comp of comps) {
+    if (!comp || comp === ".") continue;
+    if (comp === "..") {
+      cur = path.dirname(cur);
+      continue;
     }
+    const next = path.join(cur, comp);
+    if (exists) {
+      try {
+        fs.lstatSync(next);
+        try {
+          cur = (fs.realpathSync.native || fs.realpathSync)(next);
+        } catch {
+          cur = next;
+        }
+        continue;
+      } catch {
+        exists = false;
+      }
+    }
+    cur = next;
   }
-  return parts.length > 0 ? path.join(base, ...parts) : base;
+  return cur;
 }
 
 function normalizePath(rawPath, homeDir = os.homedir(), { resolveSymlinks = true } = {}) {
   const expanded = expandHome(String(rawPath).trim(), homeDir);
   if (!expanded) return "";
-  const resolved = path.resolve(expanded);
-  const real = resolveSymlinks ? resolveRealWithAncestor(resolved) : resolved;
-  return real.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  let out;
+  if (WIN_DRIVE_RE.test(expanded) && path.sep !== "\\") {
+    // Windows-style absolute path on a POSIX host: normalise textually, never join with cwd.
+    out = path.posix.normalize(expanded.replace(/\\/g, "/"));
+  } else {
+    const abs = path.isAbsolute(expanded) ? expanded : path.resolve(expanded);
+    out = resolveSymlinks ? resolveOsStyle(abs) : path.resolve(abs);
+  }
+  out = out.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
+  // macOS APFS Data volume is the same tree as "/": strip the alias (mirrors sj-core protect.rs).
+  while (DATA_VOLUME_RE.test(out)) out = out.replace(DATA_VOLUME_RE, "") || "/";
+  return out || "/";
 }
 
 function pathKey(normPath, caseInsensitive) {

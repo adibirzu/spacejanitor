@@ -161,9 +161,9 @@ export class SjBridge {
     if (!this.binaryPath) return null;
     const cmdMap: Record<string, string[]> = {
       doctor: ["doctor", "--json"],
-      disk: ["scan", ...(params.targetPath ? [String(params.targetPath)] : []), "--json"],
+      disk: ["scan", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       trash: ["trash", "--json"],
-      orphans: ["orphans", ...(params.targetPath ? [String(params.targetPath)] : []), "--json"],
+      orphans: ["orphans", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       memory: ["memory", "--json"],
       blockers: ["blockers", "--json"],
       "mcp-audit": ["mcp-audit", "--json"],

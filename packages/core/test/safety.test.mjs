@@ -241,3 +241,63 @@ test("R2-B7: redactSecrets handles JSON-quoted keys and stays linear on long inp
     assert.ok(Date.now() - t0 < 1000, `redactSecrets too slow on long input (tail ${JSON.stringify(tail)})`);
   }
 });
+
+test("R3-B9: Windows-style home is not swallowed by a C:/Users root; foreign Windows homes stay protected", () => {
+  const home = "C:/Users/runner";
+  assert.equal(isProtectedPath("C:/Users/runner/.cache/vite", { homeDir: home }).protected, false);
+  assert.equal(isProtectedPath("C:\\Users\\runner\\.cache\\vite", { homeDir: home }).protected, false);
+  assert.equal(isProtectedPath("C:/Users", { homeDir: home }).protected, true);
+  assert.equal(isProtectedPath("C:/Users/alice/.cache/x", { homeDir: home }).protected, true);
+  assert.equal(isProtectedPath("C:/Users/runner/.SSH/id", { homeDir: home }).protected, true);
+  assert.equal(isProtectedPath("C:/Windows/System32", { homeDir: home }).protected, true);
+});
+
+test("R3-B10: symlink followed by '..' is resolved the way the OS does (symlink first, then parent)", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r3b10-")));
+  try {
+    const home = path.join(base, "home");
+    fs.mkdirSync(path.join(home, ".ssh", "sub"), { recursive: true });
+    fs.writeFileSync(path.join(home, ".ssh", "secret"), "x");
+    fs.mkdirSync(path.join(base, "outside"));
+    fs.symlinkSync(path.join(home, ".ssh", "sub"), path.join(base, "outside", "sublink"));
+    fs.symlinkSync(path.join(home, ".ssh"), path.join(base, "outside", "sshlink"));
+    const opts = { homeDir: home };
+    // OS: outside/sublink/.. == home/.ssh ; lexical removal would give base/outside
+    assert.equal(isProtectedPath(`${base}/outside/sublink/../secret`, opts).protected, true);
+    assert.equal(isProtectedPath(`${base}/outside/sublink/..`, opts).protected, true);
+    // outside/sshlink/.. == home
+    assert.equal(isProtectedPath(`${base}/outside/sshlink/..`, opts).protected, true);
+    // control: a plain cache under home is still removable
+    fs.mkdirSync(path.join(home, ".cache", "vite"), { recursive: true });
+    assert.equal(isProtectedPath(path.join(home, ".cache", "vite"), opts).protected, false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R3-B11: macOS /System/Volumes/Data alias cannot bypass the denylist", () => {
+  const home = "/Users/alice";
+  const D = "/System/Volumes/Data";
+  for (const p of [`${D}${home}`, `${D}${home}/Documents/x`, `${D}${home}/.aws/credentials`, `${D}/Users`, `${D}/Applications`, `${D}/Library`, `${D}/private/etc`, `${D}/usr/local`, `${D.toLowerCase()}${home}/.ssh/id`, D]) {
+    assert.equal(isProtectedPath(p, { homeDir: home }).protected, true, `expected protected: ${p}`);
+  }
+  assert.equal(isProtectedPath(`${D}${home}/.cache/vite`, { homeDir: home }).protected, false);
+});
+
+test("R3-B12: redactSecrets covers underscore and single-dash credential flags, more token shapes, and stays linear on dashes", () => {
+  const j = (...p) => p.join("");
+  const V = "abc123secretvalue";
+  for (const input of [
+    `--access_token ${V}`, `--auth_token ${V}`, `--bot_token=${V}`, `--client_secret ${V}`, `--db_password ${V}`,
+    `-token ${V}`, `-api-key ${V}`, `-Password ${V}`, `https://host/x?code=${V}`, `https://host/x?jwt=${V}`,
+    j("sk", "-or-v1-", "abcdef0123456789abcdef"), j("gs", "k_", "abcdefghijklmnopqrstuvwx"), j("nt", "n_", "abcdefghijklmnopqrstuvwx"),
+  ]) {
+    const out = redactSecrets(input);
+    assert.ok(!/abc123secretvalue|abcdef0123456789|abcdefghijklmnop/.test(out), `leak: ${input} => ${out}`);
+  }
+  for (const s of ["-".repeat(100000), "-a".repeat(50000), "--".repeat(50000) + "x"]) {
+    const t0 = Date.now();
+    redactSecrets(s);
+    assert.ok(Date.now() - t0 < 1000, "redactSecrets slow on dash-heavy input");
+  }
+});

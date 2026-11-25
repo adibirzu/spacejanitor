@@ -187,6 +187,7 @@ test("B5: collectOrphans fails closed on git errors and detects unpushed detache
 
     // Create another worktree and corrupt its .git pointer so git commands fail
     execFileSync("git", ["worktree", "add", "-b", "broken-branch", wtBroken], { cwd: repoDir });
+    fs.rmSync(path.join(wtBroken, ".git"), { force: true });
     fs.writeFileSync(path.join(wtBroken, ".git"), "gitdir: /nonexistent/invalid/gitdir\n");
 
     const report = await collectOrphans({ targetPath: repoDir });
@@ -355,6 +356,39 @@ test("R2-B7: collectMcpAudit keeps clean servers (no TDZ drop) and counts them",
     const audit = await collectMcpAudit({ configDirs: [tmpDir] });
     assert.equal(audit.totalServers, 1);
     assert.equal(audit.secretRiskCount, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("R3-B12: collectMcpAudit never prints URL paths/queries (secret-in-path) and keeps TOML env tables out of the server list", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r3-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          hosted: { url: "https://mcp.example.com/api/mcp/s/pathSecretTok0123456789/sse" },
+          viaArg: { command: "npx", args: ["mcp-remote", "https://mcp.example.com/k/argPathSecretTok0123456789?x=1"] },
+          flagy: { command: "node", args: ["--access_token", "flagSecretVal99", "-token", "dashSecretVal99"] },
+        },
+      })
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "config.toml"),
+      '[mcp_servers.tomlsrv]\ncommand = "node"\n[mcp_servers.tomlsrv.env]\nAPI_KEY = "tomlEnvSecretVal99"\n'
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const text = JSON.stringify(audit);
+    for (const s of ["pathSecretTok0123456789", "argPathSecretTok0123456789", "flagSecretVal99", "dashSecretVal99", "tomlEnvSecretVal99"]) {
+      assert.equal(text.includes(s), false, `leaked ${s}`);
+    }
+    assert.ok(text.includes("mcp.example.com"), "origin should still be reported");
+    assert.equal(audit.totalServers, 4, "toml env table must not count as its own server");
+    const hosted = audit.servers.find((s) => s.name === "hosted");
+    assert.equal(hosted.hasSecretRisk, true);
+    const toml = audit.servers.find((s) => s.name === "tomlsrv");
+    assert.equal(toml.hasSecretRisk, true);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }

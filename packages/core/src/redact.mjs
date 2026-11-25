@@ -3,7 +3,7 @@
  * Lives in its own module so telemetry can default to it (fail closed) without a circular import.
  */
 const NAME_WORDS =
-  "api[_-]?key|access[_-]?key|private[_-]?key|token|secret|passw(?:or)?d|passwd|pwd|pass|auth(?:orization)?|credentials?|bearer|cookie|signature|sig|session|pat|key";
+  "api[_-]?key|access[_-]?key|private[_-]?key|jwt|token|secret|passw(?:or)?d|passwd|pwd|pass|auth(?:orization)?|credentials?|bearer|cookie|signature|sig|session|pat|key";
 
 function buildSecretMatchers() {
   const j = (...parts) => parts.join("");
@@ -12,6 +12,9 @@ function buildSecretMatchers() {
     j("sk", "-proj-", "[A-Za-z0-9_-]{8,}"),
     j("sk", "_live_", "[A-Za-z0-9]{10,}"),
     j("sk", "_test_", "[A-Za-z0-9]{10,}"),
+    j("sk", "-or-v1-", "[A-Za-z0-9]{16,}"),
+    j("gs", "k_[A-Za-z0-9]{20,}"),
+    j("nt", "n_[A-Za-z0-9]{20,}"),
     j("sk", "-[A-Za-z0-9]{16,}"),
     j("gh", "[pousr]_[A-Za-z0-9]{12,}"),
     j("github", "_pat_", "[A-Za-z0-9_]{12,}"),
@@ -30,9 +33,9 @@ function buildSecretMatchers() {
   return {
     pemRe: new RegExp(`${pemBegin}[\\s\\S]*?(?:${pemEnd}|$)`, "g"),
     urlCredsRe: /([a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/)[^\s/@?#"']+@/g,
-    urlQueryRe: new RegExp(`([?&;][A-Za-z0-9_.-]*(?:${NAME_WORDS})=)[^&\\s'"]+`, "gi"),
+    urlQueryRe: new RegExp(`([?&;][A-Za-z0-9_.-]{0,64}(?:${NAME_WORDS}|code)=)[^&\\s'"]+`, "gi"),
     flagRe: new RegExp(
-      `(--[a-z0-9-]*?(?:${NAME_WORDS})|-(?:t|p))(?:\\s+|=)(?:"[^"]*"|'[^']*'|[^\\s'"]+)`,
+      `(-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS})|-(?:t|p))(?:\\s+|=)(?:"[^"]*"|'[^']*'|[^\\s'"]+)`,
       "gi"
     ),
     userFlagRe: /(^|\s)(-u|--user|--proxy-user)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S*:\S+)/g,
