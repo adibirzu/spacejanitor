@@ -3,6 +3,9 @@ use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
+#[path = "../../sj-core/tests/common/probe.rs"]
+mod probe;
+
 fn sj_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sj")
 }
@@ -1416,4 +1419,218 @@ fn r3_b5_codex_toml_subtables_are_not_phantom_servers() {
     );
     assert!(!out.contains("multillm.http_headers"), "{out}");
     assert!(!out.contains("SECRET_HDR"), "{out}");
+}
+
+// ---- R4 blocker B3 regressions: symlinked ANCESTORS must never be traversed ----
+
+#[cfg(unix)]
+fn r4_home() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = tempdir().unwrap();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".claude/plugins/SecretClaudePlugin")).unwrap();
+    fs::create_dir_all(h.join(".claude/skills/SecretClaudeSkill")).unwrap();
+    fs::create_dir_all(
+        h.join("Library/Application Support/Claude/Cache/SecretCacheMkt/SecretCachePlug"),
+    )
+    .unwrap();
+    fs::create_dir_all(h.join(".gemini")).unwrap();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    (tmp, h)
+}
+
+#[cfg(unix)]
+fn llm_json(h: &Path) -> (String, serde_json::Value) {
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    (out, v)
+}
+
+#[cfg(unix)]
+fn has_refused_root(v: &serde_json::Value, reason: &str) -> bool {
+    v["symlinked_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["reason"] == reason)
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_symlinked_gemini_config_ancestor_into_claude_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(h.join(".claude"), h.join(".gemini/config")).unwrap();
+    let (out, v) = llm_json(&h);
+    // the explicit read-only `claude` client may still list its own names; no other client may
+    assert!(
+        v["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["client"] == "claude" || p["plugin_id"] != "SecretClaudePlugin"),
+        "{out}"
+    );
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_symlinked_codex_plugins_ancestor_into_claude_app_support_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(
+        h.join("Library/Application Support/Claude"),
+        h.join(".codex/plugins"),
+    )
+    .unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"SecretCachePlug@SecretCacheMkt\"]\nenabled = false\n",
+    )
+    .unwrap();
+    let (out, v) = llm_json(&h);
+    assert!(
+        v["stale_plugin_caches"].as_array().unwrap().is_empty(),
+        "{out}"
+    );
+    assert!(!out.contains("SecretCacheMkt/SecretCachePlug"), "{out}");
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_symlinked_cursor_ancestor_into_claude_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(h.join(".claude"), h.join(".cursor")).unwrap();
+    let (out, v) = llm_json(&h);
+    assert!(v["skills_by_client"].get("cursor").is_none(), "{out}");
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_ancestor_symlink_outside_home_is_refused_at_every_root() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    let outside = tempdir().unwrap();
+    let o = outside.path().canonicalize().unwrap();
+    for d in [
+        "skills/OutsideSkill",
+        "plugins/OutsidePlugin",
+        "plugins/cache/OutMkt/OutPlug",
+        "extensions/OutsideExt",
+        "config/plugins/OutsideGem",
+    ] {
+        fs::create_dir_all(o.join(d)).unwrap();
+    }
+    // whole client dirs are symlinks to outside the home
+    symlink(&o, h.join(".cursor")).unwrap();
+    symlink(&o, h.join(".agents")).unwrap();
+    symlink(&o, h.join(".gemini_x")).unwrap();
+    fs::remove_dir_all(h.join(".gemini")).unwrap();
+    symlink(&o, h.join(".gemini")).unwrap();
+    fs::remove_dir_all(h.join(".codex")).unwrap();
+    symlink(&o, h.join(".codex")).unwrap();
+    let (out, v) = llm_json(&h);
+    for leak in [
+        "OutsideSkill",
+        "OutsidePlugin",
+        "OutPlug",
+        "OutsideExt",
+        "OutsideGem",
+    ] {
+        assert!(!out.contains(leak), "{leak} leaked: {out}");
+    }
+    assert!(has_refused_root(&v, "symlinked_root"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_safe_in_home_roots_still_listed() {
+    let (_t, h) = r4_home();
+    fs::create_dir_all(h.join(".codex/skills/PlainSkill")).unwrap();
+    let (out, v) = llm_json(&h);
+    assert_eq!(v["skills_by_client"]["codex"]["total"], 1, "{out}");
+}
+
+// ---- R5: walk every JSON string of every CLI surface against the shared PROBE fixture ----
+
+#[test]
+fn r5_cli_mcp_audit_and_llm_audit_walk_every_string_against_probe_fixture() {
+    let tmp = tempdir().unwrap();
+    let h = tmp.path().canonicalize().unwrap();
+    probe::write_fixture_home(&h);
+    fs::create_dir_all(h.join(".cursor/skills/some-skill")).unwrap();
+
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            h.join(".cursor").to_str().unwrap(),
+            "--config-dir",
+            h.join(".codex").to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    assert!(
+        v["configured_servers"].as_array().unwrap().len() >= 3,
+        "{out}"
+    );
+    probe::assert_no_needles("sj mcp-audit", &v);
+
+    // default discovery from a fixture HOME (reads ~/.cursor/mcp.json and ~/.codex/config.toml)
+    let out = run_sj(&["mcp-audit", "--json"], Some(&h));
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    probe::assert_no_needles("sj mcp-audit (home)", &v);
+
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    probe::assert_no_needles("sj llm-audit", &v);
+}
+
+#[test]
+fn r5_cli_serve_stdio_mcp_and_llm_audit_walk_every_string() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tmp = tempdir().unwrap();
+    let h = tmp.path().canonicalize().unwrap();
+    probe::write_fixture_home(&h);
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("HOME", &h)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let reqs = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"mcp_audit","params":{
+            "config_dirs":[h.join(".cursor").to_str().unwrap(), h.join(".codex").to_str().unwrap()]}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"llm_audit","params":{"home":h.to_str().unwrap()}}),
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for r in &reqs {
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (i, line) in lines.iter().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).expect(line);
+        assert!(v.get("result").is_some(), "{line}");
+        probe::assert_no_needles(&format!("serve-stdio[{i}]"), &v);
+    }
 }

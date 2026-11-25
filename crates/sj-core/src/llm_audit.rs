@@ -177,6 +177,9 @@ pub struct SymlinkedRoot {
     /// Link target as text only; the target is never opened or enumerated.
     pub target: String,
     pub target_protected: bool,
+    /// `protected_target` (canonical path inside a protected root) or `symlinked_root`
+    /// (leaf symlink, or canonical path outside the canonical home).
+    pub reason: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -259,52 +262,109 @@ fn parse_codex_plugin_states(raw: &str) -> BTreeMap<String, bool> {
     out
 }
 
-/// If `root` is itself a symlink, records it (target as text, protection of the canonical
-/// target) and returns true so the caller never descends into it.
-fn note_symlinked_root(
-    client: &str,
-    root: &Path,
-    ctx: &ProtectionContext,
-    out: &mut Vec<SymlinkedRoot>,
-) -> bool {
-    let Ok(meta) = fs::symlink_metadata(root) else {
-        return false;
-    };
-    if !meta.file_type().is_symlink() {
-        return false;
-    }
-    let target = fs::read_link(root)
-        .map(|t| t.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let target_protected = match fs::canonicalize(root) {
-        Ok(canon) => check_path_protection(&canon, ctx).protected,
-        Err(_) => true,
-    };
-    out.push(SymlinkedRoot {
-        client: client.to_string(),
-        path: root.to_string_lossy().into_owned(),
-        target,
-        target_protected,
-    });
-    true
+/// Gatekeeper for every directory the audit lists. Before a directory is read or enumerated
+/// it is canonicalised and refused (recorded as a `SymlinkedRoot`, never listed) when:
+/// - it, or any ancestor, is a symlink that resolves outside the canonical home, or
+/// - its canonical path is inside a protected root (`~/.claude`, Claude app support, `.ssh`,
+///   ...). The only exception is the explicit read-only `claude` client reached without any
+///   symlink: names only, never contents, never a candidate.
+///
+/// A leaf symlink is always refused (never opened), preserving the R3 behaviour.
+struct Guard<'a> {
+    ctx: &'a ProtectionContext,
+    canon_home: PathBuf,
+    out: Vec<SymlinkedRoot>,
 }
 
-/// Names of real (non-symlink) subdirectories. Never follows a symlinked root or entry.
-fn dir_names(dir: &Path) -> Vec<String> {
-    if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
-        return Vec::new();
+impl<'a> Guard<'a> {
+    fn new(ctx: &'a ProtectionContext) -> Self {
+        let canon_home = fs::canonicalize(&ctx.home_dir).unwrap_or_else(|_| ctx.home_dir.clone());
+        Self {
+            ctx,
+            canon_home,
+            out: Vec::new(),
+        }
     }
-    let mut v: Vec<String> = fs::read_dir(dir)
-        .map(|rd| {
-            rd.flatten()
-                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                .filter_map(|e| e.file_name().into_string().ok())
-                .filter(|n| !n.starts_with('.'))
-                .collect()
-        })
-        .unwrap_or_default();
-    v.sort();
-    v
+
+    fn record(&mut self, client: &str, dir: &Path, target: String, protected: bool, reason: &str) {
+        let path = dir.to_string_lossy().into_owned();
+        if self
+            .out
+            .iter()
+            .any(|r| r.client == client && r.path == path)
+        {
+            return;
+        }
+        self.out.push(SymlinkedRoot {
+            client: client.to_string(),
+            path,
+            target,
+            target_protected: protected,
+            reason: reason.to_string(),
+        });
+    }
+
+    /// True only when `dir` is safe to read or list.
+    fn allow(&mut self, client: &str, dir: &Path) -> bool {
+        let Ok(meta) = fs::symlink_metadata(dir) else {
+            return false; // absent: nothing to read
+        };
+        let leaf_symlink = meta.file_type().is_symlink();
+        let canon = match fs::canonicalize(dir) {
+            Ok(c) => c,
+            Err(_) => {
+                let t = fs::read_link(dir)
+                    .map(|t| t.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.record(client, dir, t, true, "symlinked_root");
+                return false;
+            }
+        };
+        let protected = check_path_protection(&canon, self.ctx).protected;
+        let outside_home = !canon.starts_with(&self.canon_home);
+        let lexical = dir
+            .strip_prefix(&self.ctx.home_dir)
+            .ok()
+            .map(|rel| self.canon_home.join(rel));
+        let through_symlink = leaf_symlink || lexical.as_deref() != Some(canon.as_path());
+        let claude_names_only = client == "claude" && !through_symlink;
+        let refuse = leaf_symlink || outside_home || (protected && !claude_names_only);
+        if !refuse {
+            return true;
+        }
+        let target = if leaf_symlink {
+            fs::read_link(dir)
+                .map(|t| t.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        } else {
+            canon.to_string_lossy().into_owned()
+        };
+        let reason = if protected {
+            "protected_target"
+        } else {
+            "symlinked_root"
+        };
+        self.record(client, dir, target, protected, reason);
+        false
+    }
+
+    /// Names of real (non-symlink) subdirectories of a guarded directory.
+    fn dir_names(&mut self, client: &str, dir: &Path) -> Vec<String> {
+        if !self.allow(client, dir) {
+            return Vec::new();
+        }
+        let mut v: Vec<String> = fs::read_dir(dir)
+            .map(|rd| {
+                rd.flatten()
+                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+                    .filter_map(|e| e.file_name().into_string().ok())
+                    .filter(|n| !n.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default();
+        v.sort();
+        v
+    }
 }
 
 fn newest_mtime_secs(dir: &Path) -> u64 {
@@ -491,7 +551,11 @@ pub fn audit_llm_with_processes(
     let mut stale_caches = Vec::new();
     let codex_toml = home.join(".codex").join("config.toml");
     let mut states = BTreeMap::new();
-    if codex_toml.is_file() && !check_path_protection(&codex_toml, &ctx).protected {
+    let mut guard = Guard::new(&ctx);
+    if guard.allow("codex", &home.join(".codex"))
+        && codex_toml.is_file()
+        && !check_path_protection(&codex_toml, &ctx).protected
+    {
         match fs::read_to_string(&codex_toml) {
             Ok(raw) => states = parse_codex_plugin_states(&raw),
             Err(e) => warnings.push(format!("unreadable codex config: {e}")),
@@ -514,11 +578,9 @@ pub fn audit_llm_with_processes(
             disable_candidate: cand,
         });
     }
-    let mut symlinked_roots: Vec<SymlinkedRoot> = Vec::new();
     let cache = home.join(".codex").join("plugins").join("cache");
-    note_symlinked_root("codex", &cache, &ctx, &mut symlinked_roots);
-    for mkt in dir_names(&cache) {
-        for plug in dir_names(&cache.join(&mkt)) {
+    for mkt in guard.dir_names("codex", &cache) {
+        for plug in guard.dir_names("codex", &cache.join(&mkt)) {
             let id = format!("{plug}@{mkt}");
             if states.get(&id) == Some(&false) {
                 let path = cache.join(&mkt).join(&plug);
@@ -547,8 +609,7 @@ pub fn audit_llm_with_processes(
         ),
         ("gemini-extension", home.join(".gemini").join("extensions")),
     ] {
-        note_symlinked_root(client, &dir, &ctx, &mut symlinked_roots);
-        for name in dir_names(&dir) {
+        for name in guard.dir_names(client, &dir) {
             plugins.push(PluginEntry {
                 rule_id: format!("plugin-{client}-{}", slug(&name)),
                 client: client.into(),
@@ -562,8 +623,7 @@ pub fn audit_llm_with_processes(
     }
     // Claude: directory names only, never file contents, never a candidate.
     let claude_plugins = home.join(".claude").join("plugins");
-    note_symlinked_root("claude", &claude_plugins, &ctx, &mut symlinked_roots);
-    for name in dir_names(&claude_plugins) {
+    for name in guard.dir_names("claude", &claude_plugins) {
         plugins.push(PluginEntry {
             rule_id: format!("plugin-claude-{}", slug(&name)),
             client: "claude".into(),
@@ -588,8 +648,9 @@ pub fn audit_llm_with_processes(
     let mut broken = Vec::new();
     let mut real_locations: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (client, root, force_ro) in &roots {
-        // Never open a symlinked skills root: it may point into a protected tree.
-        if note_symlinked_root(client, root, &ctx, &mut symlinked_roots) {
+        // Canonicalise before reading: a symlinked root or ancestor may point into a
+        // protected tree or outside the home.
+        if !guard.allow(client, root) {
             continue;
         }
         let Ok(rd) = fs::read_dir(root) else { continue };
@@ -754,7 +815,7 @@ pub fn audit_llm_with_processes(
         skills_by_client: by_client,
         stale_skills,
         broken_skill_symlinks: broken,
-        symlinked_roots,
+        symlinked_roots: guard.out,
         duplicate_skill_dirs,
         unused_mcp_servers: unused,
         idle_sessions,

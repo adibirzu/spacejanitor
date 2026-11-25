@@ -165,12 +165,9 @@ mod tests {
             let out = redact_secrets(c);
             assert!(!out.contains("PROBE"), "leak in {c:?} -> {out:?}");
         }
-        // non-sensitive query params and flags stay readable
+        // structural redaction: URL shows scheme+host only, boolean flag names stay readable
         let keep = redact_secrets("curl https://h/x?page=2&sort=asc --verbose");
-        assert!(
-            keep.contains("page=2") && keep.contains("sort=asc"),
-            "{keep}"
-        );
+        assert_eq!(keep, "curl https://h --verbose");
     }
 
     const TEST_HOME: &str = "/home/developer";
@@ -205,9 +202,9 @@ mod tests {
         assert!(!out.contains("s3cr3t"));
         assert!(out.contains("--auth=<REDACTED>"));
         assert!(out.contains("--auth <REDACTED>"));
-        assert!(out.contains("Basic <REDACTED>"));
-        assert!(out.contains("https://<REDACTED>@example.com/repo.git"));
-        assert!(out.contains("https://example.com/@org/pkg"));
+        // URLs keep scheme + host only: userinfo, path and query never survive
+        assert!(out.contains("https://example.com"));
+        assert!(!out.contains("repo.git") && !out.contains("@org/pkg"));
     }
 
     #[test]
@@ -271,10 +268,8 @@ mod tests {
                 "secret probe leaked: {probe} in {out}"
             );
         }
-        assert!(out.contains("Authorization:"));
-        assert!(out.contains("X-Api-Key:"));
-        assert!(out.contains("X-Auth-Token:"));
-        assert!(out.contains("Cookie:"));
-        assert!(out.contains("Proxy-Authorization:"));
+        // header values and header names are both withheld (only flag names survive)
+        assert!(!out.contains("Authorization") && !out.contains("Cookie"));
+        assert!(out.contains("-H <REDACTED>"));
     }
 }

@@ -1,530 +1,636 @@
-//! Allowlist-based redaction for audit output.
+//! Structural redaction for every audit output path (mcp-audit, llm-audit, reap, memory,
+//! serve-stdio, `secret_findings[].key_name`, any `command` field).
 //!
-//! A token is echoed verbatim only when it is *clearly non-secret*: a flag name with no
-//! value, a lowercase package/command word, a path under a known prefix, a short numeric or
-//! boolean value, or a credential-free URL whose query values are themselves safe. Everything
-//! else becomes `<REDACTED>`. Any token that follows an auth-ish marker (`Bearer`,
-//! `Authorization:`, `--token`, `-p`, `-u`, `-t`, ...) is redacted. False-positive redaction
-//! is acceptable; a leak is not.
+//! Two rounds of guessing which values look secret (a denylist, then a heuristic allowlist)
+//! still leaked, so this module never decides whether a value is secret. It emits **only**:
+//!
+//! 1. the command's basename (strict grammar; never a path),
+//! 2. the package/script identifier: the first positional after a known launcher (`npx`,
+//!    `uvx`, `bunx`, `pnpm dlx`, `node`, `python`, `deno run`, ...) when it matches a strict
+//!    package-name grammar,
+//! 3. flag **names** (`--port`, `-y`) whose values are always `<REDACTED>`,
+//! 4. URL `scheme://host` (never userinfo, path, query or fragment),
+//! 5. counts (argv length, env key count, header key count), and identifier-grammar key names.
+//!
+//! Every other positional, value, header, env value or malformed token becomes `<REDACTED>`.
+//! Over-redaction is accepted; a leak is not possible by construction because unrecognised
+//! shapes have no way to reach the output.
 
-use crate::{has_known_secret_prefix, is_sensitive_flag_name};
+use crate::{has_known_secret_prefix, split_shell_like_tokens};
 
-const RED: &str = "<REDACTED>";
+pub const RED: &str = "<REDACTED>";
+const MAX_DEPTH: usize = 4;
 
-/// Words that introduce a credential in the *next* token.
-fn is_scheme_word(low: &str) -> bool {
-    matches!(low, "bearer" | "basic" | "digest" | "token" | "negotiate")
+/// One redacted argv element / shell word.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RedactedArg {
+    pub text: String,
+    /// True when information was withheld from this element.
+    pub redacted: bool,
+    /// Fixed-vocabulary or validated-flag-name label, safe for `secret_findings[].key_name`.
+    pub label: String,
 }
 
-fn is_auth_header_name(low: &str) -> bool {
-    matches!(
-        low.trim(),
-        "authorization"
-            | "proxy-authorization"
-            | "x-api-key"
-            | "x-auth-token"
-            | "cookie"
-            | "set-cookie"
-    ) || low.contains("token")
-        || low.contains("secret")
-        || low.contains("api-key")
-        || low.contains("apikey")
-        || low.contains("password")
+// ---------------------------------------------------------------- grammars
+
+fn basename(word: &str) -> &str {
+    word.rsplit(['/', '\\']).next().unwrap_or(word)
 }
 
-fn is_sensitive_env_name(k: &str) -> bool {
-    let up = k.to_ascii_uppercase();
-    [
-        "TOKEN",
-        "SECRET",
-        "KEY",
-        "PASS",
-        "AUTH",
-        "CREDENTIAL",
-        "DSN",
-        "SESSION",
-        "COOKIE",
-    ]
-    .iter()
-    .any(|n| up.contains(n))
-}
-
-/// Long mixed letter+digit runs or very long runs look like key material.
-fn looks_high_entropy(s: &str) -> bool {
-    if has_known_secret_prefix(s) {
-        return true;
+fn stem_lower(word: &str) -> String {
+    let b = basename(word).to_ascii_lowercase();
+    for ext in [".exe", ".cmd", ".bat"] {
+        if let Some(s) = b.strip_suffix(ext) {
+            return s.to_string();
+        }
     }
-    s.split(|c: char| !c.is_ascii_alphanumeric()).any(|seg| {
-        let has_digit = seg.chars().any(|c| c.is_ascii_digit());
-        let has_alpha = seg.chars().any(|c| c.is_ascii_alphabetic());
-        (seg.len() >= 16 && has_digit && has_alpha) || seg.len() >= 32
+    b
+}
+
+fn longest_alnum_run(s: &str) -> usize {
+    s.split(|c: char| !c.is_ascii_alphanumeric())
+        .map(str::len)
+        .max()
+        .unwrap_or(0)
+}
+
+/// Command basename: short, plain, no long unbroken run that could be key material.
+fn safe_command_name(base: &str) -> Option<String> {
+    let ok = !base.is_empty()
+        && base.len() <= 24
+        && base
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphanumeric())
+        && base
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'))
+        && longest_alnum_run(base) <= 16
+        && !has_known_secret_prefix(base);
+    ok.then(|| base.to_string())
+}
+
+/// `name`, `@scope/name`, optional `@version`. Lowercase only, at most two `-`/`_`
+/// separators, no unbroken alphanumeric run over 20 characters, no `=`, `:` or extra `/`.
+fn is_package_id(w: &str) -> bool {
+    if w.is_empty() || w.len() > 64 || has_known_secret_prefix(w) {
+        return false;
+    }
+    let (scope, rest) = match w.strip_prefix('@') {
+        Some(r) => match r.split_once('/') {
+            Some((sc, rest)) => (Some(sc), rest),
+            None => return false,
+        },
+        None => (None, w),
+    };
+    let (name, version) = match rest.rsplit_once('@') {
+        Some((n, v)) => (n, Some(v)),
+        None => (rest, None),
+    };
+    let ident = |s: &str, max: usize| {
+        !s.is_empty()
+            && s.len() <= max
+            && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && s.chars().all(|c| {
+                c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '.' | '_' | '-')
+            })
+    };
+    if !ident(name, 40) || scope.is_some_and(|s| !ident(s, 30)) {
+        return false;
+    }
+    if let Some(v) = version {
+        let ok = matches!(v, "latest" | "next")
+            || (v.len() <= 16
+                && v.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && v.chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '+' | '-')));
+        if !ok {
+            return false;
+        }
+    }
+    let part_ok = |p: &str| {
+        p.chars().filter(|c| matches!(c, '-' | '_')).count() <= 2
+            && p.split(['-', '_', '.']).all(|seg| seg.len() <= 20)
+    };
+    part_ok(name) && scope.is_none_or(part_ok)
+}
+
+/// Lowercase flag name body (after the dashes): `port`, `log-level`, `dangerously-skip-x`.
+fn safe_flag_name(body: &str) -> bool {
+    !body.is_empty()
+        && body.len() <= 32
+        && body.chars().next().is_some_and(|c| c.is_ascii_lowercase())
+        && body
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        && body.split('-').count() <= 4
+        && body
+            .split('-')
+            .all(|seg| !seg.is_empty() && seg.len() <= 14)
+        && !has_known_secret_prefix(body)
+}
+
+/// A name that is echoed (env key, header name, server name) only when it is a plain
+/// identifier without an unbroken run long enough to be key material.
+fn is_plain_name(s: &str, max: usize) -> bool {
+    !s.is_empty()
+        && s.len() <= max
+        && s.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
+        && longest_alnum_run(s) <= 24
+        && !has_known_secret_prefix(s)
+}
+
+/// Key name safe for output (`env_keys`, `header_keys`, `secret_findings[].key_name`).
+pub fn safe_key_name(raw: &str) -> String {
+    if is_plain_name(raw, 48) {
+        raw.to_string()
+    } else {
+        RED.to_string()
+    }
+}
+
+/// Server / client / process-label name safe for output.
+pub fn safe_label(raw: &str) -> String {
+    if is_plain_name(raw, 48) {
+        raw.to_string()
+    } else {
+        RED.to_string()
+    }
+}
+
+/// `scheme://host[:port]` only; userinfo, path, query and fragment are never emitted.
+pub fn safe_url(url: &str) -> Option<String> {
+    let si = url.find("://")?;
+    let scheme = &url[..si];
+    if scheme.is_empty()
+        || scheme.len() > 16
+        || !scheme
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_alphabetic())
+        || !scheme
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+    {
+        return None;
+    }
+    let after = &url[si + 3..];
+    let end = after.find(['/', '?', '#']).unwrap_or(after.len());
+    let authority = &after[..end];
+    let hostport = authority
+        .rfind('@')
+        .map_or(authority, |at| &authority[at + 1..]);
+    let (host, port) = match hostport.rsplit_once(':') {
+        Some((h, p)) => (h, Some(p)),
+        None => (hostport, None),
+    };
+    let host_ok = !host.is_empty()
+        && host.len() <= 253
+        && host
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-'))
+        && host.split('.').all(|l| l.len() <= 30 && !l.is_empty())
+        && !has_known_secret_prefix(host);
+    let port_ok =
+        port.is_none_or(|p| !p.is_empty() && p.len() <= 5 && p.chars().all(|c| c.is_ascii_digit()));
+    if !host_ok || !port_ok {
+        return None;
+    }
+    Some(match port {
+        Some(p) => format!("{scheme}://{host}:{p}"),
+        None => format!("{scheme}://{host}"),
     })
 }
 
-fn is_short_numeric_or_bool(s: &str) -> bool {
-    (!s.is_empty() && s.len() <= 6 && s.chars().all(|c| c.is_ascii_digit()))
-        || matches!(s, "true" | "false")
-}
-
-/// Lowercase package / command / simple value word: `npx`, `@scope/pkg@1.2.3`, `ubuntu:22.04`.
-fn is_package_word(s: &str) -> bool {
-    !s.is_empty()
-        && s.len() <= 64
-        && s.chars().all(|c| {
-            c.is_ascii_lowercase()
-                || c.is_ascii_digit()
-                || matches!(c, '.' | '_' | '-' | '/' | '@' | ':' | '+' | '~')
-        })
-        && s.chars().any(|c| c.is_ascii_lowercase())
-        && !s.contains("//")
-        && !looks_high_entropy(s)
-}
-
-const KNOWN_PATH_PREFIXES: &[&str] = &[
-    "/usr/",
-    "/opt/",
-    "/bin/",
-    "/sbin/",
-    "/etc/",
-    "/var/",
-    "/private/",
-    "/tmp/",
-    "/home/",
-    "/Users/",
-    "/Applications/",
-    "/Library/",
-    "/System/",
-    "/nix/",
-    "/snap/",
-    "~/",
-    "./",
-    "../",
-];
-
-fn is_safe_path(s: &str) -> bool {
-    let low_norm = s.replace('\\', "/");
-    let known = KNOWN_PATH_PREFIXES.iter().any(|p| low_norm.starts_with(p)) || {
-        let b = low_norm.as_bytes();
-        b.len() >= 3 && b[0].is_ascii_alphabetic() && b[1] == b':' && b[2] == b'/'
-    };
-    known
-        && !low_norm.contains("..\\")
-        && low_norm.chars().all(|c| {
-            c.is_ascii_alphanumeric()
-                || matches!(c, '.' | '_' | '-' | '/' | '~' | '+' | '@' | ':' | '%')
-        })
-        && !looks_high_entropy(&low_norm)
-}
-
-fn is_safe_flag_name(f: &str) -> bool {
-    let body = f.trim_start_matches('-');
-    f.starts_with("--")
-        && !body.is_empty()
-        && body.len() <= 48
-        && body.chars().next().is_some_and(|c| c.is_ascii_alphabetic())
-        && body
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-        && !looks_high_entropy(body)
-}
-
-fn redact_url(tok: &str) -> String {
-    let Some(si) = tok.find("://") else {
-        return RED.to_string();
-    };
-    let scheme = &tok[..si];
-    if !scheme
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
-    {
-        return RED.to_string();
-    }
-    let after = &tok[si + 3..];
-    let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
-    let authority = &after[..auth_end];
-    let mut rest = &after[auth_end..];
-    let mut out = format!("{scheme}://");
-    let host = match authority.rfind('@') {
-        Some(at) => {
-            out.push_str("<REDACTED>@");
-            &authority[at + 1..]
-        }
-        None => authority,
-    };
-    if host
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | ':' | '[' | ']'))
-        && !looks_high_entropy(host)
-    {
-        out.push_str(host);
-    } else {
-        out.push_str(RED);
-    }
-    // path
-    let path_end = rest.find(['?', '#']).unwrap_or(rest.len());
-    let (path, tail) = rest.split_at(path_end);
-    rest = tail;
-    let segs: Vec<String> = path
-        .split('/')
-        .map(|seg| {
-            if seg.is_empty()
-                || (seg.len() <= 48
-                    && seg.chars().all(|c| {
-                        c.is_ascii_lowercase()
-                            || c.is_ascii_digit()
-                            || matches!(c, '.' | '_' | '-' | '@' | '~' | '+' | '%')
-                    })
-                    && !looks_high_entropy(seg)
-                    && !is_sensitive_env_name(seg))
-            {
-                seg.to_string()
-            } else {
-                RED.to_string()
-            }
-        })
-        .collect();
-    out.push_str(&segs.join("/"));
-    // query
-    if let Some(q) = rest.strip_prefix('?') {
-        let (query, frag) = match q.find('#') {
-            Some(i) => (&q[..i], &q[i..]),
-            None => (q, ""),
-        };
-        let pairs: Vec<String> = query
-            .split('&')
-            .map(|pair| match pair.split_once('=') {
-                Some((k, v)) => {
-                    let k_low = k.to_ascii_lowercase();
-                    let key_ok = !k.is_empty()
-                        && k.len() <= 40
-                        && k.chars()
-                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.'))
-                        && !is_sensitive_env_name(&k_low)
-                        && !k_low.contains("sig");
-                    if key_ok
-                        && (is_short_numeric_or_bool(v) || (is_package_word(v) && v.len() <= 24))
-                    {
-                        format!("{k}={v}")
-                    } else if key_ok {
-                        format!("{k}={RED}")
-                    } else {
-                        RED.to_string()
-                    }
-                }
-                None => {
-                    if pair.is_empty() || (is_package_word(pair) && pair.len() <= 24) {
-                        pair.to_string()
-                    } else {
-                        RED.to_string()
-                    }
-                }
-            })
-            .collect();
-        out.push('?');
-        out.push_str(&pairs.join("&"));
-        if !frag.is_empty() {
-            out.push_str("#<REDACTED>");
-        }
-    } else if rest.starts_with('#') {
-        out.push_str("#<REDACTED>");
-    }
-    out
-}
-
-/// Cross-token redaction state. Shared across the elements of an argv so that a credential
-/// split from its marker by the JSON array (`["Authorization:", "Bearer", "X"]`) is caught.
-#[derive(Debug, Default, Clone)]
-pub struct RedactState {
-    redact_next: bool,
-    /// Plain-identifier name of the marker that armed `redact_next` (for finding labels).
-    pub marker: String,
-    /// Set when the most recent token was consumed as a credential value.
-    pub consumed: bool,
-}
-
-impl RedactState {
-    fn arm(&mut self, marker: &str) {
-        self.redact_next = true;
-        self.marker = if marker.len() <= 32
-            && marker
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_'))
-            && !looks_high_entropy(marker)
-        {
-            marker.to_string()
-        } else {
-            "cli-flag".to_string()
-        };
-    }
-}
-
-/// Redacts one argv element / shell word under `st`.
-pub fn redact_token(tok: &str, st: &mut RedactState) -> String {
-    st.consumed = false;
-    if tok.is_empty() {
-        return String::new();
-    }
-    let low = tok.to_ascii_lowercase();
-
-    if st.redact_next {
-        if is_scheme_word(&low) {
-            return tok.to_string();
-        }
-        let is_flag = low.starts_with("--")
-            && low.len() > 2
-            && low[2..]
-                .chars()
-                .next()
-                .is_some_and(|c| c.is_ascii_alphabetic());
-        if !is_flag {
-            st.redact_next = false;
-            st.consumed = true;
-            return RED.to_string();
-        }
-        st.redact_next = false;
-    }
-
-    // whitespace-bearing token = quoted sub-command / header: redact each word
-    if tok.chars().any(char::is_whitespace) {
-        let (inner, pending) = redact_command_with_state(tok);
-        if pending {
-            st.arm("header");
-        }
-        return inner;
-    }
-
-    if tok.starts_with('-') {
-        return redact_flag(tok, &low, st);
-    }
-
-    if is_scheme_word(&low) {
-        st.arm(&low);
-        return tok.to_string();
-    }
-
-    if tok.contains("://") {
-        return redact_url(tok);
-    }
-
-    // KEY=VAL
-    if let Some((k, v)) = tok.split_once('=') {
-        let k_ok = !k.is_empty()
-            && k.len() <= 48
-            && k.chars()
+fn is_env_assignment(w: &str) -> bool {
+    match w.split_once('=') {
+        Some((k, _)) => {
+            k.chars()
                 .next()
                 .is_some_and(|c| c.is_ascii_alphabetic() || c == '_')
-            && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            && !looks_high_entropy(k);
-        if !k_ok || v.is_empty() {
-            return RED.to_string();
+                && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
         }
-        if is_sensitive_env_name(k) {
-            return format!("{k}={RED}");
-        }
-        let mut inner = RedactState::default();
-        let rv = redact_token(v, &mut inner);
-        if inner.redact_next {
-            st.arm(k);
-        }
-        return format!("{k}={rv}");
+        None => false,
     }
-
-    // Name:Value (headers, host:port, image:tag)
-    if let Some((name, value)) = tok.split_once(':') {
-        let name_low = name.to_ascii_lowercase();
-        if is_auth_header_name(&name_low) {
-            let val_low = value.trim().to_ascii_lowercase();
-            if value.trim().is_empty() || is_scheme_word(&val_low) {
-                st.arm(&name_low);
-                return tok.to_string();
-            }
-            return format!("{name}:{RED}");
-        }
-    }
-
-    if is_short_numeric_or_bool(tok) || is_package_word(tok) || is_safe_path(tok) {
-        return tok.to_string();
-    }
-    RED.to_string()
 }
 
-fn redact_flag(tok: &str, low: &str, st: &mut RedactState) -> String {
-    // split `--name=value` / `--name:value` at the first separator
-    let sep = tok.find(['=', ':']);
-    let (lhs, rhs, sep_ch) = match sep {
-        Some(i) => (&tok[..i], Some(&tok[i + 1..]), tok.as_bytes()[i] as char),
-        None => (tok, None, ' '),
-    };
-    let lhs_low = lhs.to_ascii_lowercase();
-    let single_dash = !lhs.starts_with("--");
+fn looks_like_flag(w: &str) -> bool {
+    let mut it = w.chars();
+    it.next() == Some('-')
+        && it
+            .next()
+            .is_some_and(|c| c == '-' || c.is_ascii_alphabetic())
+}
 
-    // shell `-c` combinations carry no value
-    if rhs.is_none() && matches!(lhs, "-lc" | "-ic" | "-lic" | "-ec" | "-xc") {
-        return tok.to_string();
-    }
-    // glued short flag value: `-pSECRET`, `-Dapi.key=X`
-    if single_dash && lhs.len() > 2 {
-        let head: String = lhs.chars().take(2).collect();
-        return format!("{head}{RED}");
-    }
+// ---------------------------------------------------------------- engine
 
-    let sensitive_flag = is_sensitive_flag_name(&lhs_low, rhs.is_some())
-        || matches!(
-            lhs_low.as_str(),
-            "-p" | "-u" | "-t" | "--user" | "--username"
-        );
+const BOOL_FLAGS: &[&str] = &[
+    "-y",
+    "-q",
+    "--yes",
+    "--quiet",
+    "--silent",
+    "--no-install",
+    "--verbose",
+    "--help",
+    "--version",
+    "--debug",
+    "--stdio",
+    "--no-warnings",
+    "-NoProfile",
+    "-NonInteractive",
+];
+/// Boolean flags that may precede the package identifier of a launcher.
+const SLOT_KEEPING: &[&str] = &["-y", "-q", "--yes", "--quiet", "--silent", "--no-install"];
+const SHELL_C_FLAGS: &[&str] = &[
+    "-c", "-lc", "-ic", "-lic", "-ec", "-xc", "-Command", "-command",
+];
+const SHELLS: &[&str] = &[
+    "sh",
+    "bash",
+    "zsh",
+    "dash",
+    "ksh",
+    "fish",
+    "cmd",
+    "powershell",
+    "pwsh",
+];
 
-    match rhs {
-        Some(v) => {
-            if sensitive_flag || !(is_safe_flag_name(lhs) || (single_dash && lhs.len() == 2)) {
-                return format!("{lhs}{sep_ch}{RED}");
-            }
-            let mut inner = RedactState::default();
-            let rv = redact_token(v, &mut inner);
-            if inner.redact_next {
-                st.arm(&lhs_low);
-            }
-            format!("{lhs}{sep_ch}{rv}")
+struct Engine {
+    cmd_seen: bool,
+    is_shell: bool,
+    launcher: bool,
+    kw: &'static [&'static str],
+    kw_pending: bool,
+    slot_open: bool,
+    shell_inner: bool,
+    expect_value: Option<String>,
+}
+
+impl Engine {
+    fn new() -> Self {
+        Self {
+            cmd_seen: false,
+            is_shell: false,
+            launcher: false,
+            kw: &[],
+            kw_pending: false,
+            slot_open: false,
+            shell_inner: false,
+            expect_value: None,
         }
-        None => {
-            let _ = low;
-            if single_dash {
-                if lhs.len() == 2 && lhs.as_bytes()[1].is_ascii_alphabetic() {
-                    if sensitive_flag {
-                        st.arm(&lhs_low);
-                    }
-                    return tok.to_string();
+    }
+
+    fn set_command(&mut self, stem: &str) {
+        self.cmd_seen = true;
+        self.is_shell = SHELLS.contains(&stem);
+        self.kw = match stem {
+            "pnpm" => &["dlx", "exec"],
+            "deno" => &["run"],
+            "npm" => &["exec", "x"],
+            "bun" => &["x", "run"],
+            "yarn" => &["dlx"],
+            _ => &[],
+        };
+        self.launcher = !self.kw.is_empty()
+            || matches!(stem, "npx" | "uvx" | "bunx" | "node" | "nodejs")
+            || stem.starts_with("python");
+        self.kw_pending = !self.kw.is_empty();
+        self.slot_open = self.launcher;
+    }
+
+    fn step(&mut self, w: &str, depth: usize) -> RedactedArg {
+        let keep = |t: &str| RedactedArg {
+            text: t.to_string(),
+            redacted: false,
+            label: String::new(),
+        };
+        let red = |label: &str| RedactedArg {
+            text: RED.to_string(),
+            redacted: true,
+            label: label.to_string(),
+        };
+        if w.is_empty() {
+            return keep("");
+        }
+        if self.shell_inner {
+            self.shell_inner = false;
+            if depth >= MAX_DEPTH {
+                return red("shell-inner");
+            }
+            let inner = redact_command_depth(w, depth + 1);
+            return RedactedArg {
+                redacted: inner != w,
+                text: inner,
+                label: "shell-inner".to_string(),
+            };
+        }
+        if let Some(flag) = self.expect_value.take() {
+            if !looks_like_flag(w) {
+                self.slot_open = false;
+                return red(&flag);
+            }
+        }
+        if !self.cmd_seen {
+            if is_env_assignment(w) {
+                return red("env-assign");
+            }
+            self.set_command(&stem_lower(w));
+            return match safe_command_name(basename(w)) {
+                Some(b) => RedactedArg {
+                    redacted: b != w,
+                    text: b,
+                    label: "command".to_string(),
+                },
+                None => red("command"),
+            };
+        }
+        // Windows `/p:value`: only `/name<sep>` is a flag; the value is always withheld.
+        if let Some(rest) = w.strip_prefix('/') {
+            if let Some(i) = rest.find([':', '=']) {
+                let name = &rest[..i];
+                if (1..=8).contains(&name.len()) && name.chars().all(|c| c.is_ascii_alphabetic()) {
+                    self.slot_open = false;
+                    let sep = &rest[i..=i];
+                    return RedactedArg {
+                        text: format!("/{name}{sep}{RED}"),
+                        redacted: true,
+                        label: safe_key_name(name),
+                    };
                 }
-                return if lhs == "-" || lhs == "--" {
-                    tok.to_string()
-                } else {
-                    RED.to_string()
+            } else if self.is_shell && matches!(rest, "c" | "k") {
+                self.shell_inner = true;
+                return keep(w);
+            }
+        }
+        if w == "-" || w == "--" {
+            return keep(w);
+        }
+        if looks_like_flag(w) {
+            return self.flag(w);
+        }
+        self.positional(w)
+    }
+
+    fn flag(&mut self, w: &str) -> RedactedArg {
+        if let Some(body) = w.strip_prefix("--") {
+            let cut = body.find(['=', ':']);
+            let (name, inline) = match cut {
+                Some(i) => (&body[..i], Some((&body[i..=i], &body[i + 1..]))),
+                None => (body, None),
+            };
+            self.slot_open = self.slot_open && SLOT_KEEPING.contains(&w);
+            if !safe_flag_name(name) {
+                if inline.is_none() {
+                    self.expect_value = Some("cli-flag".to_string());
+                }
+                return RedactedArg {
+                    text: RED.to_string(),
+                    redacted: true,
+                    label: "cli-flag".to_string(),
                 };
             }
-            if lhs == "--" {
-                return tok.to_string();
+            let full = format!("--{name}");
+            if let Some((sep, _)) = inline {
+                return RedactedArg {
+                    text: format!("{full}{sep}{RED}"),
+                    redacted: true,
+                    label: full,
+                };
             }
-            if sensitive_flag {
-                st.arm(&lhs_low);
+            if !BOOL_FLAGS.contains(&full.as_str()) {
+                self.expect_value = Some(full.clone());
             }
-            if !is_safe_flag_name(lhs) {
-                return RED.to_string();
+            return RedactedArg {
+                text: full,
+                redacted: false,
+                label: String::new(),
+            };
+        }
+        // single dash
+        if SHELL_C_FLAGS.contains(&w) {
+            if self.is_shell {
+                self.shell_inner = true;
+            } else {
+                self.expect_value = Some(safe_key_name(w));
+                self.slot_open = false;
             }
-            tok.to_string()
+            return RedactedArg {
+                text: w.to_string(),
+                redacted: false,
+                label: String::new(),
+            };
+        }
+        if BOOL_FLAGS.contains(&w) {
+            self.slot_open = self.slot_open && SLOT_KEEPING.contains(&w);
+            return RedactedArg {
+                text: w.to_string(),
+                redacted: false,
+                label: String::new(),
+            };
+        }
+        self.slot_open = false;
+        let rest = &w[1..];
+        if rest.len() == 1 {
+            self.expect_value = Some(w.to_string());
+            return RedactedArg {
+                text: w.to_string(),
+                redacted: false,
+                label: String::new(),
+            };
+        }
+        // glued `-pSECRET`, `-Dapi.key=X`, unknown long single-dash flag: keep the letter only
+        let head = &w[..2];
+        RedactedArg {
+            text: format!("{head}{RED}"),
+            redacted: true,
+            label: head.to_string(),
+        }
+    }
+
+    fn positional(&mut self, w: &str) -> RedactedArg {
+        if self.kw_pending {
+            self.kw_pending = false;
+            if self.kw.contains(&w) {
+                return RedactedArg {
+                    text: w.to_string(),
+                    redacted: false,
+                    label: String::new(),
+                };
+            }
+            self.slot_open = false;
+        }
+        if self.slot_open && is_package_id(w) {
+            self.slot_open = false;
+            return RedactedArg {
+                text: w.to_string(),
+                redacted: false,
+                label: String::new(),
+            };
+        }
+        self.slot_open = false;
+        if let Some(u) = safe_url(w) {
+            return RedactedArg {
+                redacted: u != w,
+                text: u,
+                label: "url".to_string(),
+            };
+        }
+        RedactedArg {
+            text: RED.to_string(),
+            redacted: true,
+            label: "positional".to_string(),
         }
     }
 }
 
-/// Splits a command line into shell-like words (quotes removed, remembering whether the
-/// word had been quoted) — same dialect `redact_secrets` has always used.
-fn split_words(input: &str) -> Vec<(String, Option<char>)> {
-    crate::split_shell_like_tokens(input)
+// ---------------------------------------------------------------- public API
+
+/// Redacts an MCP `args` array. `command` is the server's command (used only to recognise
+/// launchers and shells); the result is 1:1 with `args`.
+pub fn redact_argv(command: Option<&str>, args: &[String]) -> Vec<RedactedArg> {
+    let mut e = Engine::new();
+    match command {
+        Some(c) => {
+            let first = split_shell_like_tokens(c)
+                .into_iter()
+                .map(|(w, _)| w)
+                .find(|w| !is_env_assignment(w));
+            e.set_command(&first.map(|w| stem_lower(&w)).unwrap_or_default());
+        }
+        None => e.set_command(""),
+    }
+    args.iter().map(|a| e.step(a, 0)).collect()
 }
 
-/// Returns the redacted command line and whether a credential is still pending after its end.
-pub fn redact_command_with_state(input: &str) -> (String, bool) {
-    let mut st = RedactState::default();
+fn redact_command_depth(input: &str, depth: usize) -> String {
+    let mut e = Engine::new();
     let mut out: Vec<String> = Vec::new();
-    for (word, quote) in split_words(input) {
-        let red = redact_token(&word, &mut st);
-        let needs_quote = red.chars().any(char::is_whitespace);
-        out.push(match quote {
-            Some(q) if red == word || needs_quote => format!("{q}{red}{q}"),
-            _ if needs_quote => format!("\"{red}\""),
-            _ => red,
+    for (word, _quote) in split_shell_like_tokens(input) {
+        let r = e.step(&word, depth);
+        out.push(if r.text.chars().any(char::is_whitespace) {
+            if r.text.contains('"') {
+                format!("'{}'", r.text)
+            } else {
+                format!("\"{}\"", r.text)
+            }
+        } else {
+            r.text
         });
     }
-    (out.join(" "), st.redact_next)
+    out.join(" ")
 }
 
-/// Allowlist redaction of a whole command line (process list, config `command`).
+/// Structural redaction of a whole command line (process list, config `command`).
 pub fn redact_command(input: &str) -> String {
-    redact_command_with_state(input).0
+    redact_command_depth(input, 0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn argv(args: &[&str]) -> String {
-        let mut st = RedactState::default();
-        args.iter()
-            .map(|a| redact_token(a, &mut st))
-            .collect::<Vec<_>>()
-            .join(" ")
+    fn argv(cmd: &str, args: &[&str]) -> Vec<String> {
+        let a: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+        redact_argv(Some(cmd), &a)
+            .into_iter()
+            .map(|r| r.text)
+            .collect()
     }
 
     #[test]
-    fn r3_probes_never_survive_in_any_shape() {
-        let cmds = [
-            "bash -lc 'npx some-mcp --token PROBE_A1'",
-            "sh -c \"npx mcp --token PROBE_A2\"",
-            "OPTS=-pPROBE_A3 node x.js",
-            "JAVA_OPTS=-Dapi.key=PROBE_A4 java -jar x.jar",
-            "tool --token:PROBE_A5=",
-            "tool --header=Authorization:Bearer PROBE_A6",
-            "tool --header=\"Authorization: Bearer PROBE_A7\"",
-            "tool -H Authorization: Bearer PROBE_A8",
-            "tool Bearer PROBE_A9",
-            "tool --auth Bearer PROBE_B1",
-            "tool -u PROBE_B2 -p PROBE_B3 -t PROBE_B4",
-            "tool X=PROBE_B5 --flag PROBE_B6",
-            "powershell -Command \"npx mcp --api-key PROBE_B7\"",
-            "tool https://u:PROBE_B8@host.example/p?q=PROBE_B9&page=2",
-            "tool https://host.example/mcp/PROBE_C1/sse",
-            "tool --url=https://host.example/x?sig=PROBE_C2",
-            "bash -lc 'npx -pPROBE_C3'",
-        ];
-        for c in cmds {
-            let out = redact_command(c);
-            assert!(!out.contains("PROBE_"), "leak in {c:?} -> {out:?}");
-        }
-    }
-
-    #[test]
-    fn split_credentials_across_argv_elements_are_redacted() {
-        for args in [
-            vec!["--header", "Authorization:", "Bearer", "PROBE_S1"],
-            vec!["--header", "Authorization: Bearer", "PROBE_S2"],
-            vec!["--auth", "Bearer", "PROBE_S3"],
-            vec!["Bearer", "PROBE_S4"],
-            vec!["--header=Authorization:Bearer", "PROBE_S5"],
-            vec!["-H", "Cookie:", "PROBE_S6"],
-        ] {
-            let out = argv(&args);
-            assert!(!out.contains("PROBE_"), "leak in {args:?} -> {out:?}");
-        }
-    }
-
-    #[test]
-    fn clearly_non_secret_tokens_stay_readable() {
-        let out = redact_command(
-            "/usr/bin/node /home/developer/app/srv.js --port 8080 --verbose --log-level=debug npx -y @scope/pkg@1.2.3 page=2",
+    fn launcher_package_flag_names_and_redacted_values() {
+        assert_eq!(
+            argv(
+                "npx",
+                &["-y", "@scope/pkg@1.2.3", "--port", "8080", "--token", "X"]
+            ),
+            ["-y", "@scope/pkg@1.2.3", "--port", RED, "--token", RED]
         );
-        for keep in [
-            "/usr/bin/node",
-            "--port 8080",
-            "--verbose",
-            "--log-level=debug",
-            "@scope/pkg@1.2.3",
+        assert_eq!(
+            redact_command("/usr/bin/node /srv/app/server.js --port 8080"),
+            format!("node {RED} --port {RED}")
+        );
+        assert_eq!(
+            redact_command("pnpm dlx mcp-remote https://u:p@host.example:8443/x?q=1"),
+            "pnpm dlx mcp-remote https://host.example:8443"
+        );
+    }
+
+    #[test]
+    fn secret_shapes_in_package_slot_are_rejected_by_grammar() {
+        for s in [
+            "probesecretlowercasetokenabcdef",
+            "550e8400-e29b-41d4-a716-446655440000",
+            "hf_a1b2c3d4_e5f6g7h8_i9j0k1l2",
+            "correct-horse-battery-staple",
+            "sk-live-abc",
+            "abcdefghijklmnopqrstuvwxyz",
+            "Mixed-Case",
+            "a=b",
+            "@scope/a/b",
         ] {
-            assert!(out.contains(keep), "{keep} missing in {out}");
+            assert!(!is_package_id(s), "{s}");
+        }
+        for s in [
+            "mcp-remote",
+            "@modelcontextprotocol/server-filesystem",
+            "chrome-devtools-mcp@latest",
+            "server.js",
+            "@upstash/context7-mcp@1.0.2",
+        ] {
+            assert!(is_package_id(s), "{s}");
         }
     }
 
     #[test]
-    fn unknown_shapes_fail_closed() {
-        for odd in [
-            "Zm9vYmFyYmF6cXV4",
-            "ABCDEF1234567890ABCDEF",
-            "k3y_Value-9",
-            "x=Y_Z9",
+    fn flag_value_never_survives() {
+        for (cmd, args) in [
+            ("sqlcmd", vec!["/p:hunter2", "/key:PROBE_X"]),
+            ("redis-cli", vec!["-a", "PROBE_R"]),
+            ("tool", vec!["-pPROBE_G", "-uPROBE_U", "--API-KEY=PROBE_UP"]),
+            ("tool", vec!["--PROBE_UNSAFE=1", "--sk-live-PROBE_SK="]),
+            ("tool", vec!["-H", "Cookie: a=b; sid=PROBE_C"]),
+            ("tool", vec!["X=PROBE_E", "{ \"api_key\": \"PROBE_J\" }"]),
         ] {
-            let out = redact_command(odd);
+            let a: Vec<String> = args.iter().map(|s| (*s).to_string()).collect();
+            let out: Vec<String> = redact_argv(Some(cmd), &a)
+                .into_iter()
+                .map(|r| r.text)
+                .collect();
+            let joined = out.join(" ");
             assert!(
-                out.contains(RED) && !out.contains("Y_Z9") && !out.contains("Zm9v"),
-                "{odd} -> {out}"
+                !joined.contains("PROBE_") && !joined.contains("hunter2"),
+                "{args:?} -> {joined}"
             );
         }
+    }
+
+    #[test]
+    fn nested_shell_is_summarised_recursively() {
+        let out = redact_command("sh -c \"sh -c 'npx mcp --token PROBE_N'\"");
+        assert!(!out.contains("PROBE_"), "{out}");
+        assert!(out.starts_with("sh -c"), "{out}");
+    }
+
+    #[test]
+    fn url_shows_scheme_and_host_only() {
+        assert_eq!(
+            safe_url("https://alice:PROBE@example.com/p/PROBE?code=PROBE#f").as_deref(),
+            Some("https://example.com")
+        );
+        assert_eq!(safe_url("https://alice%3aPROBE%40example.com/x"), None);
+        assert_eq!(safe_url("not a url"), None);
+    }
+
+    #[test]
+    fn key_and_label_names_fail_closed() {
+        assert_eq!(safe_key_name("API_TOKEN"), "API_TOKEN");
+        assert_eq!(safe_key_name("sk-live-abc"), RED);
+        assert_eq!(safe_key_name("probesecretlowercasetokenabcdef"), RED);
+        assert_eq!(safe_label("playwright"), "playwright");
     }
 }

@@ -1,6 +1,6 @@
 use crate::protect::{check_path_protection, ProtectionContext};
-use crate::redact::{redact_token, RedactState};
-use crate::{redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
+use crate::redact::{redact_argv, redact_command, safe_key_name, safe_label, safe_url};
+use crate::{SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -36,7 +36,12 @@ pub struct ConfiguredMcpServer {
     pub transport: String,
     pub command: Option<String>,
     pub args: Vec<String>,
+    /// Number of argv elements (the elements themselves are structurally redacted).
+    pub args_count: usize,
+    /// `scheme://host` only; never userinfo, path, query or fragment.
+    pub url: Option<String>,
     pub env_keys: Vec<String>,
+    pub header_keys: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -87,6 +92,14 @@ fn is_sensitive_env_key(key: &str) -> bool {
         || up.contains("PASSWD")
         || up.contains("AUTH")
         || up.contains("CREDENTIAL")
+        || up.contains("PWD")
+        || up.contains("BEARER")
+        || up.contains("JWT")
+        || up.contains("SIG")
+        || up.contains("COOKIE")
+        || up.contains("SESSION")
+        || up.contains("DSN")
+        || up.ends_with("PAT")
 }
 
 fn is_env_var_reference(val: &str) -> bool {
@@ -120,102 +133,31 @@ fn redact_secret_preview(_val: &str) -> String {
     "[REDACTED]".to_string()
 }
 
-/// A key name is only ever echoed when it is a plain identifier. Anything that
-/// could carry value text (colons, glued values, long tokens, known secret
-/// prefixes) is replaced by a fixed label.
-fn is_plain_identifier(raw: &str) -> bool {
-    !raw.is_empty()
-        && raw.len() <= 48
-        && raw
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
-        && !looks_like_secret_value(raw)
-}
-
-fn safe_arg_key_name(arg: &str) -> String {
-    if let Some(scheme_idx) = arg.find("://") {
-        let after = &arg[scheme_idx + 3..];
-        let auth_end = after.find(['/', '?', '#']).unwrap_or(after.len());
-        if after[..auth_end].contains('@') {
-            return "url-credentials".to_string();
-        }
-        if arg.contains('?') {
-            return "url-query-param".to_string();
-        }
-        return "url-secret".to_string();
-    }
-    if arg.starts_with('-') {
-        let flag = arg.split(['=', ':']).next().unwrap_or("--flag").trim();
-        if flag.eq_ignore_ascii_case("-h") || flag.eq_ignore_ascii_case("--header") {
-            return "--header".to_string();
-        }
-        if !flag.starts_with("--") && !flag.contains(['=', ':']) && flag.len() > 2 && arg == flag {
-            // glued short flag such as `-pSECRET`: keep only the letter
-            return flag.chars().take(2).collect();
-        }
-        if is_plain_identifier(flag) {
-            return flag.to_string();
-        }
-        return "cli-flag".to_string();
-    }
-    if let Some((hdr, _)) = arg.split_once(':') {
-        let hdr_low = hdr.trim().to_ascii_lowercase();
-        if matches!(
-            hdr_low.as_str(),
-            "authorization" | "x-api-key" | "x-auth-token" | "cookie" | "proxy-authorization"
-        ) {
-            return format!("header:{hdr_low}");
-        }
-    }
-    if let Some((k, _)) = arg.split_once('=') {
-        if is_plain_identifier(k) {
-            return k.to_string();
-        }
-    }
-    "inline-secret".to_string()
-}
-
-fn redact_arg_token(arg: &str) -> (String, Option<(String, String)>) {
-    let redacted = redact_secrets(arg);
-    if redacted != arg {
-        return (
-            redacted,
-            Some((safe_arg_key_name(arg), "[REDACTED]".to_string())),
-        );
-    }
-    (arg.to_string(), None)
-}
-
-/// Allowlist redaction over the whole argv: state carries across elements, so a credential
-/// split from its marker (`["--header", "Authorization:", "Bearer", "X"]`) is still caught.
+/// Structural redaction over the whole argv (see `redact.rs`): only the package identifier,
+/// flag names and counts survive. The finding label is a validated flag name or a fixed word.
 fn sanitize_args(
+    command: Option<&str>,
     args: &[String],
     server_name: &str,
     source_file: &str,
     findings: &mut Vec<SecretFinding>,
 ) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    let mut st = RedactState::default();
-    for arg in args {
-        let marker_before = st.marker.clone();
-        let clean = redact_token(arg, &mut st);
-        if clean != *arg {
-            let key_name = if st.consumed {
-                marker_before
-            } else {
-                safe_arg_key_name(arg)
-            };
-            findings.push(SecretFinding {
-                server_name: server_name.to_string(),
-                source_file: source_file.to_string(),
-                location: "args".to_string(),
-                key_name,
-                redacted_preview: redact_secret_preview(arg),
-            });
-        }
-        out.push(clean);
-    }
-    out
+    redact_argv(command, args)
+        .into_iter()
+        .map(|r| {
+            if r.redacted && !matches!(r.label.as_str(), "command" | "shell-inner" | "url") {
+                findings.push(SecretFinding {
+                    server_name: server_name.to_string(),
+                    source_file: source_file.to_string(),
+                    location: "args".to_string(),
+                    // labels are fixed words or flag names already validated by redact.rs
+                    key_name: r.label,
+                    redacted_preview: redact_secret_preview(&r.text),
+                });
+            }
+            r.text
+        })
+        .collect()
 }
 
 fn inspect_env_map(
@@ -226,7 +168,7 @@ fn inspect_env_map(
 ) -> Vec<String> {
     let mut keys = Vec::new();
     for (k, v) in env_map {
-        keys.push(k.clone());
+        keys.push(safe_key_name(k));
         if !v.trim().is_empty()
             && !is_env_var_reference(v)
             && (is_sensitive_env_key(k) || looks_like_secret_value(v))
@@ -235,7 +177,7 @@ fn inspect_env_map(
                 server_name: server_name.to_string(),
                 source_file: source_file.to_string(),
                 location: "env".to_string(),
-                key_name: k.clone(),
+                key_name: safe_key_name(k),
                 redacted_preview: redact_secret_preview(v),
             });
         }
@@ -271,10 +213,8 @@ fn parse_json_mcp_config(
             if !has_cmd_or_url {
                 continue;
             }
-            let command = cfg_obj
-                .get("command")
-                .and_then(|v| v.as_str())
-                .map(redact_secrets);
+            let raw_command = cfg_obj.get("command").and_then(|v| v.as_str());
+            let command = raw_command.map(redact_command);
             let raw_args: Vec<String> = cfg_obj
                 .get("args")
                 .and_then(|v| v.as_array())
@@ -284,7 +224,29 @@ fn parse_json_mcp_config(
                         .collect()
                 })
                 .unwrap_or_default();
-            let args = sanitize_args(&raw_args, name, source_file, findings);
+            let server_label = safe_label(name);
+            let args = sanitize_args(raw_command, &raw_args, &server_label, source_file, findings);
+            let url = cfg_obj
+                .get("url")
+                .and_then(|v| v.as_str())
+                .map(|u| safe_url(u).unwrap_or_else(|| crate::redact::RED.to_string()));
+            let mut header_keys: Vec<String> = Vec::new();
+            for hk in ["headers", "http_headers"] {
+                if let Some(h) = cfg_obj.get(hk).and_then(|v| v.as_object()) {
+                    for k in h.keys() {
+                        let kn = safe_key_name(k);
+                        findings.push(SecretFinding {
+                            server_name: server_label.clone(),
+                            source_file: source_file.to_string(),
+                            location: "headers".to_string(),
+                            key_name: kn.clone(),
+                            redacted_preview: redact_secret_preview(k),
+                        });
+                        header_keys.push(kn);
+                    }
+                }
+            }
+            header_keys.sort();
 
             let mut env_map = BTreeMap::new();
             if let Some(env_obj) = cfg_obj.get("env").and_then(|v| v.as_object()) {
@@ -294,7 +256,7 @@ fn parse_json_mcp_config(
                     }
                 }
             }
-            let env_keys = inspect_env_map(&env_map, name, source_file, findings);
+            let env_keys = inspect_env_map(&env_map, &server_label, source_file, findings);
             let transport = if cfg_obj.contains_key("url") {
                 "http".to_string()
             } else {
@@ -304,14 +266,17 @@ fn parse_json_mcp_config(
             let enabled = cfg_obj.get("enabled").and_then(|v| v.as_bool()) != Some(false)
                 && cfg_obj.get("disabled").and_then(|v| v.as_bool()) != Some(true);
             servers.push(ConfiguredMcpServer {
-                server_name: name.clone(),
+                server_name: server_label,
                 client: client_from_path(source_file),
                 enabled,
                 source_file: source_file.to_string(),
                 transport,
                 command,
+                args_count: args.len(),
                 args,
+                url,
                 env_keys,
+                header_keys,
             });
         }
         break;
@@ -444,11 +409,13 @@ fn parse_toml_mcp_config(
         enabled: Option<bool>,
         args: Vec<String>,
         env: BTreeMap<String, String>,
+        header_keys: Vec<String>,
     }
 
     let mut map: BTreeMap<String, TempServer> = BTreeMap::new();
     let mut current_server: Option<String> = None;
     let mut in_env_section = false;
+    let mut in_header_section = false;
 
     for raw_line in raw.lines() {
         let line = strip_toml_comment(raw_line).trim();
@@ -463,21 +430,30 @@ fn parse_toml_mcp_config(
                     "" => {
                         current_server = Some(name);
                         in_env_section = false;
+                        in_header_section = false;
                     }
                     ".env" => {
                         current_server = Some(name);
                         in_env_section = true;
+                        in_header_section = false;
                     }
-                    // `.http_headers`, `.env_http_headers`, `.tools.*`, ...: subtables of a
-                    // server, never servers themselves, and never parsed (headers hold secrets).
+                    // Header subtables: only the header *names* are read, never the values.
+                    ".http_headers" | ".headers" | ".env_http_headers" => {
+                        current_server = Some(name);
+                        in_env_section = false;
+                        in_header_section = true;
+                    }
+                    // `.tools.*`, ...: subtables of a server, never servers themselves.
                     _ => {
                         current_server = None;
                         in_env_section = false;
+                        in_header_section = false;
                     }
                 }
             } else {
                 current_server = None;
                 in_env_section = false;
+                in_header_section = false;
             }
             continue;
         }
@@ -491,12 +467,16 @@ fn parse_toml_mcp_config(
         let val = v_raw.trim();
         let entry = map.entry(srv_name.clone()).or_default();
 
+        if in_header_section {
+            entry.header_keys.push(key);
+            continue;
+        }
         if in_env_section {
             entry.env.insert(key, unquote_toml_str(val));
             continue;
         }
         match key.as_str() {
-            "command" => entry.command = Some(redact_secrets(&unquote_toml_str(val))),
+            "command" => entry.command = Some(unquote_toml_str(val)),
             "url" => entry.url = Some(unquote_toml_str(val)),
             "enabled" => entry.enabled = unquote_toml_str(val).parse::<bool>().ok(),
             "args" => entry.args = parse_toml_string_array(val),
@@ -512,9 +492,33 @@ fn parse_toml_mcp_config(
         }
     }
 
-    for (name, ts) in map {
-        let args = sanitize_args(&ts.args, &name, source_file, findings);
+    for (raw_name, ts) in map {
+        let name = safe_label(&raw_name);
+        let args = sanitize_args(
+            ts.command.as_deref(),
+            &ts.args,
+            &name,
+            source_file,
+            findings,
+        );
         let env_keys = inspect_env_map(&ts.env, &name, source_file, findings);
+        let mut header_keys: Vec<String> = Vec::new();
+        for k in &ts.header_keys {
+            let kn = safe_key_name(k);
+            findings.push(SecretFinding {
+                server_name: name.clone(),
+                source_file: source_file.to_string(),
+                location: "headers".to_string(),
+                key_name: kn.clone(),
+                redacted_preview: redact_secret_preview(k),
+            });
+            header_keys.push(kn);
+        }
+        header_keys.sort();
+        let url = ts
+            .url
+            .as_deref()
+            .map(|u| safe_url(u).unwrap_or_else(|| crate::redact::RED.to_string()));
         let transport = if ts.url.is_some() {
             "http".to_string()
         } else {
@@ -526,9 +530,12 @@ fn parse_toml_mcp_config(
             enabled: ts.enabled != Some(false),
             source_file: source_file.to_string(),
             transport,
-            command: ts.command,
+            command: ts.command.as_deref().map(redact_command),
+            args_count: args.len(),
             args,
+            url,
             env_keys,
+            header_keys,
         });
     }
 }
@@ -666,17 +673,18 @@ fn infer_owning_client(ppid: u32, pid_map: &BTreeMap<u32, &ObservedProcess>) -> 
             return client.to_string();
         }
     }
-    Path::new(
-        parent
-            .command
-            .split_whitespace()
-            .next()
-            .unwrap_or("unknown"),
+    safe_label(
+        Path::new(
+            parent
+                .command
+                .split_whitespace()
+                .next()
+                .unwrap_or("unknown"),
+        )
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown"),
     )
-    .file_name()
-    .and_then(|s| s.to_str())
-    .unwrap_or("unknown")
-    .to_string()
 }
 
 fn is_supervised_daemon_leader(command: &str) -> bool {
@@ -849,7 +857,9 @@ pub fn audit_mcp_with_processes(
         Some(h) => ProtectionContext::new(h.clone(), Vec::new()),
         None => ProtectionContext::from_env(),
     };
-    let files = if opts.config_dirs.is_empty() {
+    let canon_home = fs::canonicalize(&ctx.home_dir).unwrap_or_else(|_| ctx.home_dir.clone());
+    let default_discovery = opts.config_dirs.is_empty();
+    let files = if default_discovery {
         default_mcp_config_files(&ctx.home_dir)
     } else {
         collect_config_files_in_dirs(&opts.config_dirs)
@@ -864,6 +874,12 @@ pub fn audit_mcp_with_processes(
         let file_str = file.to_string_lossy().into_owned();
         if check_path_protection(&file, &ctx).protected {
             warnings.push(format!("protected config file not read: {file_str}"));
+            continue;
+        }
+        // Default discovery only reads files whose canonical path stays inside the home:
+        // a symlinked ancestor (`~/.cursor -> /elsewhere`) must not widen the audit.
+        if default_discovery && !fs::canonicalize(&file).is_ok_and(|c| c.starts_with(&canon_home)) {
+            warnings.push(format!("config file outside home not read: {file_str}"));
             continue;
         }
         let Ok(raw) = fs::read_to_string(&file) else {
@@ -902,11 +918,11 @@ pub fn audit_mcp_with_processes(
         };
         let is_orphan = proc_item.ppid == 1 && !is_supervised_daemon_leader(&proc_item.command);
         let owning_client = infer_owning_client(proc_item.ppid, &pid_map);
-        let (clean_cmd, _) = redact_arg_token(&proc_item.command);
+        let clean_cmd = redact_command(&proc_item.command);
         running_processes.push(RunningMcpProcess {
             pid: proc_item.pid,
             ppid: proc_item.ppid,
-            server_name,
+            server_name: safe_label(&server_name),
             owning_client,
             is_orphan,
             command: clean_cmd,
@@ -1158,10 +1174,11 @@ DOCS_API_KEY = "{dummy_secret_a}"
         assert!(!json.contains("CFGPROBE"), "secret text leaked: {json}");
         for f in &report.secret_findings {
             assert!(
-                f.key_name.len() <= 64
-                    && f.key_name
-                        .chars()
-                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.' | ':')),
+                f.key_name == "<REDACTED>"
+                    || (f.key_name.len() <= 48
+                        && f.key_name
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.'))),
                 "unsafe key_name {:?}",
                 f.key_name
             );
