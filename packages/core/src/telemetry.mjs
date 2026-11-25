@@ -207,12 +207,13 @@ function gitSafeEnv() {
     GIT_TERMINAL_PROMPT: "0",
     GIT_OPTIONAL_LOCKS: "0",
     // isolated global/system config and a non-interactive ssh: a proof can neither be steered by, nor hang on, ambient config
-    GIT_CONFIG_NOSYSTEM: "1",
     GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
   };
-  // Git for Windows does not reliably accept a device path as a config file, so global-config
+  // Git for Windows does not reliably accept a device path as a config file, and its SYSTEM config
+  // carries core.autocrlf (dropping it makes every CRLF checkout look modified), so global/system
   // isolation is POSIX-only; the repo-config gate (executableConfigRisk) is what protects Windows.
   if (process.platform !== "win32") {
+    env.GIT_CONFIG_NOSYSTEM = "1";
     env.GIT_CONFIG_GLOBAL = os.devNull;
     env.GIT_CONFIG_SYSTEM = os.devNull;
   }
