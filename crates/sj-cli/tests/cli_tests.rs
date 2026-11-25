@@ -49,6 +49,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // doctor --json
     let doctor = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
@@ -59,6 +61,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // scan --json
     let scan = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["scan", root.to_str().unwrap(), "--json"])
         .env("HOME", root)
         .env("USERPROFILE", root)
@@ -70,6 +74,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // trash --path --json
     let trash = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["trash", "--path", trash_dir.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -80,6 +86,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // orphans --json
     let orphans = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["orphans", "--include-orphans", root.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -89,6 +97,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // plan --json (dry-run by default)
     let plan = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -108,6 +118,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // plan --execute without confirmation must fail with exit code 2 and not mutate
     let exec_fail = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -125,6 +137,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
     let plan_id = plan_json["items"][0]["id"].as_str().unwrap();
     let plan_sha = plan_json["plan_sha256"].as_str().unwrap();
     let exec_arbitrary = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -145,6 +159,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // scan --depth 0 must fail with exit code 2
     let scan_zero = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["scan", root.to_str().unwrap(), "--depth", "0"])
         .output()
         .unwrap();
