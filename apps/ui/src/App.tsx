@@ -2,6 +2,7 @@ import React, { useEffect, useState } from "react";
 import { DiskHeroGauge, MemoryComparisonCard } from "./components/Gauges";
 import { RemediationModal } from "./components/RemediationModal";
 import { SlmAdvisorDrawer } from "./components/SlmAdvisorDrawer";
+import { buildCandidateLists } from "./candidates";
 import { DiskConsumer, formatBytes, RemediationPlan, SlmConfig, SummaryReport } from "./types";
 
 type TabId = "overview" | "disk" | "memory" | "mcp";
@@ -86,19 +87,8 @@ export const App: React.FC = () => {
     document.documentElement.dataset.theme = theme;
   }, [theme]);
 
-  const cleanableCandidates: DiskConsumer[] = [
-    ...(summary?.cleanableCaches || []),
-    ...(summary?.trash.candidates || []),
-    ...(summary?.orphans.candidates || [])
-      .filter((o) => o.safeToPrune)
-      .map((o) => ({
-        id: o.id,
-        path: o.path,
-        bytes: 0,
-        kind: "git-worktree" as const,
-        protected: false,
-      })),
-  ];
+  // Offer exactly what the gate accepts; caches and protected items are listed as blocked, not selectable.
+  const { selectable: cleanableCandidates, blocked: blockedCandidates } = buildCandidateLists(summary);
   const readOnlyConsumers: DiskConsumer[] = summary?.disk.topConsumers || [];
 
   const selectedCandidates = cleanableCandidates.filter((c) => selectedIds.has(c.id));
@@ -116,6 +106,11 @@ export const App: React.FC = () => {
     setExecResult(null);
     if (window.spaceJanitor) {
       const plan = await window.spaceJanitor.planRemediation(selectedCandidates);
+      if (plan.gateError) {
+        setActivePlan(null);
+        setExecResult(`Cleanup refused: ${plan.gateError.message}`);
+        return;
+      }
       setActivePlan(plan);
     } else {
       setActivePlan({
@@ -299,6 +294,13 @@ export const App: React.FC = () => {
 
         {summary && tab === "disk" && (
           <>
+            {summary.remediationGate?.available === false && (
+              <p className="muted" role="alert">
+                Cleanup is disabled: the Rust safety gate (sj) is unavailable ({summary.remediationGate.reason}). Read-only
+                views still work.
+              </p>
+            )}
+            {!activePlan && execResult && <p role="status">{execResult}</p>}
             <section className="card" data-testid="orphan-scan-card">
               <div className="card-header">
                 <h2>Git worktree orphans</h2>
@@ -328,18 +330,18 @@ export const App: React.FC = () => {
             </section>
             <section className="card">
               <div className="card-header">
-                <h2>Safe Remediation Candidates (Caches &amp; Trash{orphanScan.enabled ? " & Verified Orphans" : ""})</h2>
+                <h2>Remediation Candidates (Trash{orphanScan.enabled ? " & Verified Orphans" : ""})</h2>
                 <button
                   type="button"
                   className="btn-primary"
-                  disabled={selectedCandidates.length === 0}
+                  disabled={selectedCandidates.length === 0 || summary.remediationGate?.available === false}
                   onClick={() => void handleOpenDryRun()}
                 >
                   Dry-Run Plan ({selectedCandidates.length})
                 </button>
               </div>
               {cleanableCandidates.length === 0 ? (
-                <p className="muted">No allowlisted cleanable caches or trash items found{summary.orphans.scanned === false ? " (orphan worktrees were not scanned: disabled by default)" : ""}.</p>
+                <p className="muted">No trash items the safety gate accepts{summary.orphans.scanned === false ? " (orphan worktrees were not scanned: disabled by default)" : ""}.</p>
               ) : (
                 <table className="data-table">
                   <thead>
@@ -354,21 +356,12 @@ export const App: React.FC = () => {
                     {cleanableCandidates.map((c) => (
                       <tr key={c.id}>
                         <td>
-                          <input
-                            type="checkbox"
-                            disabled={Boolean(c.protected)}
-                            checked={selectedIds.has(c.id)}
-                            onChange={() => toggleCandidate(c.id)}
-                          />
+                          <input type="checkbox" checked={selectedIds.has(c.id)} onChange={() => toggleCandidate(c.id)} />
                         </td>
                         <td className="mono">{c.path}</td>
                         <td>{formatBytes(c.bytes)}</td>
                         <td>
-                          {c.protected ? (
-                            <span className="badge badge-warn">LOCKED ({c.protectedReason})</span>
-                          ) : (
-                            <span className="badge badge-ok">Cleanable Candidate</span>
-                          )}
+                          <span className="badge badge-ok">Accepted by safety gate</span>
                         </td>
                       </tr>
                     ))}
@@ -376,6 +369,34 @@ export const App: React.FC = () => {
                 </table>
               )}
             </section>
+
+            {blockedCandidates.length > 0 && (
+              <section className="card" data-testid="blocked-candidates">
+                <div className="card-header">
+                  <h2>Not removable from the desktop</h2>
+                </div>
+                <table className="data-table">
+                  <thead>
+                    <tr>
+                      <th>Path</th>
+                      <th>Size</th>
+                      <th>Reason</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {blockedCandidates.map((c) => (
+                      <tr key={c.id}>
+                        <td className="mono">{c.path}</td>
+                        <td>{formatBytes(c.bytes)}</td>
+                        <td>
+                          <span className="badge badge-warn">{c.blockedReason}</span>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </section>
+            )}
 
             <section className="card">
               <div className="card-header">
@@ -478,6 +499,7 @@ export const App: React.FC = () => {
       </main>
 
       <RemediationModal
+        key={activePlan ? activePlan.planSha256 : "none"}
         plan={activePlan}
         onClose={() => setActivePlan(null)}
         onExecute={handleExecute}

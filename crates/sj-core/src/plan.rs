@@ -243,3 +243,109 @@ pub fn execute_plan_item_with_roots(
 
     Ok(item)
 }
+
+// ---------------------------------------------------------------------------------------------
+// Selection-bound confirmation
+// ---------------------------------------------------------------------------------------------
+//
+// A confirmation must cover exactly what will be executed. The whole-plan digest says nothing about
+// WHICH items the user picked, so a token confirmed for item A could otherwise authorise A+B. The
+// selection digest hashes the canonical (sorted by path, de-duplicated) list of the selected plan items
+// including their identity snapshot (dev/ino/size/mtime/content hash/git state), and execution
+// recomputes it from a freshly built plan: anything that changed on disk, or a different selection,
+// no longer matches and is refused before a single item is touched.
+
+#[derive(Debug, Clone)]
+pub struct SelectionGate {
+    pub execute: bool,
+    pub confirm: bool,
+    pub selection_sha256: String,
+    pub paths: Vec<String>,
+}
+
+#[derive(Debug)]
+pub struct SelectionOutcome {
+    pub executed: Vec<PlanItem>,
+    pub failed: Vec<(PlanItem, String)>,
+}
+
+/// Items of `plan` whose path is in `paths` (canonical order, de-duplicated) plus the paths that
+/// matched nothing.
+pub fn select_by_paths(plan: &RemediationPlan, paths: &[String]) -> (Vec<PlanItem>, Vec<String>) {
+    let mut wanted: Vec<&String> = paths.iter().collect();
+    wanted.sort();
+    wanted.dedup();
+    let mut items: Vec<PlanItem> = Vec::new();
+    let mut unmatched: Vec<String> = Vec::new();
+    for p in wanted {
+        match plan.items.iter().find(|i| &i.path == p) {
+            Some(i) => items.push(i.clone()),
+            None => unmatched.push(p.clone()),
+        }
+    }
+    items.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.id.cmp(&b.id)));
+    (items, unmatched)
+}
+
+pub fn selection_sha256(items: &[PlanItem]) -> Result<String, SjError> {
+    let mut sorted: Vec<&PlanItem> = items.iter().collect();
+    sorted.sort_by(|a, b| a.path.cmp(&b.path).then_with(|| a.id.cmp(&b.id)));
+    sorted.dedup_by(|a, b| a.id == b.id && a.path == b.path);
+    let mut bytes = b"spacejanitor.selection.v1\n".to_vec();
+    bytes.extend(serde_json::to_vec(&sorted)?);
+    Ok(sha256_hex(&bytes))
+}
+
+pub fn execute_selection(
+    plan: &RemediationPlan,
+    gate: &SelectionGate,
+    ctx: &ProtectionContext,
+) -> Result<SelectionOutcome, SjError> {
+    let allowed = default_trash_paths(&ctx.home_dir);
+    execute_selection_with_roots(plan, gate, ctx, &allowed)
+}
+
+pub fn execute_selection_with_roots(
+    plan: &RemediationPlan,
+    gate: &SelectionGate,
+    ctx: &ProtectionContext,
+    allowed_trash_roots: &[PathBuf],
+) -> Result<SelectionOutcome, SjError> {
+    if !gate.execute {
+        return Err(SjError::ExecutionGate(
+            "missing --execute flag (dry-run is default)".to_string(),
+        ));
+    }
+    if !gate.confirm {
+        return Err(SjError::ExecutionGate("missing --confirm flag".to_string()));
+    }
+    if gate.selection_sha256.is_empty() || gate.paths.is_empty() {
+        return Err(SjError::ExecutionGate(
+            "both --selection-sha256 and at least one --select <path> are required".to_string(),
+        ));
+    }
+    let (items, unmatched) = select_by_paths(plan, &gate.paths);
+    if !unmatched.is_empty() {
+        return Err(SjError::ExecutionGate(format!(
+            "selected path not in the freshly built plan: {}",
+            unmatched.join(", ")
+        )));
+    }
+    if selection_sha256(&items)? != gate.selection_sha256 {
+        return Err(SjError::ExecutionGate(
+            "selection_sha256 mismatch; the selection or the selected items changed since confirmation, regenerate the plan and retry"
+                .to_string(),
+        ));
+    }
+    let mut outcome = SelectionOutcome {
+        executed: Vec::new(),
+        failed: Vec::new(),
+    };
+    for item in items {
+        match safe_remove_plan_item(&item, ctx, allowed_trash_roots) {
+            Ok(()) => outcome.executed.push(item),
+            Err(e) => outcome.failed.push((item, e.to_string())),
+        }
+    }
+    Ok(outcome)
+}

@@ -49,6 +49,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // doctor --json
     let doctor = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["doctor", "--json"])
         .output()
         .unwrap();
@@ -59,7 +61,11 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // scan --json
     let scan = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["scan", root.to_str().unwrap(), "--json"])
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .output()
         .unwrap();
     assert_eq!(scan.status.code(), Some(0));
@@ -68,6 +74,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // trash --path --json
     let trash = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["trash", "--path", trash_dir.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -78,6 +86,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // orphans --json
     let orphans = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["orphans", "--include-orphans", root.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
@@ -87,6 +97,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // plan --json (dry-run by default)
     let plan = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -106,6 +118,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // plan --execute without confirmation must fail with exit code 2 and not mutate
     let exec_fail = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -123,6 +137,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
     let plan_id = plan_json["items"][0]["id"].as_str().unwrap();
     let plan_sha = plan_json["plan_sha256"].as_str().unwrap();
     let exec_arbitrary = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args([
             "plan",
             root.to_str().unwrap(),
@@ -143,6 +159,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // scan --depth 0 must fail with exit code 2
     let scan_zero = Command::new(sj_bin())
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .args(["scan", root.to_str().unwrap(), "--depth", "0"])
         .output()
         .unwrap();
@@ -687,4 +705,332 @@ fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
         .unwrap();
     assert!(String::from_utf8_lossy(&on.stderr).contains("experimental"), "opt-in must warn");
     assert!(marker.exists(), "opt-in scan should reach git");
+}
+
+fn run_protect(home: &str, args: &[&str]) -> std::process::Output {
+    Command::new(sj_bin())
+        .arg("protect")
+        .args(args)
+        .env("HOME", home)
+        .env("USERPROFILE", home)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn cli_protect_reports_per_path_verdicts_from_the_rust_gate() {
+    let out = run_protect(
+        "/Users/alice",
+        &[
+            "--json",
+            "--",
+            "/Users/alice/.ssh/id_x",
+            "/Users/alice/.cache/vite",
+            "/Users/alice/proj/.env",
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(v["schema"], "spacejanitor.protect.v1");
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["path"], "/Users/alice/.ssh/id_x");
+    assert_eq!(results[0]["protected"], true);
+    assert_eq!(results[1]["protected"], false);
+    assert_eq!(results[2]["protected"], true);
+    assert!(results[2]["reason"].as_str().unwrap().contains("env"));
+}
+
+#[test]
+fn cli_protect_descendants_blocks_a_tree_holding_a_protected_entry() {
+    let tmp = tempdir().unwrap();
+    // the synthetic home contains the work dirs: on Windows the temp dir lives under C:\Users, which
+    // is another account's home to the gate unless it is inside the home being judged
+    let home = tmp.path().to_path_buf();
+    let project = tmp.path().join("project");
+    fs::create_dir_all(project.join("app")).unwrap();
+    fs::write(project.join("app").join(".env.production"), "S=1").unwrap();
+    let clean = tmp.path().join("clean");
+    fs::create_dir_all(clean.join("src")).unwrap();
+    fs::write(clean.join("src").join("main.rs"), "x").unwrap();
+
+    let out = run_protect(
+        home.to_str().unwrap(),
+        &[
+            "--json",
+            "--descendants",
+            "--",
+            project.to_str().unwrap(),
+            clean.to_str().unwrap(),
+        ],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let results = v["results"].as_array().unwrap();
+    assert_eq!(results[0]["protected"], true);
+    assert!(results[0]["reason"]
+        .as_str()
+        .unwrap()
+        .starts_with("protected_descendant"));
+    assert_eq!(results[1]["protected"], false);
+}
+
+#[test]
+fn cli_protect_with_no_paths_is_a_usage_error() {
+    let out = run_protect("/Users/alice", &["--json"]);
+    assert_ne!(out.status.code(), Some(0));
+}
+
+#[cfg(not(windows))] // the Windows trash is the system Recycle Bin, not a directory under HOME
+#[test]
+fn cli_plan_excludes_keepass_vaults_and_key_material_in_trash() {
+    // cross-family review blocker 1: *.kdbx was planned (and deletable) once the JS denylist was gone.
+    // (Credential-NAMED files inside ~/.Trash, e.g. ~/.Trash/.netrc, were never covered by the JS
+    // denylist either: its home rules are anchored at ~/.netrc itself. The home-anchored cases are pinned
+    // by the shared protect vectors.)
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    for f in ["passwords.kdbx", "server.pem", "id_rsa_backup", "junk.bin"] {
+        fs::write(trash.join(f), "x").unwrap();
+    }
+    let out = Command::new(sj_bin())
+        .args(["plan", home.to_str().unwrap(), "--json"])
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let planned: Vec<String> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert_eq!(planned, vec!["junk.bin".to_string()], "only the harmless item may be planned: {v}");
+    assert_eq!(v["protected_exclusions"].as_array().unwrap().len(), 3);
+}
+
+#[test]
+fn cli_protect_honours_custom_exact_dynamic_and_glob_rules() {
+    let out = run_protect(
+        "/Users/alice",
+        &[
+            "--json",
+            "--exact", "/data/keep",
+            "--dynamic", "/work/active",
+            "--glob", "*.secret-ish",
+            "--",
+            "/data/keep/sub",
+            "/work/active/src",
+            "/Users/alice/a.secret-ish",
+            "/data/other",
+        ],
+    );
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let flags: Vec<bool> = v["results"].as_array().unwrap().iter().map(|r| r["protected"].as_bool().unwrap()).collect();
+    assert_eq!(flags, vec![true, true, true, false]);
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_selection_token_for_one_item_cannot_execute_another_selection() {
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    for (n, b) in [("a.bin", "aaaa"), ("b.bin", "bbbbbb")] {
+        fs::write(trash.join(n), b).unwrap();
+    }
+    let a = trash.join("a.bin");
+    let b = trash.join("b.bin");
+    let sj = |args: &[&str]| {
+        Command::new(sj_bin())
+            .args(args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap()
+    };
+    let h = home.to_str().unwrap();
+    let plan_a = sj(&["plan", h, "--json", "--select", a.to_str().unwrap()]);
+    assert_eq!(plan_a.status.code(), Some(0), "{}", String::from_utf8_lossy(&plan_a.stderr));
+    let pa: serde_json::Value = serde_json::from_slice(&plan_a.stdout).unwrap();
+    let token_a = pa["selection"]["selection_sha256"].as_str().unwrap().to_string();
+    let plan_ab = sj(&["plan", h, "--json", "--select", a.to_str().unwrap(), "--select", b.to_str().unwrap()]);
+    let pab: serde_json::Value = serde_json::from_slice(&plan_ab.stdout).unwrap();
+    assert_ne!(pab["selection"]["selection_sha256"].as_str().unwrap(), token_a);
+    assert_eq!(pa["plan_sha256"], pab["plan_sha256"], "the whole-plan digest is the same; only the selection digest differs");
+
+    // the one-item token must not authorise A+B or B
+    for sel in [vec![a.to_str().unwrap(), b.to_str().unwrap()], vec![b.to_str().unwrap()]] {
+        let mut args = vec!["plan", h, "--execute", "--confirm", "--selection-sha256", token_a.as_str()];
+        for s in &sel {
+            args.push("--select");
+            args.push(s);
+        }
+        let out = sj(&args);
+        assert_eq!(out.status.code(), Some(2), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(a.exists() && b.exists());
+    }
+
+    // the right selection executes only that item (reordered/duplicated flags are fine)
+    let out = sj(&["plan", h, "--execute", "--confirm", "--selection-sha256", &token_a, "--select", a.to_str().unwrap(), "--select", a.to_str().unwrap()]);
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let done: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_eq!(done["executed_items"].as_array().unwrap().len(), 1);
+    assert!(!a.exists());
+    assert!(b.exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
+    use std::os::unix::fs::symlink;
+    let v: serde_json::Value = serde_json::from_str(include_str!("../../sj-core/tests/fixtures/protect_vectors.json")).unwrap();
+    for case in v["fs_cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+        let abs = |rel: &str| -> std::path::PathBuf {
+            if Path::new(rel).is_absolute() { Path::new(rel).to_path_buf() } else { root.join(rel) }
+        };
+        for step in case["setup"].as_array().unwrap() {
+            if let Some(d) = step["dir"].as_str() {
+                fs::create_dir_all(abs(d)).unwrap();
+            } else if let Some(l) = step["link"].as_str() {
+                fs::create_dir_all(abs(l).parent().unwrap()).unwrap();
+                symlink(abs(step["target"].as_str().unwrap()), abs(l)).unwrap();
+            }
+        }
+        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(|c| abs(c)).unwrap_or_else(|| root.clone());
+        fs::create_dir_all(&cwd).unwrap();
+        let home = abs(case["home"].as_str().unwrap());
+        let list = |k: &str| -> Vec<String> {
+            case.get("options")
+                .and_then(|o| o.get(k))
+                .and_then(|x| x.as_array())
+                .map(|a| a.iter().map(|y| y.as_str().unwrap().to_string()).collect())
+                .unwrap_or_default()
+        };
+        let check = |p: &str| -> bool {
+            let mut cmd = Command::new(sj_bin());
+            cmd.current_dir(&cwd).env("HOME", &home).env("USERPROFILE", &home).args(["protect", "--json"]);
+            for e in list("exact") { cmd.arg(format!("--exact={e}")); }
+            for e in list("dynamic") { cmd.arg(format!("--dynamic={e}")); }
+            for e in list("glob") { cmd.arg(format!("--glob={e}")); }
+            cmd.arg("--").arg(abs(p));
+            let out = cmd.output().unwrap();
+            assert_eq!(out.status.code(), Some(0), "{name}: {}", String::from_utf8_lossy(&out.stderr));
+            let j: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+            j["results"][0]["protected"].as_bool().unwrap()
+        };
+        for p in case["protected"].as_array().unwrap() {
+            assert!(check(p.as_str().unwrap()), "{name}: expected protected: {p}");
+        }
+        for p in case["unprotected"].as_array().unwrap() {
+            assert!(!check(p.as_str().unwrap()), "{name}: expected unprotected: {p}");
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_rules() {
+    // cross-family review R3 blocker 1: both shapes were planned (and deletable) at 8f61e92
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(trash.join("other_dir")).unwrap();
+    for keep in ["keep_via_sym_dotdot", "keep_via_rel_exact", "free.bin"] {
+        if keep.ends_with(".bin") {
+            fs::write(trash.join(keep), "x").unwrap();
+        } else {
+            fs::create_dir_all(trash.join(keep)).unwrap();
+            fs::write(trash.join(keep).join("precious.txt"), "p").unwrap();
+        }
+    }
+    symlink(trash.join("other_dir"), home.join("to_trash_other")).unwrap();
+    let rel_trash = trash.strip_prefix(&home).unwrap().to_string_lossy().into_owned();
+    let out = Command::new(sj_bin())
+        .current_dir(&home)
+        .args(["plan", home.to_str().unwrap(), "--json"])
+        .arg("--exact=~/to_trash_other/../keep_via_sym_dotdot")
+        .arg(format!("--exact=./{rel_trash}/keep_via_rel_exact"))
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let planned: Vec<String> = v["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|i| i["path"].as_str().unwrap().rsplit('/').next().unwrap().to_string())
+        .collect();
+    assert!(!planned.contains(&"keep_via_sym_dotdot".to_string()), "{planned:?}");
+    assert!(!planned.contains(&"keep_via_rel_exact".to_string()), "{planned:?}");
+    assert!(planned.contains(&"free.bin".to_string()), "{planned:?}");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it() {
+    // cross-family review R3 blocker 2: callers must pass --include-trash next to --include-orphans
+    let tmp = tempdir().unwrap();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let trash = if cfg!(target_os = "macos") {
+        home.join(".Trash")
+    } else {
+        home.join(".local").join("share").join("Trash").join("files")
+    };
+    fs::create_dir_all(&trash).unwrap();
+    fs::write(trash.join("old_log.txt"), "x").unwrap();
+    let planned = |extra: &[&str]| -> usize {
+        let mut args = vec!["plan", home.to_str().unwrap(), "--json"];
+        args.extend_from_slice(extra);
+        let out = Command::new(sj_bin())
+            .args(&args)
+            .env("HOME", &home)
+            .env("USERPROFILE", &home)
+            .env_remove("XDG_DATA_HOME")
+            .output()
+            .unwrap();
+        assert_eq!(out.status.code(), Some(0), "{}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        v["items"].as_array().unwrap().len()
+    };
+    assert_eq!(planned(&[]), 1, "default: trash only");
+    assert_eq!(planned(&["--include-trash"]), 1);
+    assert_eq!(planned(&["--include-orphans"]), 0, "documented sj semantics: orphans INSTEAD of trash");
+    assert_eq!(planned(&["--include-trash", "--include-orphans"]), 1, "trash plus orphans keeps the trash item");
 }

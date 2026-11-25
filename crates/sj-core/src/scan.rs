@@ -1,4 +1,4 @@
-use crate::protect::{check_path_protection, ProtectionContext};
+use crate::protect::{check_path_protection_anchored, ProtectionContext};
 use crate::{SjError, SCHEMA_STORAGE_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
@@ -119,7 +119,7 @@ pub fn scan_directory(
         .as_ref()
         .is_some_and(|hc| *hc == root_canon && hc != Path::new("/"));
     if !is_home_root {
-        let verdict = check_path_protection(root, ctx);
+        let verdict = check_path_protection_anchored(root, ctx);
         if verdict.protected {
             return Err(SjError::ProtectedPath(verdict.reason));
         }
@@ -156,7 +156,7 @@ pub fn scan_directory(
                     return false;
                 }
                 let p = entry.path();
-                let verdict = check_path_protection(&p, &ctx_clone);
+                let verdict = check_path_protection_anchored(&p, &ctx_clone);
                 if verdict.protected {
                     if let Ok(mut guard) = skipped_clone.lock() {
                         guard.push(p.to_string_lossy().into_owned());

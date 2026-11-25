@@ -55,6 +55,16 @@ export const RemediationModal: React.FC<Props> = ({ plan, onClose, onExecute, re
             <span className="muted">SHA-256 Digest:</span>
             <code>{plan.planSha256}</code>
           </div>
+          {plan.blockedItems.length > 0 && (
+            <ul className="target-list" aria-label="Blocked by the safety gate">
+              {plan.blockedItems.map((b) => (
+                <li key={b.id}>
+                  <span>{b.path}</span>
+                  <strong>{b.reason}</strong>
+                </li>
+              ))}
+            </ul>
+          )}
           <ul className="target-list">
             {plan.items.map((item) => (
               <li key={item.id}>

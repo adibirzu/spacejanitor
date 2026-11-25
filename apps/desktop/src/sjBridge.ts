@@ -28,43 +28,60 @@ export interface ResolveBinaryOptions {
   isPackaged?: boolean;
   platform?: NodeJS.Platform;
   existsSync?: (p: string) => boolean;
+  isExecutable?: (p: string) => boolean;
+  env?: NodeJS.ProcessEnv;
+  repoRoot?: string;
 }
 
 const PACKAGE_REPO_ROOT = path.resolve(__dirname, "../../..");
 
+function defaultIsExecutable(p: string, platform: NodeJS.Platform): boolean {
+  if (platform === "win32") return true;
+  try {
+    fs.accessSync(p, fs.constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Locate the Rust `sj` gate binary by ABSOLUTE path. Never searches PATH or the cwd. A packaged app
+ * only ever uses the binary bundled in its own resources (`<resources>/bin/sj`); when that is
+ * missing the answer is null and every destructive action is refused. SPACEJANITOR_NO_SJ=1 disables sj.
+ */
 export function resolveSjBinary(options: ResolveBinaryOptions = {}): string | null {
   const platform = options.platform ?? process.platform;
+  const env = options.env ?? process.env;
+  if (env.SPACEJANITOR_NO_SJ === "1") return null;
   const exe = platform === "win32" ? "sj.exe" : "sj";
   const exists = options.existsSync ?? fs.existsSync;
+  // Injected predicates are test seams. Production uses the shared trust check (absolute, regular file
+  // not a symlink, executable, owned by the user or root, not group/world writable, no world-writable
+  // parent): the same code the core gate and the CLI use.
+  const injected = options.existsSync !== undefined || options.isExecutable !== undefined;
+  const isExec = options.isExecutable ?? ((p: string) => defaultIsExecutable(p, platform));
+  const usable = (p: string): boolean =>
+    injected ? path.isAbsolute(p) && exists(p) && isExec(p) : core.sjBinaryProblem(p, { platform }) === null;
   const resourcesPath = options.resourcesPath ?? (process as { resourcesPath?: string }).resourcesPath ?? "";
   const isPackaged = options.isPackaged ?? false;
 
   if (resourcesPath) {
     const bundled = path.join(resourcesPath, "bin", exe);
-    if (exists(bundled)) return bundled;
+    if (usable(bundled)) return bundled;
   }
   if (isPackaged) {
     return null;
   }
 
-  const envBin = process.env.SPACEJANITOR_SJ_BIN;
-  if (envBin && exists(envBin)) return envBin;
+  const envBin = env.SPACEJANITOR_SJ_BIN;
+  if (envBin && usable(envBin)) return envBin;
 
-  const repoCandidates = [
-    path.resolve(PACKAGE_REPO_ROOT, "target", "release", exe),
-    path.resolve(PACKAGE_REPO_ROOT, "target", "debug", exe),
-  ];
-  for (const cand of repoCandidates) {
-    if (exists(cand)) return cand;
+  const repoRoot = options.repoRoot ?? PACKAGE_REPO_ROOT;
+  for (const profile of ["release", "debug"]) {
+    const cand = path.resolve(repoRoot, "target", profile, exe);
+    if (usable(cand)) return cand;
   }
-
-  const pathEnv = process.env.PATH || "";
-  for (const dir of pathEnv.split(path.delimiter)) {
-    if (!dir) continue;
-    const full = path.join(dir, exe);
-    if (exists(full)) return full;
-  }
-
   return null;
 }
 
@@ -83,7 +100,18 @@ export class SjBridge {
   private readonly pending = new Map<number, PendingRpc>();
 
   constructor(options: { binaryPath?: string | null } = {}) {
-    this.binaryPath = options.binaryPath !== undefined ? options.binaryPath : resolveSjBinary();
+    const requested = options.binaryPath !== undefined ? options.binaryPath : resolveSjBinary();
+    // An explicit path gets the same trust checks as a resolved one (regular file, not a symlink, not
+    // group/world writable, ...): read-only spawns must not run a binary the gate itself would refuse.
+    this.binaryPath = requested && core.sjBinaryProblem(requested) === null ? requested : null;
+    // Every safety decision in this process (core protect checks, orphan proofs, plan/execute) runs
+    // through exactly this binary. null pins the gate closed: destructive actions are refused.
+    core.configureSjBinary(this.binaryPath);
+  }
+
+  /** Whether destructive remediation can be attempted. Read-only views never depend on this. */
+  remediationAvailable(): { available: boolean; reason: string } {
+    return core.activeSjBinary() ? { available: true, reason: "" } : { available: false, reason: "sj_unavailable" };
   }
 
   private ensureSidecar(): boolean {
@@ -174,7 +202,6 @@ export class SjBridge {
       doctor: ["doctor", "--json"],
       disk: ["scan", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       trash: ["trash", "--json"],
-      orphans: ["orphans", "--include-orphans", "--json", ...(params.targetPath ? ["--", String(params.targetPath)] : [])],
       memory: ["memory", "--json"],
       blockers: ["blockers", "--json"],
       "mcp-audit": ["mcp-audit", "--json"],
@@ -200,22 +227,12 @@ export class SjBridge {
     return null;
   }
 
-  private failClosed(method: string, report: Record<string, unknown>): Record<string, unknown> {
-    const failure = this.lastRustFailure;
-    const candidates = (report as { candidates?: Array<Record<string, unknown>> }).candidates;
-    if (method !== "orphans" || !failure || !Array.isArray(candidates)) return report;
-    return {
-      ...report,
-      rustProof: failure,
-      candidates: candidates.map((c) => ({ ...c, safeToPrune: false, proofStatus: `rust_proof_${failure}` })),
-    };
-  }
-
   async invoke(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
-    // Orphan scanning is OFF unless the main process explicitly opted in: no Rust call, no git, and the
-    // report says "not scanned" instead of an empty "no orphans".
-    if (method === "orphans" && params.includeOrphans !== true) {
-      return core.collectOrphans({ targetPath: params.targetPath });
+    // Orphan scanning is OFF unless the main process explicitly opted in: nothing runs, no git is spawned
+    // and the report says "not scanned". With the opt-in the proof is Rust sj only (core -> sj orphans);
+    // a missing/slow sj yields an error report with no candidates, never a weaker Node answer.
+    if (method === "orphans") {
+      return core.collectOrphans({ targetPath: params.targetPath, includeOrphans: params.includeOrphans === true });
     }
     if (this.binaryPath) {
       try {
@@ -236,8 +253,6 @@ export class SjBridge {
         return core.collectMemory(params);
       case "blockers":
         return core.collectBlockers();
-      case "orphans":
-        return this.failClosed(method, await core.collectOrphans({ ...params, includeOrphans: true }));
       case "trash":
         return core.collectTrash(params);
       case "mcp-audit":

@@ -1,5 +1,5 @@
 {
-  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep.",
+  "comment": "Shared lexical denylist vectors. Run by crates/sj-core/tests/core_tests.rs (is_protected_path) and packages/core/test/safety.test.mjs (isProtectedPath). Every path is lexical and nonexistent; home is a synthetic placeholder. Add a vector here for every denylist bug so both implementations stay in lockstep. Every rule of the former JS denylist (main a66538f packages/core/src/protect.mjs) has a vector here; the Rust gate is the only implementation. Sections: protected/unprotected run as pure string tests on every platform; posix_host_protected needs POSIX path semantics (drive letters are meaningless there). Note: there was no config/protected.json on main. fs_cases (Unix only) are built under a scratch root: paths are relative to it, 'home' is the synthetic home, link entries are symlinks (target relative to the root unless absolute), options mirror --exact/--dynamic/--glob; a candidate listed under protected must be judged protected, under unprotected must not. A fs_case with 'cwd' (relative to the scratch root) runs with that working directory: relative custom rules are anchored to the cwd exactly like main's path.resolve did, then resolved in OS order (symlink target first, then ..); the Rust core harness skips cwd cases (a process cwd is not thread safe) and crates/sj-cli/tests/cli_tests.rs runs them through the binary.",
   "home": "/Users/alice",
   "protected": [
     "/",
@@ -71,7 +71,96 @@
     "~/Library/Caches/pnpm/../../Mail",
     "~/Library/Caches/pip/x/../../../.ssh",
     "~/AppData/Local/npm-cache/../../Roaming",
-    "/Users/alice/Library/Caches/Homebrew/../../../.aws"
+    "/Users/alice/Library/Caches/Homebrew/../../../.aws",
+    "/Users/alice/.netrc",
+    "/Users/alice/.npmrc",
+    "/Users/alice/.pypirc",
+    "/Users/alice/.git-credentials",
+    "/Users/alice/.docker/config.json",
+    "/Users/alice/.azure/accessTokens.json",
+    "/Users/alice/.oci/config",
+    "/Users/alice/.local/share/keyrings/login.keyring",
+    "/Users/alice/.password-store/site.gpg",
+    "/Users/alice/.1password/agent.sock",
+    "/Users/alice/.mozilla/firefox/p/logins.json",
+    "/Users/alice/.terraform.d/credentials.tfrc.json",
+    "/Users/alice/.codex/auth.json",
+    "/Users/alice/.config/gcloud/credentials.db",
+    "/Users/alice/.gitconfig",
+    "/Users/alice/.zshrc",
+    "/Users/alice/.bashrc",
+    "/Users/alice/.bash_profile",
+    "/Users/alice/.zprofile",
+    "/Users/alice/.profile",
+    "/Users/alice/Documents/important.pdf",
+    "/Users/alice/Desktop/x.txt",
+    "/Users/alice/Pictures/a.png",
+    "/Users/alice/Movies/a.mov",
+    "/Users/alice/Music/a.mp3",
+    "/Users/alice/OneDrive/a.docx",
+    "/Users/alice/vault/passwords.kdbx",
+    "/Users/alice/keys/id_rsa_backup",
+    "/Users/alice/keys/id_ed25519.bak",
+    "/Users/alice/a.private.d/file.txt",
+    "/Users/alice/Library/Caches/Homebrew-evil/x",
+    "/Users/alice/Library/Caches/other",
+    "/Users/alice/AppData/Roaming/x",
+    "/Users/bob/Library/Keychains/login.keychain-db",
+    "/Users/bob/.claude/settings.json",
+    "/Users/bob/anything",
+    "/home/bob/x",
+    "C:/Users/bob/x",
+    "/Users",
+    "/home",
+    "/private",
+    "/private/var",
+    "/private/var/root",
+    "/private/var/root/x",
+    "/var/root",
+    "/System/Volumes/Data/private",
+    "/System/Volumes/Data/private/var/root",
+    "/Applications",
+    "/Applications/Foo.app/Contents",
+    "/opt",
+    "/opt/homebrew/bin",
+    "/Volumes",
+    "/var",
+    "/mnt",
+    "/srv",
+    "/tmp",
+    "/lib",
+    "/lib64",
+    "/root",
+    "/var/db",
+    "/Program Files",
+    "/Program Files (x86)/x",
+    "C:/",
+    "C:\\",
+    "C:/Users",
+    "C:/WINDOWS/x",
+    "c:\\windows\\system32",
+    "C:\\Program Files\\x",
+    "C:/Program Files (x86)/x",
+    "\\\\?\\C:\\Windows\\System32",
+    "//?/C:/Windows",
+    "\\\\?\\C:\\Program Files\\x",
+    "\\\\.\\C:\\x",
+    "//./C:/x",
+    "\\\\server\\share\\x",
+    "//server/share/x",
+    "\\\\?\\UNC\\srv\\share\\x",
+    "relative/path",
+    "../x",
+    "./x",
+    "~bob/Library/Keychains/login.keychain-db",
+    "\u0000",
+    "   ",
+    "/Users/alice/.cache/a\nb",
+    "/Users/alice/.cache/a\u0000b",
+    "~/Documents",
+    "~/.config/gcloud/x",
+    "/private/tmp",
+    "/private/tmp/"
   ],
   "unprotected": [
     "/Users/alice/.cache/npm",
@@ -93,6 +182,310 @@
     "~/Library/Caches/Homebrew",
     "~/Library/Caches/pip/wheels/x",
     "~/AppData/Local/npm-cache/_cacache",
-    "~/AppData/Local/pip/Cache/http"
+    "~/AppData/Local/pip/Cache/http",
+    "/Users/alice/.cache/vite",
+    "/Users/alice/proj/src/main.rs",
+    "/Users/alice/AppData/Local/npm-cache/_cacache",
+    "/Users/alice/AppData/Local/pip/Cache/http",
+    "~/.cache/vite",
+    "/data/other/file.txt"
+  ],
+  "posix_host_protected": [
+    "D:/data/x",
+    "D:\\data\\x",
+    "C:/../Library/Keychains",
+    "E:/",
+    "\\Users\\alice\\Library\\Caches\\Homebrew",
+    "\\Users\\alice\\.cache\\vite",
+    "\\tmp\\x"
+  ],
+  "fs_cases": [
+    {
+      "name": "~/.ssh symlinked elsewhere: the real target stays protected (R2-B3)",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ext/real_ssh"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/.ssh",
+          "target": "ext/real_ssh"
+        }
+      ],
+      "protected": [
+        "ext/real_ssh/config",
+        "ext/real_ssh"
+      ],
+      "unprotected": [
+        "ext/other/file"
+      ]
+    },
+    {
+      "name": "~/Documents symlinked into the trash",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.Trash/Documents_real"
+        },
+        {
+          "link": "home/Documents",
+          "target": "home/.Trash/Documents_real"
+        }
+      ],
+      "protected": [
+        "home/.Trash/Documents_real/tax.pdf"
+      ],
+      "unprotected": [
+        "home/.Trash/other.bin"
+      ]
+    },
+    {
+      "name": "~/.password-store symlinked to a git checkout",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ws/pass-repo"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/.password-store",
+          "target": "ws/pass-repo"
+        }
+      ],
+      "protected": [
+        "ws/pass-repo",
+        "ws/pass-repo/site.gpg"
+      ],
+      "unprotected": [
+        "ws/other-repo"
+      ]
+    },
+    {
+      "name": "custom exact path given through a symlink protects the real target",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/models_ssd"
+        },
+        {
+          "link": "home/models",
+          "target": "ext/models_ssd"
+        }
+      ],
+      "options": {
+        "exact": [
+          "~/models"
+        ]
+      },
+      "protected": [
+        "ext/models_ssd/llama.gguf",
+        "home/models/x"
+      ],
+      "unprotected": [
+        "ext/models_other/x"
+      ]
+    },
+    {
+      "name": "custom dynamic path given through a symlink protects the real target",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/active_real"
+        },
+        {
+          "link": "ws_link",
+          "target": "ext/active_real"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "ws_link"
+        ]
+      },
+      "protected": [
+        "ext/active_real/src"
+      ],
+      "unprotected": [
+        "ext/idle/src"
+      ]
+    },
+    {
+      "name": "custom rules are additive only: they never allow what a built-in rule protects",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.ssh"
+        }
+      ],
+      "options": {
+        "exact": [
+          "/nonexistent-allow"
+        ],
+        "glob": [
+          "*.never-matches"
+        ]
+      },
+      "protected": [
+        "home/.ssh/id_x"
+      ],
+      "unprotected": []
+    },
+    {
+      "name": "relative --exact rule is anchored to the cwd",
+      "home": "home",
+      "cwd": "ws",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ws/keep"
+        },
+        {
+          "dir": "ws/other"
+        }
+      ],
+      "options": {
+        "exact": [
+          "./keep"
+        ]
+      },
+      "protected": [
+        "ws/keep/precious.txt",
+        "ws/keep"
+      ],
+      "unprotected": [
+        "ws/other/x"
+      ]
+    },
+    {
+      "name": "relative --dynamic rule given through a symlink",
+      "home": "home",
+      "cwd": "ws",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/real"
+        },
+        {
+          "dir": "ws"
+        },
+        {
+          "link": "ws/link",
+          "target": "ext/real"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "link"
+        ]
+      },
+      "protected": [
+        "ext/real/src",
+        "ws/link/src"
+      ],
+      "unprotected": [
+        "ext/idle/src"
+      ]
+    },
+    {
+      "name": "exact rule with symlink then .. is resolved in OS order (reviewer repro R3-1)",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home/.Trash/other_dir"
+        },
+        {
+          "dir": "home/.Trash/keep_via_sym_dotdot"
+        },
+        {
+          "link": "home/to_trash_other",
+          "target": "home/.Trash/other_dir"
+        }
+      ],
+      "options": {
+        "exact": [
+          "~/to_trash_other/../keep_via_sym_dotdot"
+        ]
+      },
+      "protected": [
+        "home/.Trash/keep_via_sym_dotdot/precious_a.txt"
+      ],
+      "unprotected": [
+        "home/.Trash/unrelated/x"
+      ]
+    },
+    {
+      "name": "dynamic rule with symlink then ..",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "home"
+        },
+        {
+          "dir": "ext/deep/x"
+        },
+        {
+          "dir": "ext/deep/sibling"
+        },
+        {
+          "link": "ws_link",
+          "target": "ext/deep/x"
+        }
+      ],
+      "options": {
+        "dynamic": [
+          "ws_link/../sibling"
+        ]
+      },
+      "protected": [
+        "ext/deep/sibling/f"
+      ],
+      "unprotected": [
+        "ext/deep/x/f",
+        "ext/other/f"
+      ]
+    },
+    {
+      "name": "glob rule matches through a symlinked parent",
+      "home": "home",
+      "setup": [
+        {
+          "dir": "ext/projreal/secret"
+        },
+        {
+          "dir": "home"
+        },
+        {
+          "link": "home/proj",
+          "target": "ext/projreal"
+        }
+      ],
+      "options": {
+        "glob": [
+          "*/projreal/secret/*"
+        ]
+      },
+      "protected": [
+        "home/proj/secret/f",
+        "ext/projreal/secret/f"
+      ],
+      "unprotected": [
+        "home/proj/public/f"
+      ]
+    }
   ]
 }

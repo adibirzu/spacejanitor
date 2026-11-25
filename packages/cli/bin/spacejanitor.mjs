@@ -5,8 +5,6 @@
  * Prefers the Rust `sj` binary when available, falling back to @spacejanitor/core.
  */
 
-import { execFileSync } from "node:child_process";
-import fs from "node:fs";
 import path from "node:path";
 import process from "node:process";
 import { fileURLToPath } from "node:url";
@@ -21,14 +19,13 @@ import {
   ORPHAN_SCAN_WARNING,
   collectSummary,
   collectTrash,
-  createRemediationPlan,
   formatToon,
   normalizeReportEnvelope,
-  verifyRemediationGate,
+  runSjSync,
+  buildSjPlanArgs,
 } from "../../core/src/index.mjs";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const REPO_ROOT = path.resolve(__dirname, "../../..");
 const VERSION = "0.1.0";
 
 function printHelp() {
@@ -63,64 +60,18 @@ function printHelp() {
   console.log(lines.join("\n"));
 }
 
-function findRustSjBinary() {
-  const envBin = process.env.SPACEJANITOR_SJ_BIN;
-  if (envBin && fs.existsSync(envBin)) return envBin;
-
-  const exe = process.platform === "win32" ? "sj.exe" : "sj";
-  const candidates = [
-    path.resolve(REPO_ROOT, "target", "release", exe),
-    path.resolve(REPO_ROOT, "target", "debug", exe),
-  ];
-  for (const cand of candidates) {
-    if (fs.existsSync(cand)) return cand;
-  }
-  return exe;
-}
-
-// How the last Rust call failed ("timed_out" | "error" | null): destructive-action proofs must not
-// silently fall back to the weaker Node answer when a Rust binary exists but could not finish.
-let lastRustFailure = null;
-
-function rustTimeoutMs(cmd) {
-  const fromEnv = Number(process.env.SPACEJANITOR_SJ_TIMEOUT_MS);
-  if (Number.isFinite(fromEnv) && fromEnv > 0) return fromEnv;
-  return cmd === "orphans" ? 60000 : 5000;
-}
-
-function failClosedOnRustFailure(report) {
-  if (!lastRustFailure || !report || !Array.isArray(report.candidates)) return report;
-  return {
-    ...report,
-    rustProof: lastRustFailure,
-    candidates: report.candidates.map((c) => ({
-      ...c,
-      safeToPrune: false,
-      proofStatus: `rust_proof_${lastRustFailure}`,
-    })),
-  };
-}
-
 function tryRustSj(subArgs) {
   // SPACEJANITOR_NO_SJ=1 forces the Node collectors (hermetic tests, locked-down hosts).
-  lastRustFailure = null;
-  if (process.env.SPACEJANITOR_NO_SJ === "1") return null;
-  const bin = findRustSjBinary();
+  // The sj binary is located by absolute path only (never PATH); see core/src/sjGate.mjs.
   try {
-    const out = execFileSync(bin, [...subArgs, "--json"], {
-      encoding: "utf8",
-      timeout: rustTimeoutMs(subArgs[0]),
-      stdio: ["ignore", "pipe", "ignore"],
-    });
-    const parsed = JSON.parse(out);
+    const envMs = Number(process.env.SPACEJANITOR_SJ_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(envMs) && envMs > 0 ? envMs : subArgs[0] === "orphans" ? 60000 : 5000;
+    const parsed = runSjSync([...subArgs, "--json"], { timeoutMs });
     if (parsed && typeof parsed === "object" && parsed.schema) {
       return normalizeReportEnvelope({ ...parsed, source: "sj-core" });
     }
-  } catch (err) {
-    // Fallback to Node telemetry collector, but never silently for a binary that ran and failed
-    if (err && err.code !== "ENOENT") {
-      lastRustFailure = err.code === "ETIMEDOUT" || err.killed || err.signal ? "timed_out" : "error";
-    }
+  } catch {
+    // Fallback to Node telemetry collector (read-only views only)
   }
   return null;
 }
@@ -187,34 +138,37 @@ async function main(argv) {
   } else if (cmd === "blockers") {
     report = tryRustSj(["blockers"]) || (await collectBlockers());
   } else if (cmd === "orphans") {
-    // Off unless --include-orphans: no git is spawned (not by Rust, not by Node) and the report says "not scanned".
-    report = includeOrphans
-      ? tryRustSj(["orphans", targetPath, "--include-orphans"]) ||
-        failClosedOnRustFailure(await collectOrphans({ targetPath, includeOrphans: true }))
-      : await collectOrphans({ targetPath });
+    // Off unless --include-orphans: no git is spawned and the report says "not scanned".
+    report = await collectOrphans({ targetPath, includeOrphans });
   } else if (cmd === "trash") {
     report = tryRustSj(["trash"]) || (await collectTrash());
   } else if (cmd === "mcp-audit") {
     report = tryRustSj(["mcp-audit"]) || (await collectMcpAudit());
   } else if (cmd === "remediate") {
-    const trash = await collectTrash();
-    const plan = createRemediationPlan(trash.candidates || []);
+    // Plans and execution are decided by the Rust gate only. The Node CLI never executes.
     if (flags.has("--execute")) {
-      const phrase = values.get("--confirm") || "";
-      const planSha256 = values.get("--plan-sha256") || "";
-      const gate = verifyRemediationGate({ plan, planSha256, phrase });
-      const errObj = {
-        schema: "spacejanitor.reap.v1",
-        executed: false,
-        reason: gate.allowed ? "not_implemented" : gate.reason,
-        error: gate.allowed
-          ? "not_implemented: Node AXI CLI is read-only/dry-run; use SpaceJanitor Desktop or Rust sj plan --execute"
-          : gate.reason,
-      };
-      emit(errObj, wantsJson);
+      emit(
+        {
+          schema: "spacejanitor.reap.v1",
+          executed: false,
+          reason: "not_implemented",
+          error: "not_implemented: Node AXI CLI is dry-run only; use SpaceJanitor Desktop or `sj plan --execute --confirm`",
+        },
+        wantsJson
+      );
       return 1;
     }
-    report = plan;
+    try {
+      report = runSjSync(buildSjPlanArgs({ root: targetPath, includeTrash: true, includeOrphans }), { timeoutMs: 60000 });
+      if (report.schema !== "spacejanitor.proposal.v1") throw Object.assign(new Error("sj_unparseable"), { reason: "sj_unparseable" });
+    } catch (err) {
+      const reason = (err && err.reason) || "sj_unavailable";
+      emit(
+        { schema: "spacejanitor.reap.v1", executed: false, reason, error: `${reason}: remediation planning requires the Rust sj gate` },
+        wantsJson
+      );
+      return 1;
+    }
   } else if (cmd === "advise") {
     const slmUrl = values.get("--slm-url") || "";
     const enabled = Boolean(slmUrl);

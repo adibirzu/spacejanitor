@@ -3,6 +3,7 @@ productName: SpaceJanitor
 copyright: Copyright (c) 2026 Adrian Birzu (MIT License)
 electronVersion: "35.7.5"
 asar: true
+beforePack: scripts/before-pack.cjs
 
 directories:
   output: release

@@ -1,6 +1,6 @@
 use crate::protect::{
-    check_dir_descendants_safe_logical, check_path_protection, is_quarantine_stage_name,
-    is_symlink_path, ProtectionContext,
+    check_dir_descendants_safe_logical, check_path_protection_anchored, is_quarantine_stage_name,
+    is_symlink_path, ProtectionContext, ProtectionVerdict,
 };
 use crate::{SjError, SCHEMA_ORPHANS_V1};
 use jwalk::WalkDir;
@@ -532,7 +532,7 @@ fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), Stri
     if is_symlink_path(&common_path).unwrap_or(true) {
         return Err("symlink_or_missing_commondir".to_string());
     }
-    let common_verdict = check_path_protection(&common_path, ctx);
+    let common_verdict = check_path_protection_anchored(&common_path, ctx);
     if common_verdict.protected {
         return Err(format!("protected_commondir:{}", common_verdict.reason));
     }
@@ -558,7 +558,7 @@ fn validate_gitdir_pointer(
     if is_symlink_path(&target).unwrap_or(true) {
         return Err("symlink_or_missing_gitdir".to_string());
     }
-    let verdict = check_path_protection(&target, ctx);
+    let verdict = check_path_protection_anchored(&target, ctx);
     if verdict.protected {
         return Err(format!("protected_gitdir:{}", verdict.reason));
     }
@@ -731,7 +731,12 @@ fn validate_single_repo_at(
     let mut reasons = Vec::new();
     let proof_start = Instant::now();
 
-    let prot = check_path_protection(logical_repo, ctx);
+    // The gate rejects relative paths outright; anchor to the cwd WITHOUT touching `..` components
+    // (symlink-then-`..` must still be resolved by the OS, not collapsed lexically).
+    let prot = match anchor_to_cwd(logical_repo) {
+        Ok(abs) => check_path_protection_anchored(&abs, ctx),
+        Err(reason) => ProtectionVerdict::deny(reason),
+    };
     if prot.protected {
         reasons.push(format!("protected_path:{}", prot.reason));
         return Err(reasons);
@@ -1057,7 +1062,7 @@ pub fn inspect_orphans(
                 {
                     return true;
                 }
-                !check_path_protection(&entry.path(), &ctx_clone).protected
+                !check_path_protection_anchored(&entry.path(), &ctx_clone).protected
             });
         });
 
@@ -1206,7 +1211,10 @@ pub(crate) fn verify_orphan_safe_to_remove_staged(
     logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<(), SjError> {
-    let prot = check_path_protection(logical_repo, ctx);
+    let prot = match anchor_to_cwd(logical_repo) {
+        Ok(abs) => check_path_protection_anchored(&abs, ctx),
+        Err(reason) => ProtectionVerdict::deny(reason),
+    };
     if prot.protected {
         return Err(SjError::ProtectedPath(prot.reason));
     }

@@ -5,6 +5,9 @@ export interface DiskConsumer {
   kind: "file" | "dir" | "git-worktree";
   protected?: boolean;
   protectedReason?: string;
+  /** set by the host from the Rust gate: false means a dry-run plan would refuse this item */
+  selectable?: boolean;
+  blockedReason?: string;
 }
 
 export interface ProcessEntry {
@@ -41,6 +44,10 @@ export interface OrphanCandidate {
   hasRemote: boolean;
   hasUnpushed: boolean;
   safeToPrune: boolean;
+  protected?: boolean;
+  protectedReason?: string;
+  selectable?: boolean;
+  blockedReason?: string;
 }
 
 export interface SummaryReport {
@@ -85,6 +92,7 @@ export interface SummaryReport {
     servers: McpServerEntry[];
   };
   cleanableCaches?: DiskConsumer[];
+  remediationGate?: { available: boolean; reason: string };
 }
 
 export interface RemediationPlan {
@@ -97,6 +105,7 @@ export interface RemediationPlan {
   planSha256: string;
   confirmationPhrase: string;
   expiresAtMs: number;
+  gateError?: { reason: string; message: string };
 }
 
 export interface SlmConfig {

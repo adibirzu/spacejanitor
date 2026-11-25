@@ -1,4 +1,5 @@
-import { isProtectedPath } from "./protect.mjs";
+import { isProtectedPath, protectPaths } from "./protect.mjs";
+import { SjGateError, runSj } from "./sjGate.mjs";
 import { redactSecrets, redactArgv } from "./redact.mjs";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
@@ -81,6 +82,15 @@ export function collectDoctor({ version = "0.1.0", schemas = SCHEMA_VERSIONS_EXT
   };
 }
 
+/**
+ * Judge many paths with ONE sj spawn when the stock gate is in use (an injected predicate, used by tests,
+ * is simply mapped). Fails closed like the single-path call.
+ */
+function judgeMany(paths, isProtectedFn, options) {
+  if (isProtectedFn === isProtectedPath) return protectPaths(paths, options);
+  return paths.map((p) => isProtectedFn(p, options));
+}
+
 export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = isProtectedPath } = {}) {
   const resolved = path.resolve(targetPath);
   let freeBytes = 0;
@@ -97,11 +107,16 @@ export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = i
   const topConsumers = [];
   try {
     const entries = fs.readdirSync(resolved, { withFileTypes: true }).slice(0, 40);
-    for (const ent of entries) {
-      if (ent.isSymbolicLink() || !ent.isDirectory()) continue;
+    const dirs = entries.filter((ent) => !ent.isSymbolicLink() && ent.isDirectory());
+    const verdicts = judgeMany(
+      dirs.map((ent) => path.join(resolved, ent.name)),
+      isProtectedFn,
+      {}
+    );
+    for (const [i, ent] of dirs.entries()) {
       const full = path.join(resolved, ent.name);
       const bytes = dirSizeBounded(full, 1);
-      const prot = isProtectedFn(full);
+      const prot = verdicts[i] || { protected: true, reason: "sj_unparseable" };
       topConsumers.push({
         id: `dir-${ent.name}`,
         path: full,
@@ -133,11 +148,15 @@ export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = i
 export async function collectTrash({ homeDir = os.homedir() } = {}) {
   const candidates = [];
   const platform = os.platform();
+  // Must match the Rust gate's default_trash_paths exactly: the desktop selects sj plan items by path.
+  const xdgDataHome = process.env.XDG_DATA_HOME;
   const trashPath =
     platform === "darwin"
       ? path.join(homeDir, ".Trash")
       : platform === "linux"
-        ? path.join(homeDir, ".local", "share", "Trash", "files")
+        ? xdgDataHome
+          ? path.join(xdgDataHome, "Trash", "files")
+          : path.join(homeDir, ".local", "share", "Trash", "files")
         : "";
 
   let totalBytes = 0;
@@ -181,160 +200,13 @@ export async function collectTrash({ homeDir = os.homedir() } = {}) {
   };
 }
 
-async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000, env, input } = {}) {
+async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000 } = {}) {
   try {
-    const pending = execFileAsync(cmd, args, { cwd, timeout, maxBuffer, ...(env ? { env } : {}) });
-    if (input !== undefined && pending.child?.stdin) {
-      pending.child.stdin.on("error", () => {});
-      pending.child.stdin.end(input);
-    }
-    const { stdout } = await pending;
+    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout, maxBuffer });
     return { ok: true, stdout: stdout.trim() };
   } catch {
     return { ok: false, stdout: "" };
   }
-}
-
-
-// Repo-controlled git config can EXECUTE commands (core.fsmonitor, hooks) or LIE about the working
-// tree (fsmonitor answering "nothing changed"), so every proof call neutralises it.
-const GIT_SAFE_ARGS = [
-  "-c", "core.fsmonitor=false",
-  "-c", "core.untrackedCache=false",
-  "-c", `core.hooksPath=${os.devNull}`,
-  "-c", "protocol.ext.allow=never",
-  "--no-optional-locks",
-];
-
-function gitSafeEnv() {
-  const env = {
-    ...process.env,
-    GIT_TERMINAL_PROMPT: "0",
-    GIT_OPTIONAL_LOCKS: "0",
-    // isolated global/system config and a non-interactive ssh: a proof can neither be steered by, nor hang on, ambient config
-    GIT_SSH_COMMAND: "ssh -o BatchMode=yes",
-  };
-  // Git for Windows does not reliably accept a device path as a config file, and its SYSTEM config
-  // carries core.autocrlf (dropping it makes every CRLF checkout look modified), so global/system
-  // isolation is POSIX-only; the repo-config gate (executableConfigRisk) is what protects Windows.
-  if (process.platform !== "win32") {
-    env.GIT_CONFIG_NOSYSTEM = "1";
-    env.GIT_CONFIG_GLOBAL = os.devNull;
-    env.GIT_CONFIG_SYSTEM = os.devNull;
-  }
-  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
-    delete env[k];
-  }
-  return env;
-}
-
-const EXEC_CONFIG_PATTERNS = [
-  /^filter\..+\.(clean|smudge|process)$/,
-  /^remote\..+\.(uploadpack|receivepack|vcs|proxy)$/,
-  /^core\.(sshcommand|gitproxy|askpass|pager|editor|alternaterefscommand)$/,
-  /^credential\./,
-  /^url\..+\.(insteadof|pushinsteadof)$/,
-  /^include\./,
-  /^includeif\./,
-  /^diff\.external$/,
-  /^diff\..+\.(textconv|command)$/,
-  /^gpg\.(.+\.)?program$/,
-  /^uploadpack\./,
-  /^http\.(proxy|sslcertpasswordprotected)$/,
-  /^ssh\./,
-];
-
-/** Returns the offending (lowercased) key when a git config key can make git execute a command, else null. */
-export function classifyExecutableConfigKey(key) {
-  const k = String(key).toLowerCase();
-  return EXEC_CONFIG_PATTERNS.some((re) => re.test(k)) ? k : null;
-}
-
-/**
- * Read the repo-local and worktree config WITHOUT running anything (git config --file only parses) and
- * report the first key that could execute a command. Unreadable config fails closed.
- */
-async function executableConfigRisk(gitDir) {
-  const files = [];
-  let commonDir = gitDir;
-  try {
-    const rel = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
-    if (rel) commonDir = path.resolve(gitDir, rel);
-  } catch {
-    // no commondir file: this IS the common dir
-  }
-  files.push(path.join(commonDir, "config"));
-  const wtCfg = path.join(gitDir, "config.worktree");
-  if (fs.existsSync(wtCfg)) files.push(wtCfg);
-  for (const f of files) {
-    if (!fs.existsSync(f)) continue;
-    const res = await safeExecResult("git", ["config", "--file", f, "--list", "--name-only", "-z"], os.tmpdir(), { env: gitSafeEnv() });
-    if (!res.ok) return "repo_config_can_execute:unreadable_config";
-    for (const key of res.stdout.split("\0")) {
-      const hit = key && classifyExecutableConfigKey(key);
-      if (hit) return `repo_config_can_execute:${hit}`;
-    }
-  }
-  return null;
-}
-
-function resolveCommonDir(gitDir) {
-  try {
-    const rel = fs.readFileSync(path.join(gitDir, "commondir"), "utf8").trim();
-    return rel ? path.resolve(gitDir, rel) : gitDir;
-  } catch {
-    return gitDir;
-  }
-}
-
-/** git against the SHARED git dir (branch reflogs live there and outlive a linked worktree). */
-function gitProofCommon(commonDir, args, opts = {}) {
-  return safeExecResult("git", [...GIT_SAFE_ARGS, "--git-dir", commonDir, ...args], os.tmpdir(), { ...opts, env: gitSafeEnv() });
-}
-
-/** Heads and tags the remotes actually hold (one ls-remote per remote), limited to objects we have. */
-async function remoteTagAndHeadTips(G, remotes) {
-  const tips = new Set();
-  for (const remote of remotes) {
-    const r = await G(["ls-remote", "--heads", "--tags", "--", remote], { timeout: 15000 });
-    if (!r.ok) continue;
-    for (const line of r.stdout.split(/\r?\n/)) {
-      const sha = line.split(/\s+/)[0];
-      if (/^[0-9a-f]{40,64}$/i.test(sha)) tips.add(sha);
-    }
-  }
-  if (tips.size === 0) return [];
-  const present = await G(["cat-file", "--batch-check"], { input: [...tips].join("\n") + "\n" });
-  if (!present.ok) return [];
-  return present.stdout.split(/\r?\n/).filter((l) => l && !l.endsWith(" missing")).map((l) => l.split(/\s+/)[0]);
-}
-
-function resolveWorktreeGitDir(wtPath) {
-  try {
-    const dotGit = path.join(wtPath, ".git");
-    const st = fs.lstatSync(dotGit);
-    if (st.isDirectory()) return dotGit;
-    if (!st.isFile()) return null;
-    const m = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)\s*$/m);
-    if (!m) return null;
-    return path.resolve(wtPath, m[1].trim());
-  } catch {
-    return null;
-  }
-}
-
-/** git call with an explicit --git-dir/--work-tree (config.worktree decoys and inherited GIT_DIR cannot redirect it). */
-function gitProof(wtPath, gitDir, args, opts = {}) {
-  return safeExecResult(
-    "git",
-    [...GIT_SAFE_ARGS, "--git-dir", gitDir, "--work-tree", wtPath, ...args],
-    wtPath,
-    { ...opts, env: gitSafeEnv() }
-  );
-}
-
-function gitSafeIn(cwd, args, opts = {}) {
-  return safeExecResult("git", [...GIT_SAFE_ARGS, ...args], cwd, { ...opts, env: gitSafeEnv() });
 }
 
 async function safeExec(cmd, args, cwd) {
@@ -343,193 +215,42 @@ async function safeExec(cmd, args, cwd) {
 }
 
 /**
- * Prove (or fail to prove) that a linked worktree can be removed without losing anything.
- * Mirrors the Rust core (crates/sj-core/src/orphans.rs): dirty, untracked, ignored files, stashes,
- * unpushed commits/branches, no remote and detached/unborn HEAD all block; any git failure blocks.
+ * Orphan/worktree discovery and every safety proof come from the Rust gate (`sj orphans`). There is no
+ * JavaScript proof. OFF by default: without an explicit opt-in nothing is scanned, git is never spawned
+ * and the report says "not scanned" (not an empty "no orphans"). With the opt-in, a missing, slow or
+ * unparseable sj yields `error` and no candidates, so nothing can be offered as safe to prune.
  */
-export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false, includeOrphans = false } = {}) {
-  const base = {
-    id: `wt-${path.basename(wtPath)}`,
-    path: wtPath,
-    kind: "git-worktree",
-    maxAgeDays,
-  };
-  const unverified = (extra = {}) => ({
-    ...base,
-    clean: false,
-    hasRemote: false,
-    hasUnpushed: true,
-    hasIgnored: false,
-    hasStashes: false,
-    hasIndexFlags: false,
-    locked,
-    proofStatus: "unverified",
-    safeToPrune: false,
-    ...extra,
-  });
-  // OFF unless explicitly opted in: nothing here may run git against a repository we did not create.
-  if (!includeOrphans) return unverified({ proofStatus: "not_scanned", notScannedReason: "orphan_scan_disabled_by_default" });
-  if (!wtPath || !fs.existsSync(wtPath)) return unverified();
-  const gitDir = resolveWorktreeGitDir(wtPath);
-  if (!gitDir) return unverified();
-  locked = locked || fs.existsSync(path.join(gitDir, "locked"));
-  const configRisk = await executableConfigRisk(gitDir);
-  if (configRisk) return unverified({ configRisk });
-  const G = (args, opts) => gitProof(wtPath, gitDir, args, opts);
-
-  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes, flagsRes, extraRefsRes, reflogRes] = await Promise.all([
-    G(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"]),
-    G(["remote"]),
-    G(["rev-list", "--branches", "--not", "--remotes", "--count"]),
-    G(["rev-list", "HEAD", "--not", "--remotes", "--count"]),
-    G(["stash", "list"]),
-    G(["symbolic-ref", "-q", "HEAD"]),
-    G(["rev-parse", "--verify", "-q", "HEAD"]),
-    // lowercase tags = assume-unchanged, "S" = skip-worktree: git status stays clean while edits exist
-    G(["ls-files", "-v", "-z"], { maxBuffer: 64 * 1024 * 1024, timeout: 15000 }),
-    // tags and per-worktree ref namespaces: lost with the worktree unless a remote holds them
-    G(["for-each-ref", "--format=%(objectname)", "refs/tags", "refs/worktree", "refs/bisect", "refs/rewritten"]),
-    // commits made on a detached HEAD and then left behind live only in this worktree's HEAD reflog
-    G(["reflog", "show", "--format=%H", "HEAD"], { maxBuffer: 8 * 1024 * 1024 }),
-  ]);
-  if (![statusRes, remotesRes, branchesRes, headRes, stashRes, flagsRes, extraRefsRes, reflogRes].every((r) => r.ok)) {
-    return unverified({ hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false });
-  }
-  const refShas = [...new Set(extraRefsRes.stdout.split(/\s+/).filter(Boolean))];
-  const reflogShas = [...new Set(reflogRes.stdout.split(/\s+/).filter(Boolean))];
-  let extraUnpushed = false;
-  if (refShas.length + reflogShas.length > 3000 || [...refShas, ...reflogShas].some((x) => !/^[0-9a-f]{7,64}$/i.test(x))) {
-    extraUnpushed = true; // cannot verify: fail closed
-  } else {
-    // shas travel on stdin (Windows command lines are short); remote tags are only fetched lazily
-    const commonDir = resolveCommonDir(gitDir);
-    const sharedG = commonDir !== gitDir ? (args, opts) => gitProofCommon(commonDir, args, opts) : null;
-    let remoteTips = null;
-    const getRemoteTips = async () => {
-      if (remoteTips === null) remoteTips = await remoteTagAndHeadTips(G, remotesRes.stdout.split(/\s+/).filter(Boolean));
-      return remoteTips;
-    };
-    const unreachable = async (run, shas, pre = [], notArgs = ["--remotes"]) => {
-      if (shas.length === 0) return 0;
-      const count = async (tips) => {
-        const input = shas.join("\n") + "\n" + tips.map((t) => `^${t}`).join("\n") + (tips.length ? "\n" : "");
-        const r = await run(["rev-list", "--count", ...pre, "--stdin", "--not", ...notArgs], { input });
-        const n = Number(r.stdout);
-        return r.ok && Number.isFinite(n) ? n : Infinity;
-      };
-      const n = await count([]);
-      if (n === 0) return 0;
-      return count(await getRemoteTips());
-    };
-    if ((await unreachable(G, refShas)) > 0) extraUnpushed = true;
-    if (!extraUnpushed && reflogShas.length) {
-      // linked worktree: commits still held by the SHARED reflogs (amend/rebase before push) are not lost
-      const n = sharedG
-        ? await unreachable(sharedG, reflogShas, ["--single-worktree"], ["--reflog", "--remotes"])
-        : await unreachable(G, reflogShas);
-      if (n > 0) extraUnpushed = true;
-    }
-  }
-  const lines = statusRes.stdout.split(/\r?\n/).filter(Boolean);
-  const hasIgnored = lines.some((l) => l.startsWith("!!"));
-  const hasDirty = lines.some((l) => !l.startsWith("!!"));
-  const hasRemote = remotesRes.stdout.length > 0;
-  const hasStashes = stashRes.stdout.length > 0;
-  const hasIndexFlags = flagsRes.stdout.split("\0").some((e) => /^[a-zS]/.test(e));
-  const branchCount = Number(branchesRes.stdout);
-  const headCount = Number(headRes.stdout);
-  const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
-  const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0 || extraUnpushed;
-  const onBranch = symRes.ok && symRes.stdout.length > 0 && headOkRes.ok;
-  const proofStatus = countsValid ? "verified" : "unverified";
-  return {
-    ...base,
-    clean: !hasDirty && !hasIgnored && !hasIndexFlags,
-    hasRemote,
-    hasUnpushed,
-    hasIgnored,
-    hasStashes,
-    hasIndexFlags,
-    locked,
-    detachedHead: !onBranch,
-    proofStatus,
-    safeToPrune:
-      !hasDirty && !hasIgnored && !hasIndexFlags && hasRemote && !hasUnpushed && !hasStashes && onBranch && !locked && proofStatus === "verified",
-  };
-}
-
-/**
- * `git worktree remove` for a linked worktree, run against the MAIN repository with explicit
- * --git-dir/--work-tree and the same neutralised config as the proofs (no --force: git itself still
- * refuses dirty or locked worktrees). Works for worktrees placed beside the repo as well as inside it.
- */
-export async function removeLinkedWorktree(wtPath, { includeOrphans = false } = {}) {
-  if (!includeOrphans) return { ok: false, error: "orphan_scanning_disabled" };
-  const gitDir = resolveWorktreeGitDir(wtPath);
-  if (!gitDir) return { ok: false, error: "worktree_git_dir_unresolvable" };
-  const commonDir = resolveCommonDir(gitDir);
-  if (commonDir === gitDir || path.basename(commonDir) !== ".git") return { ok: false, error: "main_repo_unresolvable" };
-  const mainWorkTree = path.dirname(commonDir);
-  try {
-    await execFileAsync(
-      "git",
-      [...GIT_SAFE_ARGS, "--git-dir", commonDir, "--work-tree", mainWorkTree, "worktree", "remove", wtPath],
-      { cwd: mainWorkTree, timeout: 15000, env: gitSafeEnv() }
-    );
-    return { ok: true };
-  } catch (err) {
-    return { ok: false, error: err instanceof Error ? err.message.split("\n")[0] : "worktree_remove_failed" };
-  }
-}
-
 export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14, includeOrphans = false } = {}) {
   const resolved = path.resolve(targetPath);
-  const candidates = [];
-
+  const base = {
+    schema: SCHEMA_VERSIONS_EXT.orphans,
+    targetPath: resolved,
+    maxAgeDays,
+    timestamp: new Date().toISOString(),
+  };
   if (!includeOrphans) {
-    // Off by default and NOT an empty "no orphans" result: nothing was looked at, and git was not spawned.
     return {
-      schema: SCHEMA_VERSIONS_EXT.orphans,
-      source: "node-fallback",
+      ...base,
+      source: "not-scanned",
       status: "not_scanned",
       scanned: false,
       notScannedReason: "orphan_scan_disabled_by_default",
       message: ORPHAN_SCAN_DISABLED_MESSAGE,
-      targetPath: resolved,
-      maxAgeDays,
-      candidates,
-      timestamp: new Date().toISOString(),
+      candidates: [],
     };
   }
-
-  const insideGit = await gitSafeIn(resolved, ["rev-parse", "--is-inside-work-tree"]);
-  if (insideGit.ok && insideGit.stdout === "true") {
-    const wtOut = await gitSafeIn(resolved, ["worktree", "list", "--porcelain"]);
-    if (wtOut.ok) {
-      // git lists the main working tree first: it is never an orphan, however the target is spelled.
-      const blocks = wtOut.stdout.split(/\r?\n\r?\n/).filter(Boolean);
-      for (const [idx, block] of blocks.entries()) {
-        if (idx === 0) continue;
-        const lines = block.split(/\r?\n/);
-        const first = lines.find((l) => l.startsWith("worktree "));
-        if (!first) continue;
-        const wtPath = first.slice("worktree ".length).trim();
-        if (!wtPath || wtPath === resolved) continue;
-        const locked = lines.some((l) => l === "locked" || l.startsWith("locked "));
-        candidates.push(await inspectWorktree(wtPath, { maxAgeDays, locked, includeOrphans: true }));
-      }
+  try {
+    const envMs = Number(process.env.SPACEJANITOR_SJ_TIMEOUT_MS);
+    const timeoutMs = Number.isFinite(envMs) && envMs > 0 ? envMs : 60000;
+    const raw = await runSj(["orphans", "--include-orphans", "--json", resolved], { timeoutMs });
+    if (raw.schema !== SCHEMA_VERSIONS_EXT.orphans || !Array.isArray(raw.safe_to_prune) || !Array.isArray(raw.blocked)) {
+      throw new SjGateError("sj_unparseable");
     }
+    const normalized = normalizeReportEnvelope({ ...raw, source: "sj-core" });
+    return { ...base, ...normalized, scanned: true, targetPath: resolved, maxAgeDays };
+  } catch (err) {
+    return { ...base, source: "sj-unavailable", scanned: false, error: err && err.reason ? err.reason : "sj_unavailable", candidates: [] };
   }
-
-  return {
-    schema: SCHEMA_VERSIONS_EXT.orphans,
-    source: "node-fallback",
-    scanned: true,
-    targetPath: resolved,
-    maxAgeDays,
-    candidates,
-    timestamp: new Date().toISOString(),
-  };
 }
 
 export function parseMacOsVmStat(vmStatOutput, swapOutput = "", totalBytes = os.totalmem()) {
@@ -899,9 +620,10 @@ export async function collectCleanableCaches({ homeDir = os.homedir(), isProtect
     path.join(homeDir, ".gradle", "caches"),
   ];
   const candidates = [];
-  for (const cachePath of knownCaches) {
-    if (!fs.existsSync(cachePath)) continue;
-    const prot = isProtectedFn(cachePath, { homeDir });
+  const present = knownCaches.filter((cachePath) => fs.existsSync(cachePath));
+  const verdicts = judgeMany(present, isProtectedFn, { homeDir });
+  for (const [i, cachePath] of present.entries()) {
+    const prot = verdicts[i] || { protected: true };
     if (prot.protected) continue;
     const bytes = dirSizeBounded(cachePath, 2);
     candidates.push({

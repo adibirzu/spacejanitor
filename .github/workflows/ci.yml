@@ -61,8 +61,15 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 22
-      - name: Run unit tests
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the Rust sj gate (the Node gate wrappers delegate every safety decision to it)
+        run: cargo build -p sj-cli
+      - name: Run unit tests (with sj)
         run: npm test
+      - name: Run unit tests with the gate disabled (every protection check must fail closed)
+        run: npm test
+        env:
+          SPACEJANITOR_NO_SJ: "1"
       - name: Verify CLI doctor
         run: node packages/cli/bin/spacejanitor.mjs doctor --json
 
@@ -84,10 +91,17 @@ jobs:
           node-version: 22
       - name: Install workspace dependencies
         run: npm ci
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build the Rust sj gate (desktop integration tests drive the real binary)
+        run: cargo build -p sj-cli
       - name: Typecheck desktop and UI
         run: npm run desktop:typecheck
       - name: Run desktop tests
         run: npm run desktop:test
+      - name: Run desktop tests with the gate disabled (destructive actions must be refused)
+        run: npm run desktop:test
+        env:
+          SPACEJANITOR_NO_SJ: "1"
 
   # Electron desktop release matrix (enabled once M5 desktop bundle lands):
   #   - macOS Universal (arm64 + x86_64) on macos-15

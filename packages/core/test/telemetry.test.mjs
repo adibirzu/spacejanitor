@@ -15,10 +15,7 @@ import {
   collectMcpAudit,
   collectSummary,
   collectCleanableCaches,
-  inspectWorktree,
-  classifyExecutableConfigKey,
-  createRemediationPlan,
-  verifyRemediationGate,
+  activeSjBinary,
   validateLoopbackSlmUrl,
   redactSlmPayload,
   adviseWithLocalSlm,
@@ -78,65 +75,6 @@ test("collectors emit valid v1 envelopes with node-fallback source", async () =>
   assert.ok(summary.disk && summary.memory && summary.blockers);
 });
 
-test("two-step remediation plan filters protected paths and enforces SHA-256 + phrase + TTL gate", () => {
-  const plan = createRemediationPlan(
-    [
-      { id: "c1", path: "/home/developer/.ssh/id_ed25519", bytes: 4096, kind: "file" },
-      { id: "c2", path: "/home/developer/.cache/npm", bytes: 1048576, kind: "dir" },
-    ],
-    { homeDir: SYNTHETIC_HOME, nowMs: 1_000_000 }
-  );
-
-  assert.equal(plan.schema, "spacejanitor.plan.v1");
-  assert.equal(plan.dryRun, true);
-  assert.equal(plan.items.length, 1);
-  assert.equal(plan.items[0].id, "c2");
-  assert.equal(plan.blockedItems.length, 1);
-  assert.equal(plan.blockedItems[0].id, "c1");
-  assert.match(plan.planSha256, /^[a-f0-9]{64}$/);
-  assert.ok(plan.confirmationPhrase.length >= 6);
-
-  // Fails with wrong phrase
-  const badPhrase = verifyRemediationGate({
-    plan,
-    planSha256: plan.planSha256,
-    phrase: "WRONG",
-    nowMs: 1_001_000,
-    homeDir: SYNTHETIC_HOME,
-  });
-  assert.equal(badPhrase.allowed, false);
-
-  // Fails with wrong SHA-256
-  const badSha = verifyRemediationGate({
-    plan,
-    planSha256: "0".repeat(64),
-    phrase: plan.confirmationPhrase,
-    nowMs: 1_001_000,
-    homeDir: SYNTHETIC_HOME,
-  });
-  assert.equal(badSha.allowed, false);
-
-  // Fails when TTL (5 min) expired
-  const expired = verifyRemediationGate({
-    plan,
-    planSha256: plan.planSha256,
-    phrase: plan.confirmationPhrase,
-    nowMs: 1_000_000 + 6 * 60 * 1000,
-    homeDir: SYNTHETIC_HOME,
-  });
-  assert.equal(expired.allowed, false);
-
-  // Succeeds when valid
-  const ok = verifyRemediationGate({
-    plan,
-    planSha256: plan.planSha256,
-    phrase: plan.confirmationPhrase,
-    nowMs: 1_001_000,
-    homeDir: SYNTHETIC_HOME,
-  });
-  assert.equal(ok.allowed, true);
-});
-
 test("SLM URL validator enforces loopback-only by default and blocks external cloud URLs", () => {
   assert.equal(validateLoopbackSlmUrl("http://127.0.0.1:11434/v1/chat/completions").allowed, true);
   assert.equal(validateLoopbackSlmUrl("http://localhost:8080/v1/chat/completions").allowed, true);
@@ -165,50 +103,6 @@ test("SLM payload redactor strips secrets and TOON formatter produces compact ou
   const toon = formatToon({ schema: "spacejanitor.doctor.v1", status: "OK", platform: "darwin", arch: "arm64" });
   assert.ok(toon.includes("schema: spacejanitor.doctor.v1"));
   assert.ok(!toon.trim().startsWith("{"));
-});
-
-test("B5: collectOrphans fails closed on git errors and detects unpushed detached-HEAD commits", async () => {
-  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "sj-orphans-"));
-  try {
-    const repoDir = path.join(tmpRoot, "repo");
-    const wtDetached = path.join(tmpRoot, "wt-detached");
-    const wtBroken = path.join(tmpRoot, "wt-broken");
-    fs.mkdirSync(repoDir, { recursive: true });
-
-    execFileSync("git", ["init"], { cwd: repoDir });
-    execFileSync("git", ["config", "user.email", "dev@example.com"], { cwd: repoDir });
-    execFileSync("git", ["config", "user.name", "Developer"], { cwd: repoDir });
-    fs.writeFileSync(path.join(repoDir, "README.md"), "init\n");
-    execFileSync("git", ["add", "README.md"], { cwd: repoDir });
-    execFileSync("git", ["commit", "-m", "init"], { cwd: repoDir });
-    execFileSync("git", ["remote", "add", "origin", "https://example.com/repo.git"], { cwd: repoDir });
-
-    // Create detached-HEAD worktree with an unpushed commit
-    execFileSync("git", ["worktree", "add", "--detach", wtDetached], { cwd: repoDir });
-    fs.writeFileSync(path.join(wtDetached, "local.txt"), "unpushed\n");
-    execFileSync("git", ["add", "local.txt"], { cwd: wtDetached });
-    execFileSync("git", ["commit", "-m", "detached unpushed"], { cwd: wtDetached });
-
-    // Create another worktree and corrupt its .git pointer so git commands fail
-    execFileSync("git", ["worktree", "add", "-b", "broken-branch", wtBroken], { cwd: repoDir });
-    fs.rmSync(path.join(wtBroken, ".git"), { force: true });
-    fs.writeFileSync(path.join(wtBroken, ".git"), "gitdir: /nonexistent/invalid/gitdir\n");
-
-    const report = await collectOrphans({ targetPath: repoDir, includeOrphans: true });
-    const detachedEntry = report.candidates.find((c) => path.basename(c.path) === "wt-detached");
-    assert.ok(detachedEntry, "expected detached worktree in candidates");
-    assert.equal(detachedEntry.hasUnpushed, true);
-    assert.equal(detachedEntry.safeToPrune, false);
-
-    const brokenEntry = report.candidates.find((c) => path.basename(c.path) === "wt-broken");
-    assert.ok(brokenEntry, "expected broken worktree in candidates");
-    assert.equal(brokenEntry.clean, false);
-    assert.equal(brokenEntry.hasUnpushed, true);
-    assert.equal(brokenEntry.proofStatus, "unverified");
-    assert.equal(brokenEntry.safeToPrune, false);
-  } finally {
-    fs.rmSync(tmpRoot, { recursive: true, force: true });
-  }
 });
 
 test("B7: collectMcpAudit parses JSON & TOML configs and flags URL creds, headers, and inline tokens without leaks", async () => {
@@ -468,6 +362,10 @@ test("R5-B18: collectCleanableCaches offers the macOS Library/Caches targets", a
       fs.writeFileSync(path.join(home, rel, "f"), "x");
     }
     const found = (await collectCleanableCaches({ homeDir: home })).map((c) => path.relative(home, c.path).split(path.sep).join("/")).sort();
+    if (!activeSjBinary()) {
+      assert.deepEqual(found, [], "no sj gate: no cache may be offered (fail closed)");
+      return;
+    }
     assert.deepEqual(found, [".npm/_cacache", "Library/Caches/Homebrew", "Library/Caches/pip", "Library/Caches/pnpm"]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
@@ -511,106 +409,6 @@ test("R6-B19: mcp-audit redacts the value of every two-argument header form (-H 
 function git(cwd, ...args) {
   return execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" });
 }
-
-test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed, detached and no-remote worktrees as NOT safe", async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r6b21-")));
-  try {
-    const origin = path.join(base, "origin.git");
-    const repo = path.join(base, "repo");
-    fs.mkdirSync(repo);
-    git(base, "init", "--bare", "-b", "main", origin);
-    git(repo, "init", "-b", "main");
-    fs.writeFileSync(path.join(repo, ".gitignore"), "*.secret\nlocal-data/\n");
-    fs.writeFileSync(path.join(repo, "a.txt"), "a");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "init");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    const mk = (name, branch) => {
-      const p = path.join(base, name);
-      git(repo, "worktree", "add", "-b", branch, p);
-      git(p, "push", "-u", "origin", branch);
-      return p;
-    };
-    const clean = mk("wt-clean", "b-clean");
-    const ignored = mk("wt-ignored", "b-ignored");
-    const untracked = mk("wt-untracked", "b-untracked");
-    const unpushed = mk("wt-unpushed", "b-unpushed");
-    const stashed = mk("wt-stashed", "b-stashed");
-    // proof for the clean worktree is taken BEFORE any sibling gets an unpushed branch (the unpushed
-    // check is repo-wide, as in the Rust core)
-    const cleanProof = await inspectWorktree(clean, { includeOrphans: true });
-    assert.equal(cleanProof.safeToPrune, true, `clean pushed worktree is safe: ${JSON.stringify(cleanProof)}`);
-    fs.writeFileSync(path.join(ignored, "db.secret"), "precious");
-    fs.mkdirSync(path.join(ignored, "local-data"));
-    fs.writeFileSync(path.join(untracked, "notes.txt"), "n");
-    fs.writeFileSync(path.join(unpushed, "u.txt"), "u");
-    git(unpushed, "add", "u.txt");
-    git(unpushed, "commit", "-m", "local only");
-    fs.writeFileSync(path.join(stashed, "a.txt"), "changed");
-    git(stashed, "stash", "push");
-    const detached = path.join(base, "wt-detached");
-    git(repo, "worktree", "add", "--detach", detached);
-
-    const proof = async (p) => (await inspectWorktree(p, { includeOrphans: true })).safeToPrune;
-    for (const [name, p] of Object.entries({ ignored, untracked, unpushed, stashed, detached })) {
-      assert.equal(await proof(p), false, `${name} must not be safe to prune`);
-    }
-    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
-    const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
-    assert.equal(byBase["wt-ignored"].safeToPrune, false);
-    assert.equal(byBase["wt-ignored"].hasIgnored, true);
-    assert.equal(byBase["wt-stashed"].hasStashes, true);
-    assert.equal(report.candidates.some((c) => c.path === repo), false, "main checkout is never listed");
-    // from inside a linked worktree the main checkout must still not be offered
-    const fromLinked = await collectOrphans({ targetPath: clean, includeOrphans: true });
-    assert.equal(fromLinked.candidates.some((c) => c.path === repo), false);
-    // unverifiable path -> not safe
-    assert.equal(await proof(path.join(base, "does-not-exist")), false);
-  } finally {
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
-
-test("R7-B23: index flags (assume-unchanged, skip-worktree) that can hide edits make a worktree NOT safe", async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r7b23-")));
-  try {
-    const origin = path.join(base, "origin.git");
-    const repo = path.join(base, "repo");
-    fs.mkdirSync(repo);
-    git(base, "init", "--bare", "-b", "main", origin);
-    git(repo, "init", "-b", "main");
-    fs.writeFileSync(path.join(repo, "a.txt"), "a");
-    fs.writeFileSync(path.join(repo, "b.txt"), "b");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "init");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    const mk = (name) => {
-      const p = path.join(base, name);
-      git(repo, "worktree", "add", "-b", `b-${name}`, p);
-      git(p, "push", "-u", "origin", `b-${name}`);
-      return p;
-    };
-    const control = mk("control");
-    const assume = mk("assume");
-    const skip = mk("skip");
-    assert.equal((await inspectWorktree(control, { includeOrphans: true })).safeToPrune, true);
-    git(assume, "update-index", "--assume-unchanged", "a.txt");
-    fs.writeFileSync(path.join(assume, "a.txt"), "UNCOMMITTED EDIT");
-    git(skip, "update-index", "--skip-worktree", "b.txt");
-    fs.writeFileSync(path.join(skip, "b.txt"), "UNCOMMITTED EDIT");
-    // git status stays clean in both - that is the whole problem
-    assert.equal(git(assume, "status", "--porcelain").trim(), "");
-    for (const [name, p] of Object.entries({ assume, skip })) {
-      const proof = await inspectWorktree(p, { includeOrphans: true });
-      assert.equal(proof.safeToPrune, false, `${name} must not be safe`);
-      assert.equal(proof.hasIndexFlags, true, `${name} must report hasIndexFlags`);
-    }
-  } finally {
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
 
 test("R7-B24: credential values containing spaces never reach reports, the IPC summary or the SLM payload", async () => {
   const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r7-"));
@@ -805,122 +603,6 @@ function lyingFsmonitorFixture(base) {
   return { repo, wt, marker };
 }
 
-test("R9-B27: a lying core.fsmonitor hook cannot hide edits and is never executed by the proof", { skip: process.platform === "win32" }, async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9b27-")));
-  try {
-    const { repo, wt, marker } = lyingFsmonitorFixture(base);
-    const proof = await inspectWorktree(wt, { includeOrphans: true });
-    assert.equal(fs.existsSync(marker), false, "the repo's fsmonitor hook must not run during the proof");
-    assert.equal(proof.safeToPrune, false, "modified tracked file must block the prune");
-    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
-    assert.equal(fs.existsSync(marker), false, "hook must not run during collectOrphans either");
-    assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
-  } finally {
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
-
-test("R9-B28/B29: commits held only by tags, per-worktree refs, bisect refs or the HEAD reflog make a worktree NOT safe; locked worktrees too", async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9b28-")));
-  try {
-    const origin = path.join(base, "origin.git");
-    const repo = path.join(base, "repo");
-    fs.mkdirSync(repo);
-    git(base, "init", "--bare", "-b", "main", origin);
-    git(repo, "init", "-b", "main");
-    fs.writeFileSync(path.join(repo, "a.txt"), "a");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "init");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    const mk = (name) => {
-      const p = path.join(base, name);
-      git(repo, "worktree", "add", "-b", `b-${name}`, p);
-      git(p, "push", "-u", "origin", `b-${name}`);
-      return p;
-    };
-    const control = mk("control");
-    const light = mk("tag-light");
-    const ann = mk("tag-ann");
-    const wref = mk("ref-worktree");
-    const bis = mk("ref-bisect");
-    const rlog = mk("head-reflog");
-    const locked = mk("locked");
-    assert.equal((await inspectWorktree(control, { includeOrphans: true })).safeToPrune, true, "control must be safe before siblings add local commits");
-    const commit = (p, name) => {
-      fs.writeFileSync(path.join(p, name), "x");
-      git(p, "add", name);
-      git(p, "commit", "-m", name);
-    };
-    const reset = (p, b) => git(p, "reset", "--hard", `origin/${b}`);
-    commit(light, "l.txt");
-    git(light, "tag", "keep-light");
-    reset(light, "b-tag-light");
-    commit(ann, "n.txt");
-    git(ann, "tag", "-a", "keep-ann", "-m", "m");
-    reset(ann, "b-tag-ann");
-    commit(wref, "w.txt");
-    git(wref, "update-ref", "refs/worktree/keep", "HEAD");
-    reset(wref, "b-ref-worktree");
-    commit(bis, "b.txt");
-    git(bis, "update-ref", "refs/bisect/bad", "HEAD");
-    reset(bis, "b-ref-bisect");
-    git(rlog, "checkout", "--detach");
-    commit(rlog, "r.txt");
-    git(rlog, "checkout", "b-head-reflog");
-    git(repo, "worktree", "lock", locked);
-
-    // control must still be safe? other worktrees now hold local-only objects, so only per-worktree
-    // proofs are asserted here: each of these holds something no branch or remote has.
-    for (const [name, p] of Object.entries({ light, ann, wref, bis, rlog })) {
-      assert.equal((await inspectWorktree(p, { includeOrphans: true })).safeToPrune, false, `${name} must not be safe`);
-    }
-    const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
-    const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
-    assert.equal(byBase.locked.safeToPrune, false, "locked worktree must not be safe");
-    assert.equal(byBase.locked.locked, true);
-  } finally {
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
-
-test("R9-note: a config.worktree core.worktree decoy and an inherited GIT_DIR cannot redirect the proof", { skip: process.platform === "win32" }, async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9decoy-")));
-  const savedGitDir = process.env.GIT_DIR;
-  try {
-    const origin = path.join(base, "origin.git");
-    const repo = path.join(base, "repo");
-    fs.mkdirSync(repo);
-    git(base, "init", "--bare", "-b", "main", origin);
-    git(repo, "init", "-b", "main");
-    fs.writeFileSync(path.join(repo, "a.txt"), "a");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "init");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    const wt = path.join(base, "wt");
-    git(repo, "worktree", "add", "-b", "feat", wt);
-    git(wt, "push", "-u", "origin", "feat");
-    const decoy = path.join(base, "decoy");
-    git(repo, "worktree", "add", "-b", "decoy", decoy, "origin/main");
-    git(wt, "config", "extensions.worktreeConfig", "true");
-    git(wt, "config", "--worktree", "core.worktree", decoy);
-    fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
-    fs.writeFileSync(path.join(wt, "untracked_work.txt"), "work");
-    process.env.GIT_DIR = path.join(repo, ".git");
-    const proof = await inspectWorktree(wt, { includeOrphans: true });
-    assert.equal(proof.safeToPrune, false);
-    // the ONLY thing blocking the prune must be the dirty tree itself, so a redirected proof cannot pass
-    assert.equal(proof.clean, false, "dirty edit must be seen through the decoy");
-    assert.equal(proof.hasUnpushed, false);
-    assert.equal(proof.configRisk, undefined);
-  } finally {
-    if (savedGitDir === undefined) delete process.env.GIT_DIR;
-    else process.env.GIT_DIR = savedGitDir;
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});
-
 test("R10-B33: attached short-flag credentials inside shell strings and -p-… leak nowhere; ordinary flags stay readable", async () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r10b33-"));
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r10b33h-"));
@@ -966,112 +648,3 @@ test("R10-B33: attached short-flag credentials inside shell strings and -p-… l
   }
 });
 
-test("R10-B32: executable-config key classifier matches the shared vectors", () => {
-  const v = JSON.parse(
-    fs.readFileSync(new URL("../../../crates/sj-core/tests/fixtures/exec_config_keys.json", import.meta.url), "utf8")
-  );
-  for (const k of v.block) assert.equal(typeof classifyExecutableConfigKey(k), "string", `expected block: ${k}`);
-  for (const k of v.allow) assert.equal(classifyExecutableConfigKey(k), null, `expected allow: ${k}`);
-});
-
-test("R10-B32: repo-local config that can execute commands blocks the proof and no command ever runs", { skip: process.platform === "win32" }, async () => {
-  const cases = {
-    uploadpack: (repo, wt, marker) => git(repo, "config", "remote.origin.uploadpack", `touch ${marker}; git-upload-pack`),
-    sshcommand: (repo, wt, marker) => {
-      git(repo, "config", "remote.origin.url", "ssh://example.invalid/x.git");
-      git(repo, "config", "core.sshCommand", `touch ${marker}; false`);
-    },
-    cleanfilter: (repo, wt, marker) => {
-      fs.writeFileSync(path.join(wt, ".gitattributes"), "*.txt filter=evil\n");
-      git(wt, "add", ".gitattributes");
-      git(wt, "commit", "-m", "attr");
-      git(wt, "push");
-      git(repo, "config", "filter.evil.clean", `touch ${marker}; cat`);
-      fs.utimesSync(path.join(wt, "a.txt"), new Date("2020-01-01"), new Date("2020-01-01"));
-    },
-    gitproxy: (repo, wt, marker) => {
-      git(repo, "config", "remote.origin.url", "git://127.0.0.1:9/x.git");
-      git(repo, "config", "core.gitProxy", `touch ${marker}`);
-    },
-    credential: (repo, wt, marker) => git(repo, "config", "credential.helper", `!touch ${marker}`),
-    include: (repo, wt, marker) => git(repo, "config", "include.path", path.join(path.dirname(marker), "inc.cfg")),
-  };
-  for (const [name, arm] of Object.entries(cases)) {
-    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), `sj-r10b32-${name}-`)));
-    try {
-      const origin = path.join(base, "origin.git");
-      const repo = path.join(base, "repo");
-      fs.mkdirSync(repo);
-      git(base, "init", "--bare", "-b", "main", origin);
-      git(repo, "init", "-b", "main");
-      fs.writeFileSync(path.join(repo, "a.txt"), "a");
-      git(repo, "add", ".");
-      git(repo, "commit", "-m", "init");
-      git(repo, "remote", "add", "origin", origin);
-      git(repo, "push", "-u", "origin", "main");
-      const wt = path.join(base, "wt");
-      git(repo, "worktree", "add", "-b", "feat", wt);
-      git(wt, "push", "-u", "origin", "feat");
-      const marker = path.join(base, `MARK_${name}`);
-      arm(repo, wt, marker);
-      const proof = await inspectWorktree(wt, { includeOrphans: true });
-      const report = await collectOrphans({ targetPath: repo, includeOrphans: true });
-      assert.equal(proof.safeToPrune, false, `${name}: must not be safe`);
-      assert.match(String(proof.configRisk), /repo_config_can_execute/, `${name}: reason`);
-      assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
-      assert.equal(fs.existsSync(marker), false, `${name}: repo config command ran`);
-    } finally {
-      fs.rmSync(base, { recursive: true, force: true });
-    }
-  }
-});
-
-test("R10-B34: Node agrees with Rust on remote tags and on amend-before-push (linked worktrees)", async () => {
-  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r10b34-")));
-  try {
-    const origin = path.join(base, "origin.git");
-    const repo = path.join(base, "repo");
-    fs.mkdirSync(repo);
-    git(base, "init", "--bare", "-b", "main", origin);
-    git(repo, "init", "-b", "main");
-    fs.writeFileSync(path.join(repo, "a.txt"), "a");
-    git(repo, "add", ".");
-    git(repo, "commit", "-m", "init");
-    git(repo, "remote", "add", "origin", origin);
-    git(repo, "push", "-u", "origin", "main");
-    const mk = (name) => {
-      const p = path.join(base, name);
-      git(repo, "worktree", "add", "-b", `b-${name}`, p);
-      git(p, "push", "-u", "origin", `b-${name}`);
-      return p;
-    };
-    const tagged = mk("remote-tag");
-    git(tagged, "checkout", "--detach");
-    fs.writeFileSync(path.join(tagged, "t.txt"), "t");
-    git(tagged, "add", "t.txt");
-    git(tagged, "commit", "-m", "tagged-only");
-    git(tagged, "tag", "pushed-tag");
-    git(tagged, "push", "origin", "pushed-tag");
-    git(tagged, "checkout", "b-remote-tag");
-
-    const amended = mk("amended");
-    fs.writeFileSync(path.join(amended, "x.txt"), "x");
-    git(amended, "add", "x.txt");
-    git(amended, "commit", "-m", "first");
-    git(amended, "commit", "--amend", "-m", "second");
-    git(amended, "push", "origin", "b-amended");
-
-    const lost = mk("lost");
-    git(lost, "checkout", "--detach");
-    fs.writeFileSync(path.join(lost, "y.txt"), "y");
-    git(lost, "add", "y.txt");
-    git(lost, "commit", "-m", "abandoned");
-    git(lost, "checkout", "b-lost");
-
-    assert.equal((await inspectWorktree(tagged, { includeOrphans: true })).safeToPrune, true, "commit held by a REMOTE tag is safe");
-    assert.equal((await inspectWorktree(amended, { includeOrphans: true })).safeToPrune, true, "amend-before-push must not block forever");
-    assert.equal((await inspectWorktree(lost, { includeOrphans: true })).safeToPrune, false, "abandoned detached commit still blocks");
-  } finally {
-    fs.rmSync(base, { recursive: true, force: true });
-  }
-});

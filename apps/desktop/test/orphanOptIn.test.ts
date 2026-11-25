@@ -3,12 +3,10 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import test from "node:test";
-import { executePlanItems } from "../src/executor";
 import { sanitizeIpcParams } from "../src/ipcValidation";
 import { OrphanScanSetting, setOrphanScanWithConfirmation } from "../src/orphanSetting";
 import { RemediationCandidate, RemediationGate } from "../src/remediationGate";
 import { SjBridge } from "../src/sjBridge";
-import { worktreePruneBlockReason } from "../src/worktreeGuard";
 
 /** `git` shim first on PATH recording every spawn. */
 async function withGitShim(fn: (ctx: { dir: string; marker: string }) => Promise<void>): Promise<void> {
@@ -62,46 +60,62 @@ test("desktop startup scan (summary), orphan view and remediation plan spawn no 
     assert.equal(orphans.scanned, false);
     bridge.dispose();
 
-    const gate = new RemediationGate({ homeDir: path.join(dir, "home") });
+    const gate = new RemediationGate({
+      homeDir: path.join(dir, "home"),
+      planRoot: dir,
+      runSj: async () => ({
+        schema: "spacejanitor.proposal.v1",
+        mode: "dry-run",
+        mutated: false,
+        plan_sha256: "a".repeat(64),
+        items: [],
+        protected_exclusions: [],
+        selection: { paths: [], ids: [], unmatched: [], selection_sha256: "b".repeat(64) },
+      }),
+    });
     const cache = path.join(dir, "home", ".cache", "npm");
     fs.mkdirSync(cache, { recursive: true });
     const cands: RemediationCandidate[] = [{ id: "c", path: cache, bytes: 1, kind: "dir" }];
     gate.registerApprovedCandidates(cands);
-    gate.createDryRunPlan(cands);
+    await gate.createDryRunPlan(cands);
     assert.equal(fs.existsSync(marker), false, `git was spawned: ${fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : ""}`);
 
-    // explicit opt-in is what reaches git
+    // explicit opt-in goes to the Rust gate only: with no sj the report fails closed and Node spawns no git
     const on = new SjBridge({ binaryPath: null });
-    await on.invoke("orphans", { targetPath: dir, includeOrphans: true });
+    const optIn = (await on.invoke("orphans", { targetPath: dir, includeOrphans: true })) as { error?: string; candidates: unknown[] };
     on.dispose();
-    assert.equal(fs.existsSync(marker), true);
+    assert.equal(optIn.error, "sj_unavailable");
+    assert.deepEqual(optIn.candidates, []);
+    assert.equal(fs.existsSync(marker), false);
   });
 });
 
-test("worktree prune is blocked and spawns no git unless scanning is enabled", skip, async () => {
+test("remediation never asks sj for orphan worktrees and spawns no git unless scanning is enabled", skip, async () => {
   await withGitShim(async ({ dir, marker }) => {
     const wt = path.join(dir, "wt");
     fs.mkdirSync(wt);
     fs.writeFileSync(path.join(wt, ".git"), `gitdir: ${path.join(dir, "g")}\n`);
-    assert.equal(await worktreePruneBlockReason(wt), "orphan_scan_disabled_by_default");
-
-    const gate = new RemediationGate({ homeDir: path.join(dir, "home") });
+    const calls: string[][] = [];
+    const runSj = async (args: string[]) => {
+      calls.push(args);
+      return {
+        selection: { paths: [], ids: [], unmatched: [], selection_sha256: "b".repeat(64) },
+        schema: "spacejanitor.proposal.v1",
+        mode: "dry-run",
+        mutated: false,
+        plan_sha256: "a".repeat(64),
+        total_reclaimable_bytes: 0,
+        items: [],
+        protected_exclusions: [],
+      };
+    };
+    const gate = new RemediationGate({ homeDir: path.join(dir, "home"), runSj, planRoot: dir, orphanScanEnabled: () => false });
     const cands: RemediationCandidate[] = [{ id: "w", path: wt, bytes: 1, kind: "git-worktree" }];
     gate.registerApprovedCandidates(cands);
-    const plan = gate.createDryRunPlan(cands);
-    const auth = gate.authorizeExecute({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
-    assert.equal(auth.allowed, true, `gate must authorize so the executor assertions below actually run: ${auth.reason}`);
-    const res = await executePlanItems(auth.plan!, auth.identities!, {
-      homeDir: path.join(dir, "home"),
-      isInsideOsTrash: () => false,
-      trashItem: async () => {},
-      removeWorktree: async () => {
-        throw new Error("must not be called");
-      },
-      orphanScanEnabled: () => false,
-    });
-    assert.equal(res.removed.length, 0);
-    assert.equal(res.failed[0].error, "orphan_scanning_disabled");
+    const plan = await gate.createDryRunPlan(cands);
+    assert.equal(plan.items.length, 0);
+    assert.equal(plan.blockedItems[0].reason, "not_in_sj_plan");
+    for (const c of calls) assert.equal(c.includes("--include-orphans"), false);
     assert.equal(fs.existsSync(marker), false);
   });
 });

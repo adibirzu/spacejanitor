@@ -1,12 +1,15 @@
 use clap::{Parser, Subcommand};
 use sj_core::{
     orphans::{inspect_orphans, OrphanOptions},
-    plan::{build_remediation_plan, execute_plan_item, ExecutionGate, PlanOptions},
-    protect::ProtectionContext,
+    plan::{
+        build_remediation_plan, execute_plan_item, execute_selection, select_by_paths,
+        selection_sha256 as selection_sha256_fn, ExecutionGate, PlanOptions, SelectionGate,
+    },
+    protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions},
     trash::{default_trash_paths, discover_trash_at},
     SjError, SCHEMA_BLOCKERS_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1,
-    SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
+    SCHEMA_PROTECT_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
 };
 use std::env;
 use std::path::PathBuf;
@@ -96,6 +99,47 @@ enum Commands {
         /// Allowlisted item ID to execute
         #[arg(long)]
         item: Option<String>,
+        /// Select a plan item by path (repeatable). Dry-run reports the selection digest; with
+        /// --execute --selection-sha256 exactly these items are removed, and only if a freshly built
+        /// plan hashes to the confirmed digest
+        #[arg(long = "select")]
+        select: Vec<String>,
+        /// Selection digest confirmed by the user (from a dry run with the same --select paths)
+        #[arg(long)]
+        selection_sha256: Option<String>,
+        /// Extra user-protected path (the path and everything below it); repeatable
+        #[arg(long = "exact")]
+        exact: Vec<PathBuf>,
+        /// Extra runtime-protected path; repeatable
+        #[arg(long = "dynamic")]
+        dynamic: Vec<PathBuf>,
+        /// Extra case-insensitive wildcard protection pattern; repeatable
+        #[arg(long = "glob")]
+        glob: Vec<String>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Evaluate paths against the protected-path gate (lexical + symlink-resolved; optional subtree walk)
+    Protect {
+        /// Paths to evaluate
+        #[arg(required = true, num_args = 1.., last = true)]
+        paths: Vec<PathBuf>,
+        /// Extra user-protected path (the path and everything below it); repeatable
+        #[arg(long = "exact")]
+        exact: Vec<PathBuf>,
+        /// Extra runtime-protected path (for example an active worktree); repeatable
+        #[arg(long = "dynamic")]
+        dynamic: Vec<PathBuf>,
+        /// Extra case-insensitive wildcard pattern (`*`, `?`) matched on the path and its last segment; repeatable
+        #[arg(long = "glob")]
+        glob: Vec<String>,
+        /// Also walk each directory and block when any descendant is protected, a symlink or unreadable
+        #[arg(long, default_value_t = false)]
+        descendants: bool,
+        /// Maximum entries to inspect per directory walk (fail closed when exceeded)
+        #[arg(long, default_value_t = 200_000)]
+        max_entries: usize,
         /// Emit versioned JSON output
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -193,6 +237,57 @@ fn run() -> Result<(), CliError> {
     match cli.command {
         Commands::Doctor { json } => {
             print_doctor(json)?;
+        }
+        Commands::Protect {
+            paths,
+            exact,
+            dynamic,
+            glob,
+            descendants,
+            max_entries,
+            json,
+        } => {
+            let mut pctx = ctx.clone();
+            pctx.exact_paths.extend(exact);
+            pctx.dynamic_paths = dynamic;
+            pctx.glob_patterns = glob;
+            let ctx = &pctx;
+            let mut results = Vec::with_capacity(paths.len());
+            for p in &paths {
+                let mut verdict = check_path_protection(p, ctx);
+                if !verdict.protected && descendants {
+                    verdict = check_dir_descendants_safe(p, ctx, max_entries);
+                }
+                results.push(serde_json::json!({
+                    "path": p.to_string_lossy(),
+                    "protected": verdict.protected,
+                    "reason": verdict.reason,
+                }));
+            }
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": SCHEMA_PROTECT_V1,
+                        "descendants": descendants,
+                        "results": results,
+                    }))
+                    .map_err(SjError::from)?
+                );
+            } else {
+                for r in &results {
+                    println!(
+                        "{} {} {}",
+                        if r["protected"] == true {
+                            "PROTECTED"
+                        } else {
+                            "SAFE"
+                        },
+                        r["path"].as_str().unwrap_or(""),
+                        r["reason"].as_str().unwrap_or("")
+                    );
+                }
+            }
         }
         Commands::Scan {
             path,
@@ -309,8 +404,18 @@ fn run() -> Result<(), CliError> {
             confirm,
             plan_sha256,
             item,
+            select,
+            selection_sha256,
+            exact,
+            dynamic,
+            glob,
             json,
         } => {
+            let mut pctx = ctx.clone();
+            pctx.exact_paths.extend(exact);
+            pctx.dynamic_paths = dynamic;
+            pctx.glob_patterns = glob;
+            let ctx = pctx;
             if execute && trash_path.is_some() {
                 return Err(CliError::Usage(
                     "cannot combine --trash-path with --execute; execution is restricted to verified OS Trash roots".to_string(),
@@ -332,7 +437,32 @@ fn run() -> Result<(), CliError> {
                 orphan_max_depth: depth,
             };
             let plan = build_remediation_plan(&path, &ctx, &opts)?;
-            if execute {
+            if execute && selection_sha256.is_some() {
+                let gate = SelectionGate {
+                    execute,
+                    confirm,
+                    selection_sha256: selection_sha256.unwrap_or_default(),
+                    paths: select,
+                };
+                let out = execute_selection(&plan, &gate, &ctx)?;
+                let failed: Vec<serde_json::Value> = out
+                    .failed
+                    .iter()
+                    .map(|(i, e)| serde_json::json!({"id": i.id, "path": i.path, "error": e}))
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "schema": SCHEMA_PROPOSAL_V1,
+                        "mode": "executed",
+                        "mutated": !out.executed.is_empty(),
+                        "selection_sha256": gate.selection_sha256,
+                        "executed_items": out.executed,
+                        "failed_items": failed,
+                    }))
+                    .map_err(SjError::from)?
+                );
+            } else if execute {
                 let gate = ExecutionGate {
                     execute,
                     confirm,
@@ -356,9 +486,19 @@ fn run() -> Result<(), CliError> {
                     println!("executed: {} ({})", removed.id, removed.path);
                 }
             } else if json {
+                let mut value = serde_json::to_value(&plan).map_err(SjError::from)?;
+                if !select.is_empty() {
+                    let (items, unmatched) = select_by_paths(&plan, &select);
+                    value["selection"] = serde_json::json!({
+                        "paths": items.iter().map(|i| i.path.clone()).collect::<Vec<_>>(),
+                        "ids": items.iter().map(|i| i.id.clone()).collect::<Vec<_>>(),
+                        "unmatched": unmatched,
+                        "selection_sha256": selection_sha256_fn(&items)?,
+                    });
+                }
                 println!(
                     "{}",
-                    serde_json::to_string_pretty(&plan).map_err(SjError::from)?
+                    serde_json::to_string_pretty(&value).map_err(SjError::from)?
                 );
             } else {
                 println!(
