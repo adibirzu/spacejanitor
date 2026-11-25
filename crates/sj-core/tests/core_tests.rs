@@ -2372,9 +2372,10 @@ fn shared_descendant_vectors_match_node_implementation() {
     for case in v["cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
         let tmp = tempdir().unwrap();
-        let home = tmp.path().join("home");
+        // the synthetic home contains the project (Windows temp dirs live under C:\Users, another
+        // account's home to the gate unless they are inside the home being judged)
+        let home = tmp.path().to_path_buf();
         let project = tmp.path().join("project");
-        fs::create_dir_all(&home).unwrap();
         fs::create_dir_all(&project).unwrap();
         for entry in case["entries"].as_array().unwrap() {
             let e = entry.as_str().unwrap();

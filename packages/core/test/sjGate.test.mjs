@@ -232,9 +232,8 @@ test("gate: shared descendant vectors are decided by the Rust sj binary", { skip
     for (const c of descendantVectors.cases) {
       const root = fs.mkdtempSync(path.join(os.tmpdir(), "sj-desc-"));
       try {
-        const home = path.join(root, "home");
+        const home = root; // contains the project (Windows temp lives under another account's home)
         const project = path.join(root, "project");
-        fs.mkdirSync(home);
         fs.mkdirSync(project);
         for (const e of c.entries) {
           if (e.startsWith("link:")) fs.symlinkSync("/", path.join(project, e.slice(5)));
