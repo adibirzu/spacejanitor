@@ -115,6 +115,150 @@ pub(crate) fn read_config_file(
     Ok(raw)
 }
 
+/// Kind of a directory entry, never following symlinks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EntryKind {
+    Dir,
+    File,
+    Symlink,
+    Other,
+}
+
+/// A directory enumerated through a no-follow handle.
+///
+/// `fs::read_dir(path)` opens by path and follows a swapped-in symlink, so a path check
+/// before or after it cannot prove which directory was listed. Here the canonical path is
+/// opened component by component with `O_NOFOLLOW | O_DIRECTORY` (the helpers in
+/// `safe_remove`), the handle is bound to that path by `(st_dev, st_ino)`, and the listing and
+/// every child open go through the handle only.
+///
+/// Windows has no equivalent here and keeps the path-based listing (documented limitation).
+pub(crate) struct SafeDir {
+    #[cfg(unix)]
+    inner: crate::safe_remove::unix_impl::NofollowDir,
+    #[cfg(not(unix))]
+    canon: std::path::PathBuf,
+}
+
+impl SafeDir {
+    /// Opens `path` for listing. The canonical path must be inside the canonical home (when
+    /// the policy requires it) and outside every protected root, unless it equals
+    /// `protected_ok_exact` (a names-only listing of one specific protected directory).
+    pub(crate) fn open(
+        path: &Path,
+        policy: &ReadPolicy<'_>,
+        protected_ok_exact: Option<&Path>,
+    ) -> Result<Self, ReadRefusal> {
+        let canon = fs::canonicalize(path).map_err(|_| ReadRefusal::Unreadable)?;
+        if policy.require_in_home && !canon.starts_with(policy.canon_home) {
+            return Err(ReadRefusal::OutsideHome);
+        }
+        let exact = protected_ok_exact.is_some_and(|e| e == canon.as_path());
+        if !exact && check_path_protection(&canon, policy.ctx).protected {
+            return Err(ReadRefusal::Protected);
+        }
+        Self::open_canonical(&canon)
+    }
+
+    #[cfg(unix)]
+    fn open_canonical(canon: &Path) -> Result<Self, ReadRefusal> {
+        let inner = crate::safe_remove::unix_impl::NofollowDir::open_canonical(canon).map_err(
+            |e| match e {
+                crate::SjError::Io(ref io) if io.raw_os_error() == Some(libc::ELOOP) => {
+                    ReadRefusal::Symlink
+                }
+                _ => ReadRefusal::Unreadable,
+            },
+        )?;
+        // the handle we hold must be the directory at the canonical path we validated
+        if !inner.matches_canonical_path() {
+            return Err(ReadRefusal::Symlink);
+        }
+        Ok(Self { inner })
+    }
+
+    #[cfg(not(unix))]
+    fn open_canonical(canon: &Path) -> Result<Self, ReadRefusal> {
+        Ok(Self {
+            canon: canon.to_path_buf(),
+        })
+    }
+
+    /// Canonical path of the directory this handle was opened for.
+    pub(crate) fn canonical_path(&self) -> &Path {
+        #[cfg(unix)]
+        {
+            self.inner.canonical_path()
+        }
+        #[cfg(not(unix))]
+        {
+            &self.canon
+        }
+    }
+
+    /// Entries (`.`/`..` excluded, non-UTF-8 names skipped), classified without following
+    /// symlinks.
+    pub(crate) fn entries(&self) -> Result<Vec<(String, EntryKind)>, ReadRefusal> {
+        #[cfg(unix)]
+        {
+            use crate::safe_remove::unix_impl::HandleEntryKind as K;
+            let v = self.inner.entries().map_err(|_| ReadRefusal::Unreadable)?;
+            Ok(v.into_iter()
+                .map(|(n, k)| {
+                    let k = match k {
+                        K::Dir => EntryKind::Dir,
+                        K::File => EntryKind::File,
+                        K::Symlink => EntryKind::Symlink,
+                        K::Other => EntryKind::Other,
+                    };
+                    (n, k)
+                })
+                .collect())
+        }
+        #[cfg(not(unix))]
+        {
+            let rd = fs::read_dir(&self.canon).map_err(|_| ReadRefusal::Unreadable)?;
+            Ok(rd
+                .flatten()
+                .filter_map(|e| {
+                    let name = e.file_name().into_string().ok()?;
+                    let t = e.file_type().ok()?;
+                    let k = if t.is_symlink() {
+                        EntryKind::Symlink
+                    } else if t.is_dir() {
+                        EntryKind::Dir
+                    } else if t.is_file() {
+                        EntryKind::File
+                    } else {
+                        EntryKind::Other
+                    };
+                    Some((name, k))
+                })
+                .collect())
+        }
+    }
+
+    /// Opens a child directory relative to this handle without following a symlink.
+    pub(crate) fn open_child(&self, name: &str) -> Result<Self, ReadRefusal> {
+        #[cfg(unix)]
+        {
+            let inner = self.inner.open_child(name).map_err(|e| match e {
+                crate::SjError::Io(ref io) if io.raw_os_error() == Some(libc::ELOOP) => {
+                    ReadRefusal::Symlink
+                }
+                _ => ReadRefusal::Unreadable,
+            })?;
+            Ok(Self { inner })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                canon: self.canon.join(name),
+            })
+        }
+    }
+}
+
 #[cfg(unix)]
 fn libc_eloop() -> i32 {
     libc::ELOOP
@@ -182,5 +326,46 @@ mod tests {
         );
         // an explicit config dir may be outside the home, but never a protected root
         assert!(read_config_file(&ext_c.join("c.json"), &policy(&ctx, &h, false)).is_ok());
+    }
+
+    #[test]
+    fn safe_dir_lists_real_children_and_refuses_protected_and_symlink_leaf() {
+        let tmp = tempdir().unwrap();
+        let h = tmp.path().canonicalize().unwrap();
+        fs::create_dir_all(h.join("plain/real")).unwrap();
+        fs::write(h.join("plain/a.json"), "{}").unwrap();
+        symlink(h.join("plain/real"), h.join("plain/link")).unwrap();
+        fs::create_dir_all(h.join(".ssh/inner")).unwrap();
+        let ctx = ProtectionContext::new(h.clone(), Vec::new());
+        let p = policy(&ctx, &h, true);
+
+        let d = SafeDir::open(&h.join("plain"), &p, None).unwrap();
+        let mut e = d.entries().unwrap();
+        e.sort_by(|a, b| a.0.cmp(&b.0));
+        assert_eq!(
+            e.iter().map(|(n, _)| n.as_str()).collect::<Vec<_>>(),
+            ["a.json", "link", "real"]
+        );
+        assert!(e.contains(&("link".to_string(), EntryKind::Symlink)));
+        assert!(e.contains(&("real".to_string(), EntryKind::Dir)));
+        assert!(d.open_child("real").is_ok());
+        assert!(
+            d.open_child("link").is_err(),
+            "child symlink is never followed"
+        );
+
+        assert!(matches!(
+            SafeDir::open(&h.join(".ssh"), &p, None),
+            Err(ReadRefusal::Protected)
+        ));
+        // a symlinked leaf resolves to its target; the protected target is refused
+        symlink(h.join(".ssh"), h.join("plain/to_ssh")).unwrap();
+        assert!(matches!(
+            SafeDir::open(&h.join("plain/to_ssh"), &p, None),
+            Err(ReadRefusal::Protected)
+        ));
+        // names-only exception applies to exactly one directory
+        assert!(SafeDir::open(&h.join(".ssh"), &p, Some(&h.join(".ssh"))).is_ok());
+        assert!(SafeDir::open(&h.join(".ssh"), &p, Some(&h.join("other"))).is_err());
     }
 }

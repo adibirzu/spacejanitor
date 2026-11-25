@@ -8,7 +8,7 @@
 
 use crate::mcp_audit::{audit_mcp_with_processes, McpAuditOptions};
 use crate::protect::{check_path_protection, ProtectionContext};
-use crate::safe_read::{read_config_file, ReadPolicy};
+use crate::safe_read::{read_config_file, EntryKind, ReadPolicy, SafeDir};
 use crate::SjError;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -349,26 +349,43 @@ impl<'a> Guard<'a> {
         false
     }
 
+    /// Opens an allowed directory through a no-follow handle bound to its canonical path.
+    /// Nothing is ever listed by re-resolving the path, so a directory swapped for a symlink
+    /// during the audit cannot redirect the listing into a protected root.
+    fn open_dir(&mut self, client: &str, dir: &Path) -> Option<SafeDir> {
+        if !self.allow(client, dir) {
+            return None;
+        }
+        let policy = ReadPolicy {
+            ctx: self.ctx,
+            canon_home: &self.canon_home,
+            require_in_home: true,
+        };
+        // the read-only claude client may list names of exactly its own directory
+        let exact = (client == "claude")
+            .then(|| {
+                dir.strip_prefix(&self.ctx.home_dir)
+                    .ok()
+                    .map(|rel| self.canon_home.join(rel))
+            })
+            .flatten();
+        SafeDir::open(dir, &policy, exact.as_deref()).ok()
+    }
+
     /// Names of real (non-symlink) subdirectories of a guarded directory.
     fn dir_names(&mut self, client: &str, dir: &Path) -> Vec<String> {
-        if !self.allow(client, dir) {
+        let Some(handle) = self.open_dir(client, dir) else {
             return Vec::new();
-        }
-        let before = fs::canonicalize(dir).ok();
-        let mut v: Vec<String> = fs::read_dir(dir)
-            .map(|rd| {
-                rd.flatten()
-                    .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
-                    .filter_map(|e| e.file_name().into_string().ok())
-                    .filter(|n| !n.starts_with('.'))
-                    .collect()
-            })
-            .unwrap_or_default();
-        // the directory must still resolve to the path that was validated; if it was swapped
-        // while it was being listed, nothing from the listing is used
-        if before.is_none() || fs::canonicalize(dir).ok() != before {
+        };
+        let Ok(entries) = handle.entries() else {
             return Vec::new();
-        }
+        };
+        let mut v: Vec<String> = entries
+            .into_iter()
+            .filter(|(_, k)| *k == EntryKind::Dir)
+            .map(|(n, _)| n)
+            .filter(|n| !n.starts_with('.'))
+            .collect();
         v.sort();
         v
     }
@@ -666,25 +683,22 @@ pub fn audit_llm_with_processes(
     for (client, root, force_ro) in &roots {
         // Canonicalise before reading: a symlinked root or ancestor may point into a
         // protected tree or outside the home.
-        if !guard.allow(client, root) {
+        let Some(handle) = guard.open_dir(client, root) else {
             continue;
-        }
-        let Ok(rd) = fs::read_dir(root) else { continue };
+        };
+        let Ok(mut entries) = handle.entries() else {
+            continue;
+        };
         let ro = *force_ro || check_path_protection(root, &ctx).protected;
         let mut sum = SkillClientSummary::default();
-        let mut entries: Vec<_> = rd.flatten().collect();
-        entries.sort_by_key(|e| e.file_name());
-        for e in entries {
-            let name = e.file_name().to_string_lossy().into_owned();
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        for (name, kind) in entries {
             if name.starts_with('.') {
                 continue;
             }
             sum.total += 1;
-            let path = e.path();
-            let Ok(meta) = fs::symlink_metadata(&path) else {
-                continue;
-            };
-            if meta.file_type().is_symlink() {
+            let path = root.join(&name);
+            if kind == EntryKind::Symlink {
                 sum.symlinks += 1;
                 if !ro && fs::metadata(&path).is_err() {
                     sum.broken_symlinks += 1;
@@ -700,7 +714,7 @@ pub fn audit_llm_with_processes(
                 // a valid symlink is never stale (it may point into a protected root)
                 continue;
             }
-            if !meta.is_dir() {
+            if kind != EntryKind::Dir {
                 continue;
             }
             sum.real_dirs += 1;

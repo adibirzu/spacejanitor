@@ -3,7 +3,7 @@ use crate::redact::{
     env_key_label, header_key_label, is_secret_name, known_client, known_command, known_key,
     known_package_in, redact_argv, redact_command, server_label, unknown_label, url_label,
 };
-use crate::safe_read::{read_config_file, ReadPolicy};
+use crate::safe_read::{read_config_file, EntryKind, ReadPolicy, ReadRefusal, SafeDir};
 use crate::{SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -634,26 +634,59 @@ fn collect_config_files_in_dirs(
         if !lm.is_dir() {
             continue;
         }
-        let mut stack: Vec<(PathBuf, usize)> = vec![(dir.clone(), 0)];
-        while let Some((d, depth)) = stack.pop() {
-            let Ok(rd) = fs::read_dir(&d) else { continue };
-            for e in rd.flatten() {
-                let p = e.path();
+        // Every directory is listed through a no-follow handle bound to its canonical path;
+        // a directory swapped for a symlink mid-walk can never redirect the listing.
+        let canon_home = fs::canonicalize(&ctx.home_dir).unwrap_or_else(|_| ctx.home_dir.clone());
+        let policy = ReadPolicy {
+            ctx,
+            canon_home: &canon_home,
+            require_in_home: false,
+        };
+        let root = match SafeDir::open(dir, &policy, None) {
+            Ok(h) => h,
+            Err(ReadRefusal::Protected) => {
+                warnings.push(format!("protected_target: {}", dir.display()));
+                continue;
+            }
+            Err(r) => {
+                warnings.push(format!(
+                    "config dir not read ({}): {}",
+                    r.code(),
+                    dir.display()
+                ));
+                continue;
+            }
+        };
+        let mut stack: Vec<(SafeDir, PathBuf, usize)> = vec![(root, dir.clone(), 0)];
+        while let Some((handle, shown, depth)) = stack.pop() {
+            let Ok(entries) = handle.entries() else {
+                continue;
+            };
+            for (name, kind) in entries {
+                let p = shown.join(&name);
                 // protection first: a protected entry is neither descended into nor named
-                if check_path_protection(&p, ctx).protected {
+                if check_path_protection(&p, ctx).protected
+                    || check_path_protection(&handle.canonical_path().join(&name), ctx).protected
+                {
                     continue;
                 }
-                let Ok(ft) = e.file_type() else { continue };
-                if ft.is_dir() {
-                    if depth + 1 < MAX_DEPTH {
-                        stack.push((p, depth + 1));
-                    }
-                } else if ft.is_file() {
-                    if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
-                        if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("toml") {
-                            files.push(p);
+                match kind {
+                    EntryKind::Dir => {
+                        if depth + 1 < MAX_DEPTH {
+                            if let Ok(child) = handle.open_child(&name) {
+                                stack.push((child, p, depth + 1));
+                            }
                         }
                     }
+                    EntryKind::File => {
+                        if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
+                            if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("toml")
+                            {
+                                files.push(p);
+                            }
+                        }
+                    }
+                    EntryKind::Symlink | EntryKind::Other => {}
                 }
             }
         }
