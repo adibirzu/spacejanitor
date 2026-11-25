@@ -653,3 +653,49 @@ test("R7-B24: credential values containing spaces never reach reports, the IPC s
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("R8-B25: whole-element redaction covers -u user:pass, -p=, --x= and JSON/key=value argv with spaces (report, summary, SLM body)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r8-"));
+  const WORDS = ["AlphaSecretW", "BravoSecretW", "CharlieSecretW", "DeltaSecretW"];
+  const leaks = (text) => WORDS.filter((w) => text.includes(w));
+  try {
+    const servers = {
+      u: ["-u", "alice:AlphaSecretW BravoSecretW"],
+      ueq: ["--user=alice:AlphaSecretW BravoSecretW"],
+      peq: ["-p=AlphaSecretW BravoSecretW"],
+      teq: ["-t=AlphaSecretW BravoSecretW"],
+      json: ["--config", '{"password":"AlphaSecretW \\"BravoSecretW CharlieSecretW\\" DeltaSecretW"}'],
+      kv: ["--env", "db_password=AlphaSecretW BravoSecretW"],
+      xeq: ["--x-token=AlphaSecretW BravoSecretW"],
+      pass: ["--password", "AlphaSecretW BravoSecretW"],
+      quoted: ['--secret="AlphaSecretW BravoSecretW"'],
+      bare: ["--opt", 'user=alice password="AlphaSecretW BravoSecretW" host=h'],
+    };
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(servers).map(([k, args]) => [k, { command: "x", args }])) })
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    assert.deepEqual(leaks(JSON.stringify(audit)), [], "report leak");
+    for (const srv of audit.servers) assert.equal(srv.hasSecretRisk, true, srv.name);
+
+    const summary = await collectSummary({ configDirs: [tmpDir], targetPath: tmpDir });
+    assert.deepEqual(leaks(JSON.stringify(summary)), [], "IPC summary leak");
+
+    let body = "";
+    await adviseWithLocalSlm({
+      enabled: true,
+      url: "http://127.0.0.1:11434/v1/chat/completions",
+      summary,
+      candidates: [],
+      fetchImpl: async (_u, init) => {
+        body = String(init.body);
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "{}" } }] }) };
+      },
+    });
+    assert.ok(body.length > 0);
+    assert.deepEqual(leaks(body), [], "SLM payload leak");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

@@ -73,21 +73,30 @@ export function redactSecrets(input) {
     .replace(M.vendorRe, "<REDACTED>");
 }
 
+const USER_FLAG_RE = /^(?:-u|--user|--proxy-user)$/i;
 const CRED_FLAG_RE = new RegExp(`^(?:-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS})|-t|-p)$`, "i");
-const CRED_FLAG_EQ_RE = new RegExp(`^(-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS}))=[\\s\\S]*$`, "i");
+const CRED_FLAG_EQ_RE = new RegExp(
+  `^(-(?:t|p|u)|--user|--proxy-user|-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS}))=[\\s\\S]*$`,
+  "i"
+);
 const CRED_ASSIGN_ARG_RE = new RegExp(`^([A-Za-z0-9_.-]{0,64}(?:${NAME_WORDS})s?)=[\\s\\S]*$`, "i");
 
 /**
- * Redact an argv array while keeping argument boundaries: the whole argument that holds a credential
- * value is replaced, so a value containing spaces ("--password", "word1 word2") cannot leak its
- * trailing words the way it does after the arguments are joined into one string.
+ * Redact an argv array while keeping argument boundaries. Decisions are made per ELEMENT, before any
+ * joining, so a credential value containing spaces can never leak its tail:
+ *  - a credential flag (incl. -u/--user, -p, -t) consumes the whole next element, or the whole
+ *    remainder of a `--flag=value` element;
+ *  - a `NAME=value` element with a credential-looking name is replaced whole;
+ *  - any other element that contains whitespace/quotes/braces AND trips the generic redactor
+ *    (JSON blobs, `user=a password="b c"` strings, ...) is replaced WHOLE, because partial
+ *    pattern redaction of free text is exactly what leaks the tail.
  */
 export function redactArgv(args) {
   const out = [];
   const list = Array.isArray(args) ? args.map(String) : [];
   for (let i = 0; i < list.length; i++) {
     const a = list[i];
-    if (CRED_FLAG_RE.test(a)) {
+    if (CRED_FLAG_RE.test(a) || USER_FLAG_RE.test(a)) {
       out.push(a);
       if (i + 1 < list.length && !list[i + 1].startsWith("--")) {
         out.push("<REDACTED>");
@@ -105,7 +114,12 @@ export function redactArgv(args) {
       out.push(`${asg[1]}=<REDACTED>`);
       continue;
     }
-    out.push(redactSecrets(a));
+    const generic = redactSecrets(a);
+    if (generic !== a && /[\s"'{}\[\]]/.test(a)) {
+      out.push("<REDACTED>");
+      continue;
+    }
+    out.push(generic);
   }
   return out;
 }

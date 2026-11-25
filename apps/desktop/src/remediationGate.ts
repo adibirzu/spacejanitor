@@ -1,3 +1,4 @@
+import fs from "node:fs";
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const core = require("@spacejanitor/core");
 
@@ -21,9 +22,24 @@ export interface RemediationPlan {
   expiresAtMs: number;
 }
 
+export interface ItemIdentity {
+  dev: string;
+  ino: string;
+}
+
+function snapshotIdentity(p: string): ItemIdentity | null {
+  try {
+    const st = fs.lstatSync(p, { bigint: true });
+    return { dev: st.dev.toString(), ino: st.ino.toString() };
+  } catch {
+    return null;
+  }
+}
+
 export class RemediationGate {
   private readonly homeDir?: string;
   private activePlan: RemediationPlan | null = null;
+  private activeIdentities: Record<string, ItemIdentity | null> = {};
   private readonly approved = new Map<string, RemediationCandidate>();
   private readonly usedDigests = new Set<string>();
   private executing = false;
@@ -62,6 +78,10 @@ export class RemediationGate {
       nowMs,
     });
     this.activePlan = plan;
+    // Bind each planned path to the filesystem object it was planned against (dev/inode), so the
+    // executor can refuse a path that was swapped for another object after authorization.
+    this.activeIdentities = {};
+    for (const item of plan.items) this.activeIdentities[item.path] = snapshotIdentity(item.path);
     return plan;
   }
 
@@ -69,7 +89,7 @@ export class RemediationGate {
     planSha256: string;
     phrase: string;
     nowMs?: number;
-  }): { allowed: boolean; reason: string; plan?: RemediationPlan } {
+  }): { allowed: boolean; reason: string; plan?: RemediationPlan; identities?: Record<string, ItemIdentity | null> } {
     if (this.executing) {
       return { allowed: false, reason: "remediation_mutex_locked" };
     }
@@ -98,7 +118,7 @@ export class RemediationGate {
     }
 
     this.usedDigests.add(params.planSha256);
-    return { allowed: true, reason: "verified", plan: this.activePlan };
+    return { allowed: true, reason: "verified", plan: this.activePlan, identities: { ...this.activeIdentities } };
   }
 
   withMutex<T>(fn: () => Promise<T>): Promise<T> {

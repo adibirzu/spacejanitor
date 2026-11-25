@@ -12,7 +12,7 @@ import {
   validateTargetPath,
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
-import { worktreePruneBlockReason } from "./worktreeGuard";
+import { executePlanItems } from "./executor";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
 
@@ -235,46 +235,16 @@ function registerIpcHandlers(): void {
       };
     }
 
-    return gate.withMutex(async () => {
-      const removed: string[] = [];
-      const failed: Array<{ path: string; error: string }> = [];
-      for (const item of auth.plan!.items) {
-        try {
-          if (!fs.existsSync(item.path)) {
-            failed.push({ path: item.path, error: "target_missing" });
-            continue;
-          }
-          if (item.kind === "git-worktree") {
-            const blocked = await worktreePruneBlockReason(item.path);
-            if (blocked) {
-              failed.push({ path: item.path, error: blocked });
-              continue;
-            }
-            await execFileAsync("git", ["worktree", "remove", item.path], {
-              cwd: path.dirname(item.path),
-              timeout: 5000,
-            });
-            removed.push(item.path);
-          } else if (isInsideOsTrash(item.path)) {
-            fs.rmSync(item.path, { recursive: item.kind === "dir", force: false });
-            removed.push(item.path);
-          } else {
-            await shell.trashItem(item.path);
-            removed.push(item.path);
-          }
-        } catch (err) {
-          failed.push({ path: item.path, error: err instanceof Error ? err.message : "remediation_failed" });
-        }
-      }
-      return {
-        schema: "spacejanitor.reap.v1",
-        executed: failed.length === 0 && removed.length > 0,
-        partial: removed.length > 0 && failed.length > 0,
-        planSha256,
-        removed,
-        failed,
-      };
-    });
+    return gate.withMutex(() =>
+      executePlanItems(auth.plan!, auth.identities || {}, {
+        homeDir: os.homedir(),
+        isInsideOsTrash,
+        trashItem: (p) => shell.trashItem(p),
+        removeWorktree: async (p) => {
+          await execFileAsync("git", ["worktree", "remove", p], { cwd: path.dirname(p), timeout: 5000 });
+        },
+      })
+    );
   });
 
   ipcMain.handle("sj:slm-get-config", (event) => {

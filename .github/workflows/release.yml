@@ -126,7 +126,7 @@ jobs:
 
   desktop-installer-matrix:
     name: Build Desktop Installers (${{ matrix.label }})
-    needs: rust-cli-matrix
+    needs: [rust-cli-matrix, verify-tests]
     strategy:
       fail-fast: false
       matrix:
@@ -218,7 +218,7 @@ jobs:
 
   publish-release:
     name: Checksums & GitHub Release
-    needs: [rust-cli-matrix, desktop-installer-matrix]
+    needs: [verify-tests, rust-cli-matrix, desktop-installer-matrix]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -230,7 +230,7 @@ jobs:
       - name: Generate unified SHA256SUMS.txt
         run: |
           cd release-assets
-          sha256sum * > SHA256SUMS.txt
+          sha256sum ./* > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - uses: actions/upload-artifact@v4 # v4.4.3
         with:
