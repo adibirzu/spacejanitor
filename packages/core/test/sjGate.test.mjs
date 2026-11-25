@@ -4,12 +4,15 @@ import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import {
+  activeSjBinary,
   collectOrphans,
   configureSjBinary,
   findProtectedDescendant,
   isProtectedPath,
+  protectPaths,
   resolveSjBinary,
   runSjSync,
+  sjBinaryProblem,
 } from "../src/index.mjs";
 
 const REPO_ROOT = path.resolve(new URL("../../..", import.meta.url).pathname);
@@ -170,11 +173,57 @@ test("gate: runSjSync reports sj_unavailable when nothing is configured", () => 
   withBinary(null, () => assert.throws(() => runSjSync(["doctor", "--json"]), /sj_unavailable/));
 });
 
-test("gate: shared protect vectors are decided by the Rust sj binary", { skip: !HAVE_SJ || process.platform === "win32" }, () => {
+test("gate: shared protect vectors are decided by the Rust sj binary (every platform)", { skip: !HAVE_SJ }, () => {
   withBinary(REAL_SJ, () => {
     const opts = { homeDir: vectors.home };
     for (const p of vectors.protected) assert.equal(isProtectedPath(p, opts).protected, true, `expected protected: ${p}`);
     for (const p of vectors.unprotected) assert.equal(isProtectedPath(p, opts).protected, false, `expected unprotected: ${p}`);
+    if (process.platform !== "win32") {
+      for (const p of vectors.posix_host_protected) assert.equal(isProtectedPath(p, opts).protected, true, `expected protected on POSIX: ${p}`);
+    }
+  });
+});
+
+test("gate: custom exactPaths, dynamicProtectedPaths and globPatterns reach the Rust gate", { skip: !HAVE_SJ }, () => {
+  withBinary(REAL_SJ, () => {
+    const o = {
+      homeDir: "/Users/alice",
+      exactPaths: ["/data/keep"],
+      dynamicProtectedPaths: ["/work/active"],
+      globPatterns: ["*.secret-ish"],
+    };
+    for (const p of ["/data/keep/sub", "/work/active/src", "/Users/alice/a.secret-ish"]) {
+      assert.equal(isProtectedPath(p, o).protected, true, p);
+    }
+    assert.equal(isProtectedPath("/data/other", o).protected, false);
+  });
+});
+
+test("gate: NUL and control characters are refused before sj is even spawned", () => {
+  withBinary(null, () => {
+    for (const p of ["/Users/alice/.cache/a\u0000b", "/Users/alice/.cache/a\nb"]) {
+      assert.equal(isProtectedPath(p).reason, "control_character_in_path");
+    }
+  });
+});
+
+test("gate: tilde + planted symlink + '..' is judged on the OS-resolved path (R6-B20)", { skip: !HAVE_SJ || process.platform === "win32" }, () => {
+  withBinary(REAL_SJ, () => {
+    const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r6b20-")));
+    try {
+      const home = path.join(base, "home");
+      for (const d of ["Library/Caches/pnpm", "Library/Mail", ".ssh/sub", ".cache/npm"]) fs.mkdirSync(path.join(home, d), { recursive: true });
+      fs.symlinkSync("/", path.join(home, "Library", "Caches", "pnpm", "to-root"));
+      fs.symlinkSync(path.join(home, ".ssh", "sub"), path.join(home, ".cache", "npm", "to-ssh-sub"));
+      const o = { homeDir: home };
+      for (const c of ["~/Library/Caches/pnpm/to-root/..", "~/.cache/npm/to-ssh-sub/.."]) {
+        assert.equal(isProtectedPath(c, o).protected, true, c);
+      }
+      assert.equal(isProtectedPath("~/.cache/npm", o).protected, false);
+      assert.equal(isProtectedPath("relative/path", o).protected, true);
+    } finally {
+      fs.rmSync(base, { recursive: true, force: true });
+    }
   });
 });
 
@@ -200,5 +249,88 @@ test("gate: shared descendant vectors are decided by the Rust sj binary", { skip
         fs.rmSync(root, { recursive: true, force: true });
       }
     }
+  });
+});
+
+// ---- sj binary trust checks (cross-family review blocker 3) ----
+const posixOnly = { skip: process.platform === "win32" };
+
+function mkBin(dir, name, mode = 0o755, body = "#!/bin/sh\nexit 0\n") {
+  const p = path.join(dir, name);
+  fs.writeFileSync(p, body);
+  fs.chmodSync(p, mode);
+  return p;
+}
+
+test("trust: sjBinaryProblem rejects symlinks, directories, group/world-writable files and foreign owners", posixOnly, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-trust-"));
+  try {
+    const good = mkBin(dir, "good");
+    assert.equal(sjBinaryProblem(good), null);
+    const link = path.join(dir, "link");
+    fs.symlinkSync(good, link);
+    assert.equal(sjBinaryProblem(link), "sj_binary_is_symlink");
+    assert.equal(sjBinaryProblem(mkBin(dir, "ww", 0o777)), "sj_binary_writable_by_others");
+    assert.equal(sjBinaryProblem(mkBin(dir, "gw", 0o775)), "sj_binary_writable_by_others");
+    assert.equal(sjBinaryProblem(mkBin(dir, "noexec", 0o644)), "sj_binary_not_executable");
+    const sub = path.join(dir, "adir");
+    fs.mkdirSync(sub, { mode: 0o755 });
+    assert.equal(sjBinaryProblem(sub), "sj_binary_not_a_file");
+    assert.equal(sjBinaryProblem(path.join(dir, "missing")), "sj_binary_missing");
+    assert.equal(sjBinaryProblem("relative/sj"), "sj_binary_not_absolute");
+    // owned by someone else (neither the current user nor root)
+    assert.equal(sjBinaryProblem(good, { uid: process.getuid() + 12345 }), "sj_binary_foreign_owner");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("trust: a world-writable parent directory (no sticky bit) disqualifies the binary", posixOnly, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-trust-"));
+  try {
+    const open = path.join(dir, "open");
+    fs.mkdirSync(open);
+    fs.chmodSync(open, 0o777);
+    const bin = mkBin(open, "sj");
+    assert.equal(sjBinaryProblem(bin), "sj_binary_parent_writable_by_others");
+    const sticky = path.join(dir, "sticky");
+    fs.mkdirSync(sticky);
+    fs.chmodSync(sticky, 0o1777);
+    assert.equal(sjBinaryProblem(mkBin(sticky, "sj")), null);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("trust: resolveSjBinary and the active gate never use a rejected binary", posixOnly, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-trust-"));
+  try {
+    fs.mkdirSync(path.join(dir, "bin"));
+    const real = mkBin(path.join(dir, "bin"), "real");
+    const link = path.join(dir, "bin", "sj");
+    fs.symlinkSync(real, link);
+    assert.equal(resolveSjBinary({ resourcesPath: dir, env: {}, repoRoot: "/nonexistent" }), null, "symlinked bundled sj");
+    fs.rmSync(link);
+    mkBin(path.join(dir, "bin"), "sj", 0o777);
+    assert.equal(resolveSjBinary({ resourcesPath: dir, env: {}, repoRoot: "/nonexistent" }), null, "world-writable bundled sj");
+    assert.equal(resolveSjBinary({ resourcesPath: "", env: { SPACEJANITOR_SJ_BIN: path.join(dir, "bin", "sj") }, repoRoot: "/nonexistent" }), null);
+    withBinary(path.join(dir, "bin", "sj"), () => {
+      assert.equal(activeSjBinary(), null);
+      assert.equal(isProtectedPath("/tmp/x").protected, true);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("gate: protectPaths asks sj once for a whole batch and fails closed for every path without sj", { skip: !HAVE_SJ }, () => {
+  withBinary(REAL_SJ, () => {
+    const out = protectPaths(["/Users/alice/.ssh/id_x", "/Users/alice/.cache/vite", "/Users/alice/vault/a.kdbx"], { homeDir: "/Users/alice" });
+    assert.deepEqual(out.map((r) => r.protected), [true, false, true]);
+    assert.deepEqual(out.map((r) => r.path), ["/Users/alice/.ssh/id_x", "/Users/alice/.cache/vite", "/Users/alice/vault/a.kdbx"]);
+  });
+  withBinary(null, () => {
+    const out = protectPaths(["/a", "/b"]);
+    assert.deepEqual(out.map((r) => [r.protected, r.reason]), [[true, "sj_unavailable"], [true, "sj_unavailable"]]);
   });
 });

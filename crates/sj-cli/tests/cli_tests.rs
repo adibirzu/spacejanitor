@@ -60,6 +60,8 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
     // scan --json
     let scan = Command::new(sj_bin())
         .args(["scan", root.to_str().unwrap(), "--json"])
+        .env("HOME", root)
+        .env("USERPROFILE", root)
         .output()
         .unwrap();
     assert_eq!(scan.status.code(), Some(0));
@@ -731,9 +733,10 @@ fn cli_protect_reports_per_path_verdicts_from_the_rust_gate() {
 #[test]
 fn cli_protect_descendants_blocks_a_tree_holding_a_protected_entry() {
     let tmp = tempdir().unwrap();
-    let home = tmp.path().join("home");
+    // the synthetic home contains the work dirs: on Windows the temp dir lives under C:\Users, which
+    // is another account's home to the gate unless it is inside the home being judged
+    let home = tmp.path().to_path_buf();
     let project = tmp.path().join("project");
-    fs::create_dir_all(&home).unwrap();
     fs::create_dir_all(project.join("app")).unwrap();
     fs::write(project.join("app").join(".env.production"), "S=1").unwrap();
     let clean = tmp.path().join("clean");
@@ -772,6 +775,7 @@ fn cli_protect_with_no_paths_is_a_usage_error() {
     assert_ne!(out.status.code(), Some(0));
 }
 
+#[cfg(not(windows))] // the Windows trash is the system Recycle Bin, not a directory under HOME
 #[test]
 fn cli_plan_excludes_keepass_vaults_and_key_material_in_trash() {
     // cross-family review blocker 1: *.kdbx was planned (and deletable) once the JS denylist was gone.

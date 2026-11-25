@@ -23,15 +23,50 @@ export class SjGateError extends Error {
   }
 }
 
-function usable(candidate, platform = process.platform) {
-  if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return false;
+/**
+ * Why a candidate sj binary must not be trusted, or null when it may be used. The gate runs with the
+ * user's rights and decides what gets deleted, so the file must be exactly what the installer put
+ * there: an absolute path to a regular file (not a symlink), executable, owned by the current user or
+ * root, not writable by group or others, inside no directory that others can write to (a sticky
+ * directory such as /tmp is tolerated). On Windows only the symlink/regular-file checks apply.
+ */
+export function sjBinaryProblem(candidate, { platform = process.platform, uid } = {}) {
+  if (typeof candidate !== "string" || !path.isAbsolute(candidate)) return "sj_binary_not_absolute";
+  let st;
   try {
-    if (!fs.statSync(candidate).isFile()) return false;
-    if (platform !== "win32") fs.accessSync(candidate, fs.constants.X_OK);
-    return true;
+    st = fs.lstatSync(candidate);
   } catch {
-    return false;
+    return "sj_binary_missing";
   }
+  if (st.isSymbolicLink()) return "sj_binary_is_symlink";
+  if (!st.isFile()) return "sj_binary_not_a_file";
+  if (platform === "win32") return null;
+  try {
+    fs.accessSync(candidate, fs.constants.X_OK);
+  } catch {
+    return "sj_binary_not_executable";
+  }
+  const me = uid ?? (typeof process.getuid === "function" ? process.getuid() : undefined);
+  if (me !== undefined && st.uid !== me && st.uid !== 0) return "sj_binary_foreign_owner";
+  if ((st.mode & 0o022) !== 0) return "sj_binary_writable_by_others";
+  let dir = path.dirname(candidate);
+  for (let i = 0; i < 64; i += 1) {
+    let d;
+    try {
+      d = fs.lstatSync(dir);
+    } catch {
+      return "sj_binary_parent_unreadable";
+    }
+    if ((d.mode & 0o002) !== 0 && (d.mode & 0o1000) === 0) return "sj_binary_parent_writable_by_others";
+    const up = path.dirname(dir);
+    if (up === dir) break;
+    dir = up;
+  }
+  return null;
+}
+
+function usable(candidate, platform = process.platform) {
+  return sjBinaryProblem(candidate, { platform }) === null;
 }
 
 // undefined = auto-discover, null = forced unavailable, string = explicit absolute path

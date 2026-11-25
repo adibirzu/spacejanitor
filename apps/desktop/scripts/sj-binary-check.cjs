@@ -59,12 +59,16 @@ function readHeader(file) {
 function assertSjBinary(file, platform, arch) {
   let st;
   try {
-    st = fs.statSync(file);
+    st = fs.lstatSync(file);
   } catch {
     throw new Error(`bundled sj is missing: ${file}`);
   }
+  if (st.isSymbolicLink()) throw new Error(`bundled sj must not be a symlink: ${file}`);
   if (!st.isFile() || st.size === 0) throw new Error(`bundled sj is not a regular file: ${file}`);
-  if (platform !== "win32" && (st.mode & 0o111) === 0) throw new Error(`bundled sj is not executable: ${file}`);
+  if (platform !== "win32") {
+    if ((st.mode & 0o111) === 0) throw new Error(`bundled sj is not executable: ${file}`);
+    if ((st.mode & 0o022) !== 0) throw new Error(`bundled sj is writable by group or others: ${file}`);
+  }
   const info = inspectBinaryBuffer(readHeader(file));
   if (!info) throw new Error(`bundled sj is not a native executable (unrecognised header): ${file}`);
   const wantFormat = FORMAT_FOR_PLATFORM[platform];

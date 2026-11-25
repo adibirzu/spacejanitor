@@ -57,11 +57,27 @@ function unparseable(): Error {
   return new core.SjGateError("sj_unparseable");
 }
 
+const MAX_REASON_CHARS = 300;
+
+/**
+ * Every error string that can leave the main process (IPC result, UI banner) passes through the shared
+ * redactor first; sj stderr is never forwarded raw and is capped.
+ */
+function redactForRenderer(text: string): string {
+  let out: string;
+  try {
+    out = String(core.redactSecrets(text));
+  } catch {
+    return "redaction_failed";
+  }
+  return out.length > MAX_REASON_CHARS ? `${out.slice(0, MAX_REASON_CHARS)}...` : out;
+}
+
 function reasonOf(err: unknown): string {
   const e = err as { reason?: string; stderr?: string; message?: string };
   const base = e?.reason || e?.message || "remediation_failed";
   const detail = typeof e?.stderr === "string" ? e.stderr.trim() : "";
-  return detail ? `${base}: ${detail}` : base;
+  return redactForRenderer(detail ? `${base}: ${detail}` : base);
 }
 
 function parseSjPlan(raw: Record<string, unknown>): SjPlan {

@@ -45,12 +45,6 @@ test("validates plugin rules against core immutable protected denylist", () => {
     assert.ok(result.rejectedRules.every((r) => r.reason === "sj_unavailable"));
     return;
   }
-  if (process.platform === "win32") {
-    // Inherited from PR #10: the Rust gate's own Windows denylist tests already fail on windows-latest
-    // (core_tests protect_normalizes_traversal... and protected_denylist_covers_secrets...), so the
-    // sj verdicts for POSIX-shaped synthetic homes are not asserted here until that is fixed in sj.
-    return;
-  }
   assert.equal(result.allowedRules.length, 1);
   assert.equal(result.allowedRules[0].id, "safe-cache");
   assert.equal(result.rejectedRules.length, 2);

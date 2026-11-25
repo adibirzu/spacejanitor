@@ -56,8 +56,13 @@ export function resolveSjBinary(options: ResolveBinaryOptions = {}): string | nu
   if (env.SPACEJANITOR_NO_SJ === "1") return null;
   const exe = platform === "win32" ? "sj.exe" : "sj";
   const exists = options.existsSync ?? fs.existsSync;
+  // Injected predicates are test seams. Production uses the shared trust check (absolute, regular file
+  // not a symlink, executable, owned by the user or root, not group/world writable, no world-writable
+  // parent): the same code the core gate and the CLI use.
+  const injected = options.existsSync !== undefined || options.isExecutable !== undefined;
   const isExec = options.isExecutable ?? ((p: string) => defaultIsExecutable(p, platform));
-  const usable = (p: string): boolean => path.isAbsolute(p) && exists(p) && isExec(p);
+  const usable = (p: string): boolean =>
+    injected ? path.isAbsolute(p) && exists(p) && isExec(p) : core.sjBinaryProblem(p, { platform }) === null;
   const resourcesPath = options.resourcesPath ?? (process as { resourcesPath?: string }).resourcesPath ?? "";
   const isPackaged = options.isPackaged ?? false;
 

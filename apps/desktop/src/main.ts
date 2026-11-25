@@ -9,9 +9,13 @@ import {
   validateTargetPath,
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
+import { annotateSummary, approvedFromSummary } from "./candidateAnnotations";
 import { OrphanScanSetting, setOrphanScanWithConfirmation } from "./orphanSetting";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const core = require("@spacejanitor/core");
 
 let mainWindow: BrowserWindow | null = null;
 let tray: Tray | null = null;
@@ -163,18 +167,8 @@ function registerApprovedFromReport(method: string, result: Record<string, unkno
   const orphanRoot = method === "orphans" ? result.targetPath : (result.orphans as { targetPath?: unknown } | undefined)?.targetPath;
   if (typeof orphanRoot === "string" && path.isAbsolute(orphanRoot)) gate.setPlanRoot(orphanRoot);
   if (method !== "summary") return;
-  const trashCands = Array.isArray((result.trash as { candidates?: RemediationCandidate[] })?.candidates)
-    ? ((result.trash as { candidates: RemediationCandidate[] }).candidates)
-    : [];
-  const cacheCands = Array.isArray(result.cleanableCaches)
-    ? (result.cleanableCaches as RemediationCandidate[])
-    : [];
-  const orphanCands = Array.isArray((result.orphans as { candidates?: Array<RemediationCandidate & { safeToPrune?: boolean }> })?.candidates)
-    ? (result.orphans as { candidates: Array<RemediationCandidate & { safeToPrune?: boolean }> }).candidates.filter(
-        (c) => c.safeToPrune
-      )
-    : [];
-  gate.registerApprovedCandidates([...trashCands, ...cacheCands, ...orphanCands]);
+  // Only what the Rust gate judged selectable can ever be planned (caches never are).
+  gate.registerApprovedCandidates(approvedFromSummary(result));
 }
 
 function gateRefusalMessage(reason: string): string {
@@ -203,7 +197,9 @@ function registerIpcHandlers(): void {
     }
     // Only the main process decides whether git may run inside repositories found on disk (default OFF).
     if (method === "orphans" || method === "summary") params.includeOrphans = orphanScan.get();
-    const result = await bridge.invoke(method, params);
+    let result = await bridge.invoke(method, params);
+    // Tell the UI which candidates the gate accepts (and why not), so it never offers what plan would refuse.
+    if (method === "summary") result = annotateSummary(result, (paths) => core.protectPaths(paths));
     registerApprovedFromReport(method, result);
     // Read-only views always work; the renderer is told whether destructive actions are possible.
     return method === "summary" ? { ...result, remediationGate: bridge.remediationAvailable() } : result;

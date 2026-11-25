@@ -88,6 +88,31 @@ test("packaging: assertSjBinary accepts only the right platform/arch, an existin
   }
 });
 
+test("packaging: the pack check rejects symlinked, group/world-writable and directory sj", () => {
+  if (process.platform === "win32") return;
+  const dir = tmp();
+  try {
+    const good = path.join(dir, "good");
+    fs.writeFileSync(good, elf(0x3e), { mode: 0o755 });
+    fs.chmodSync(good, 0o755);
+    assert.doesNotThrow(() => check.assertSjBinary(good, "linux", "x64"));
+    const link = path.join(dir, "link");
+    fs.symlinkSync(good, link);
+    assert.throws(() => check.assertSjBinary(link, "linux", "x64"), /symlink/);
+    for (const mode of [0o777, 0o775, 0o757]) {
+      const p = path.join(dir, `m${mode.toString(8)}`);
+      fs.writeFileSync(p, elf(0x3e));
+      fs.chmodSync(p, mode);
+      assert.throws(() => check.assertSjBinary(p, "linux", "x64"), /writable/, mode.toString(8));
+    }
+    const d = path.join(dir, "adir");
+    fs.mkdirSync(d, { mode: 0o755 });
+    assert.throws(() => check.assertSjBinary(d, "linux", "x64"), /regular file/);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("packaging: electron-builder bundles resources/bin and refuses to pack without a verified sj", () => {
   const cfg = fs.readFileSync(path.join(repoRoot, "apps/desktop/electron-builder.yml"), "utf8");
   assert.match(cfg, /extraResources:\s*\n\s*- from: resources\/bin\s*\n\s*to: bin/);

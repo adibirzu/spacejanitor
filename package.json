@@ -15,7 +15,7 @@
   "scripts": {
     "test": "node --test packages/*/test/*.test.mjs",
     "desktop:typecheck": "npm --workspace @spacejanitor/ui run typecheck && npm --workspace @spacejanitor/desktop run typecheck",
-    "desktop:test": "npm --workspace @spacejanitor/desktop test",
+    "desktop:test": "npm --workspace @spacejanitor/ui test && npm --workspace @spacejanitor/desktop test",
     "desktop:build": "npm --workspace @spacejanitor/ui run build && npm --workspace @spacejanitor/desktop run build",
     "desktop:pack": "npm run desktop:build && npm --workspace @spacejanitor/desktop run pack",
     "desktop:dist": "npm run desktop:build && npm --workspace @spacejanitor/desktop run dist",

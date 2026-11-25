@@ -149,3 +149,56 @@ test("R10-B34: a hanging Rust sj makes the orphan report fail closed (sj_timeout
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("trust: the desktop resolver rejects symlinked, world-writable and directory sj even when packaged", () => {
+  if (process.platform === "win32") return;
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-bridge-trust-"));
+  try {
+    const mk = (name: string, mode: number) => {
+      const res = path.join(dir, name);
+      fs.mkdirSync(path.join(res, "bin"), { recursive: true });
+      return res;
+    };
+    const resolve = (resourcesPath: string) => resolveSjBinary({ resourcesPath, isPackaged: true, env: {} });
+
+    const good = mk("good", 0o755);
+    fs.writeFileSync(path.join(good, "bin", "sj"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.equal(resolve(good), path.join(good, "bin", "sj"));
+
+    const sym = mk("sym", 0o755);
+    fs.writeFileSync(path.join(sym, "evil.sh"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    fs.symlinkSync(path.join(sym, "evil.sh"), path.join(sym, "bin", "sj"));
+    assert.equal(resolve(sym), null, "symlinked sj");
+
+    const ww = mk("ww", 0o777);
+    fs.writeFileSync(path.join(ww, "bin", "sj"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(path.join(ww, "bin", "sj"), 0o777);
+    assert.equal(resolve(ww), null, "world-writable sj");
+
+    const gw = mk("gw", 0o775);
+    fs.writeFileSync(path.join(gw, "bin", "sj"), "#!/bin/sh\nexit 0\n");
+    fs.chmodSync(path.join(gw, "bin", "sj"), 0o775);
+    assert.equal(resolve(gw), null, "group-writable sj");
+
+    const asDir = mk("asdir", 0o755);
+    fs.mkdirSync(path.join(asDir, "bin", "sj"), { mode: 0o755 });
+    assert.equal(resolve(asDir), null, "directory at <resources>/bin/sj");
+
+    const open = mk("open", 0o777);
+    fs.chmodSync(path.join(open, "bin"), 0o777);
+    fs.writeFileSync(path.join(open, "bin", "sj"), "#!/bin/sh\nexit 0\n", { mode: 0o755 });
+    assert.equal(resolve(open), null, "world-writable parent directory");
+
+    // a bridge pinned to a rejected binary fails closed in core as well
+    const bridge = new SjBridge({ binaryPath: path.join(ww, "bin", "sj") });
+    try {
+      assert.equal(bridge.remediationAvailable().available, false);
+    } finally {
+      bridge.dispose();
+      // eslint-disable-next-line @typescript-eslint/no-var-requires
+      require("@spacejanitor/core").configureSjBinary(undefined);
+    }
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});

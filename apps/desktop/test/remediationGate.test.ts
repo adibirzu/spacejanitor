@@ -312,3 +312,34 @@ test("orphan worktrees are planned and executed only with the main-process opt-i
     for (const c of sj.calls) assert.equal(c.includes("--include-orphans"), enabled, c.join(" "));
   }
 });
+
+test("sj stderr and error text are redacted before they leave the main process (execute result and errors)", async () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { urlWith } = require("../../../../packages/core/test/_fixtures.mjs");
+  const secretUrl = urlWith("https", "alice", "superSecretPass99", "git.example.com/r.git");
+  const tokenFlag = ["--token", "tokSecret99"].join("=");
+  const stderr = `error: git remote ${secretUrl} ${tokenFlag} failed`;
+  const a = item("/h/.Trash/a", "item_a");
+  const sj = fakeSj((args) => {
+    if (!args.includes("--execute")) return sjPlan([a]);
+    const e = new core.SjGateError("sj_exit_2");
+    (e as unknown as { stderr: string }).stderr = stderr;
+    return e;
+  });
+  const gate = new RemediationGate({ runSj: sj.run, planRoot: "/h" });
+  gate.registerApprovedCandidates([cand(a.path)]);
+  const plan = await gate.createDryRunPlan([cand(a.path)]);
+  const res = await gate.run({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
+  const text = JSON.stringify(res);
+  for (const leak of ["superSecretPass99", "tokSecret99"]) assert.equal(text.includes(leak), false, `leaked ${leak}: ${text}`);
+  assert.match((res.failed as Array<{ error: string }>)[0].error, /^sj_exit_2/);
+
+  // a plain Error carrying a secret (not an SjGateError) is redacted as well
+  const sj2 = fakeSj((args) => (args.includes("--execute") ? new Error(`boom ${secretUrl} ${["--password", "pwSecret77"].join("=")}`) : sjPlan([a])));
+  const gate2 = new RemediationGate({ runSj: sj2.run, planRoot: "/h" });
+  gate2.registerApprovedCandidates([cand(a.path)]);
+  const plan2 = await gate2.createDryRunPlan([cand(a.path)]);
+  const res2 = await gate2.run({ planSha256: plan2.planSha256, phrase: plan2.confirmationPhrase });
+  const text2 = JSON.stringify(res2);
+  for (const leak of ["superSecretPass99", "pwSecret77"]) assert.equal(text2.includes(leak), false, `leaked ${leak}: ${text2}`);
+});
