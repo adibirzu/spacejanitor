@@ -3097,6 +3097,11 @@ fn protect_covers_claude_state_files_and_app_support_pure_string_windows_and_pos
         );
     }
     assert!(
-        !is_protected_path("/home/developer/Library/Application Support/Other", home, &[]).protected
+        !is_protected_path(
+            "/home/developer/Library/Application Support/Other",
+            home,
+            &[]
+        )
+        .protected
     );
 }
