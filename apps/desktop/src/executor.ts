@@ -15,6 +15,8 @@ export interface ExecutorDeps {
   afterItem?: (item: { path: string }) => void | Promise<void>;
   /** test seam: runs immediately before every unlink/rmdir */
   beforeUnlink?: (p: string) => void;
+  /** filled by the walk: every entry actually unlinked/rmdir'd, so a mid-walk failure can report it honestly */
+  deleted?: string[];
   /** test seam: runs right after a directory has been listed, before its children are touched */
   afterReaddir?: (dir: string) => void;
 }
@@ -25,7 +27,7 @@ export interface ReapResult {
   partial: boolean;
   planSha256: string;
   removed: string[];
-  failed: Array<{ path: string; error: string }>;
+  failed: Array<{ path: string; error: string; partiallyRemoved?: string[] }>;
 }
 
 function judge(p: string, homeDir: string): void {
@@ -77,9 +79,11 @@ function removeTreeNoFollow(full: string, deps: ExecutorDeps, top: boolean, expe
     sameDir(full, id);
     deps.beforeUnlink?.(full);
     fs.rmdirSync(full);
+    deps.deleted?.push(full);
   } else {
     deps.beforeUnlink?.(full);
     fs.unlinkSync(full);
+    deps.deleted?.push(full);
   }
 }
 
@@ -89,8 +93,10 @@ export async function executePlanItems(
   deps: ExecutorDeps
 ): Promise<ReapResult> {
   const removed: string[] = [];
-  const failed: Array<{ path: string; error: string }> = [];
+  const failed: Array<{ path: string; error: string; partiallyRemoved?: string[] }> = [];
   for (const item of plan.items) {
+    const deleted: string[] = [];
+    const itemDeps: ExecutorDeps = { ...deps, deleted };
     try {
       let st: fs.BigIntStats;
       try {
@@ -115,13 +121,18 @@ export async function executePlanItems(
         if (blocked) throw new Error(blocked);
         await deps.removeWorktree(item.path);
       } else if (deps.isInsideOsTrash(item.path)) {
-        removeTreeNoFollow(item.path, deps, true);
+        removeTreeNoFollow(item.path, itemDeps, true);
       } else {
         await deps.trashItem(item.path);
       }
       removed.push(item.path);
     } catch (err) {
-      failed.push({ path: item.path, error: err instanceof Error ? err.message : "remediation_failed" });
+      failed.push({
+        path: item.path,
+        error: err instanceof Error ? err.message : "remediation_failed",
+        // honest partial outcome: what the walk really deleted before it stopped
+        ...(deleted.length ? { partiallyRemoved: deleted } : {}),
+      });
     }
     await deps.afterItem?.(item);
   }

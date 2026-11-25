@@ -169,6 +169,42 @@ test("R9-B31: a directory swapped for a symlink to an outside folder mid-walk is
     }
     assert.equal(res.executed, false);
     assert.match(res.failed[0].error, /directory_swapped|symlink_refused/);
+    // honest partial outcome: whatever the walk really deleted before it stopped is reported
+    const partial = res.failed[0].partiallyRemoved ?? [];
+    for (const p of partial) assert.equal(fs.existsSync(p), false, `reported as removed but still exists: ${p}`);
+    assert.equal(res.removed.length, 0);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R10-B31: a mid-walk failure reports exactly the entries that were deleted before it stopped", async () => {
+  const { base, home, trash, gate } = setup();
+  try {
+    const d = makeTree(trash, "partial", ["a.txt", "b.txt", "sub/c.txt"]);
+    const cands: RemediationCandidate[] = [{ id: "p", path: d, bytes: 1, kind: "dir" }];
+    gate.registerApprovedCandidates(cands);
+    const plan = gate.createDryRunPlan(cands);
+    const auth = gate.authorizeExecute({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
+    let calls = 0;
+    const res = await executePlanItems(
+      auth.plan!,
+      auth.identities!,
+      deps(home, {
+        beforeUnlink: () => {
+          calls += 1;
+          if (calls === 3) throw new Error("directory_swapped:injected");
+        },
+      })
+    );
+    assert.equal(res.executed, false);
+    assert.equal(res.removed.length, 0);
+    const partial = res.failed[0].partiallyRemoved ?? [];
+    assert.equal(partial.length, 2);
+    for (const p of partial) assert.equal(fs.existsSync(p), false);
+    // everything else is still there
+    const remaining = ["a.txt", "b.txt", "sub/c.txt"].filter((f) => fs.existsSync(path.join(d, f)));
+    assert.equal(remaining.length, 1);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }
