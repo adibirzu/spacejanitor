@@ -125,19 +125,19 @@ fn is_system_binary_path(command: &str) -> bool {
             && first_clean.contains(".app/contents/macos/"))
 }
 
-fn is_reapable_mcp_or_agent_worker(command: &str) -> bool {
-    let bin = extract_binary_name(command);
-    if matches!(
-        bin.as_str(),
-        "npx" | "uvx" | "node" | "deno" | "bun" | "python" | "python3"
-    ) || bin.starts_with("python3.")
-        || bin.starts_with("python2.")
-        || bin.contains("mcp")
-    {
-        return true;
-    }
+/// MCP lineage: the command line itself must name an MCP server (`mcp`,
+/// `@modelcontextprotocol`, `mcp-server`, `--mcp`). A bare runtime such as
+/// `node`, `python3` or `bun` is NOT enough: any orphaned dev server would match.
+fn has_mcp_lineage(command: &str) -> bool {
     let low = command.to_ascii_lowercase();
-    low.contains("@modelcontextprotocol") || low.contains("mcp-server") || low.contains("--mcp")
+    low.contains("mcp") || low.contains("modelcontextprotocol")
+}
+
+/// Wrapper hosts that supervise MCP children and must never be signalled.
+fn is_protected_wrapper(command: &str) -> bool {
+    let low = command.to_ascii_lowercase();
+    low.contains("codex-code-mode-host")
+        || low.contains("codexcli.app/contents/macos/codex app-server")
 }
 
 pub fn is_protected_process(pid: u32, command: &str) -> Option<&'static str> {
@@ -146,6 +146,9 @@ pub fn is_protected_process(pid: u32, command: &str) -> Option<&'static str> {
     }
     if is_system_binary_path(command) {
         return Some("protected_system_binary_path");
+    }
+    if is_protected_wrapper(command) {
+        return Some("protected_wrapper_process");
     }
     let bin = extract_binary_name(command);
     if PROTECTED_PROCESS_NAMES.contains(&bin.as_str()) {
@@ -223,9 +226,11 @@ pub fn build_reap_plan_from_processes(
             });
             continue;
         }
+        // F6: a PPID=1 orphan is only a candidate when its owner is provably us.
         #[cfg(unix)]
-        if let Some(proc_uid) = p.uid {
-            if proc_uid != current_uid || (proc_uid == 0 && current_uid != 0) {
+        match p.uid {
+            Some(proc_uid) if proc_uid == current_uid => {}
+            Some(_) => {
                 excluded.push(ReapExcluded {
                     pid: p.pid,
                     command: redact_secrets(&p.command),
@@ -233,6 +238,23 @@ pub fn build_reap_plan_from_processes(
                 });
                 continue;
             }
+            None => {
+                excluded.push(ReapExcluded {
+                    pid: p.pid,
+                    command: redact_secrets(&p.command),
+                    reason: "unknown_uid".to_string(),
+                });
+                continue;
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            excluded.push(ReapExcluded {
+                pid: p.pid,
+                command: redact_secrets(&p.command),
+                reason: "uid_unverifiable".to_string(),
+            });
+            continue;
         }
         if let Some(reason) = is_protected_process(p.pid, &p.command) {
             excluded.push(ReapExcluded {
@@ -242,11 +264,11 @@ pub fn build_reap_plan_from_processes(
             });
             continue;
         }
-        if !is_reapable_mcp_or_agent_worker(&p.command) {
+        if !has_mcp_lineage(&p.command) {
             excluded.push(ReapExcluded {
                 pid: p.pid,
                 command: redact_secrets(&p.command),
-                reason: "non_mcp_or_non_worker_process".to_string(),
+                reason: "non_mcp_lineage".to_string(),
             });
             continue;
         }
@@ -332,6 +354,10 @@ pub fn verify_target_unchanged(
     };
     if live.ppid != 1 {
         return Err(format!("ppid_drifted:{}", live.ppid));
+    }
+    #[cfg(unix)]
+    if live.uid != Some(unsafe { libc::geteuid() }) {
+        return Err("uid_drifted".to_string());
     }
     if sha256_hex(live.command.as_bytes()) != target.command_sha256 {
         return Err("command_drifted".to_string());
@@ -451,12 +477,81 @@ pub fn execute_reap_plan(
 mod tests {
     use super::*;
 
+    fn cur_uid() -> Option<u32> {
+        #[cfg(unix)]
+        {
+            Some(unsafe { libc::geteuid() })
+        }
+        #[cfg(not(unix))]
+        {
+            None
+        }
+    }
+
+    fn orphan(pid: u32, uid: Option<u32>, command: &str) -> ObservedProcess {
+        ObservedProcess {
+            pid,
+            ppid: 1,
+            uid,
+            start_time: "Mon Nov 24 01:00:00 2026".to_string(),
+            elapsed_secs: 7200,
+            command: command.to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_f6_requires_known_own_uid_and_mcp_lineage_for_ppid1_orphans() {
+        let me = cur_uid();
+        let other = me.map(|u| u.wrapping_add(1));
+        let procs = vec![
+            orphan(201, me, "node /srv/dev-server.js --port 3000"),
+            orphan(202, me, "python3 train.py"),
+            orphan(203, None, "node /opt/x/mcp-server.js"),
+            orphan(204, other, "node /opt/x/mcp-server.js"),
+            orphan(205, me, "npx -y @modelcontextprotocol/server-filesystem /tmp"),
+            orphan(206, me, "node /opt/x/mcp-server.js"),
+            orphan(207, me, "/Applications/Codex.app/Contents/MacOS/codex app-server --mcp"),
+            orphan(208, me, "codex-code-mode-host --mcp"),
+        ];
+        let plan = build_reap_plan_from_processes(30, &procs, 999).unwrap();
+        let got: Vec<u32> = plan.targets.iter().map(|t| t.pid).collect();
+        assert_eq!(got, vec![205, 206], "plan: {plan:?}");
+        let reason = |pid: u32| {
+            plan.excluded
+                .iter()
+                .find(|e| e.pid == pid)
+                .map(|e| e.reason.clone())
+                .unwrap_or_default()
+        };
+        assert_eq!(reason(201), "non_mcp_lineage");
+        assert_eq!(reason(202), "non_mcp_lineage");
+        assert_eq!(reason(203), "unknown_uid");
+        assert_eq!(reason(204), "foreign_uid");
+        assert_eq!(reason(207), "protected_system_binary_path");
+        assert_eq!(reason(208), "protected_wrapper_process");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reap_f6_verify_rejects_uid_drift() {
+        let me = cur_uid();
+        let procs = vec![orphan(301, me, "node /opt/x/mcp-server.js")];
+        let plan = build_reap_plan_from_processes(30, &procs, 999).unwrap();
+        let mut drifted = procs.clone();
+        drifted[0].uid = me.map(|u| u.wrapping_add(1));
+        assert_eq!(
+            verify_target_unchanged(&plan.targets[0], &drifted),
+            Err("uid_drifted".to_string())
+        );
+    }
+
     fn sample_processes() -> Vec<ObservedProcess> {
         vec![
             ObservedProcess {
                 pid: 1,
                 ppid: 0,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 00:00:00 2026".to_string(),
                 elapsed_secs: 99999,
                 command: "/sbin/launchd".to_string(),
@@ -464,7 +559,7 @@ mod tests {
             ObservedProcess {
                 pid: 101,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/bin/zsh".to_string(),
@@ -472,7 +567,7 @@ mod tests {
             ObservedProcess {
                 pid: 202,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 02:00:00 2026".to_string(),
                 elapsed_secs: 600, // 10 mins < 30
                 command: "node fresh-worker.js".to_string(),
@@ -480,7 +575,7 @@ mod tests {
             ObservedProcess {
                 pid: 303,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:10:00 2026".to_string(),
                 elapsed_secs: 3600,
                 command: "node stale-mcp.js --token=secret_123".to_string(),
@@ -488,7 +583,7 @@ mod tests {
             ObservedProcess {
                 pid: 404,
                 ppid: 101, // not PPID=1
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:10:00 2026".to_string(),
                 elapsed_secs: 3600,
                 command: "node active-child.js".to_string(),
@@ -496,6 +591,7 @@ mod tests {
         ]
     }
 
+    #[cfg(unix)]
     #[test]
     fn reap_plan_is_deterministic_excludes_protected_and_enforces_gates() {
         let procs = sample_processes();
@@ -555,6 +651,7 @@ mod tests {
         assert!(valid.is_ok());
     }
 
+    #[cfg(unix)]
     #[test]
     fn reap_drift_guard_detects_command_and_start_time_changes() {
         let procs = sample_processes();
@@ -583,7 +680,7 @@ mod tests {
         let mut procs = vec![ObservedProcess {
             pid: 505,
             ppid: 1,
-            uid: None,
+            uid: cur_uid(),
             start_time: "Mon Nov 24 01:10:00 2026".to_string(),
             elapsed_secs: 1800,
             command: "node stale-mcp.js --token=PROBE_REAP_EQ --api-key PROBE_REAP_SP".to_string(),
@@ -609,13 +706,14 @@ mod tests {
         assert_eq!(plan_a.plan_sha256, plan_b.plan_sha256);
     }
 
+    #[cfg(unix)]
     #[test]
     fn reap_excludes_system_daemons_gui_apps_and_non_mcp_processes() {
         let procs = vec![
             ObservedProcess {
                 pid: 101,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/usr/libexec/opendirectoryd".to_string(),
@@ -623,7 +721,7 @@ mod tests {
             ObservedProcess {
                 pid: 102,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/Applications/Safari.app/Contents/MacOS/Safari".to_string(),
@@ -631,7 +729,7 @@ mod tests {
             ObservedProcess {
                 pid: 103,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "sshd: /usr/sbin/sshd -D [listener]".to_string(),
@@ -639,7 +737,7 @@ mod tests {
             ObservedProcess {
                 pid: 104,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/usr/lib/systemd/systemd-journald".to_string(),
@@ -647,7 +745,7 @@ mod tests {
             ObservedProcess {
                 pid: 105,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "/usr/bin/ssh-agent -l".to_string(),
@@ -655,7 +753,7 @@ mod tests {
             ObservedProcess {
                 pid: 106,
                 ppid: 1,
-                uid: None,
+                uid: cur_uid(),
                 start_time: "Mon Nov 24 01:00:00 2026".to_string(),
                 elapsed_secs: 7200,
                 command: "npx -y @modelcontextprotocol/server-filesystem /tmp".to_string(),
