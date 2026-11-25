@@ -78,7 +78,7 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
     // orphans --json
     let orphans = Command::new(sj_bin())
-        .args(["orphans", root.to_str().unwrap(), "--json"])
+        .args(["orphans", "--include-orphans", root.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     assert_eq!(orphans.status.code(), Some(0));
@@ -177,10 +177,10 @@ fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
 
     let checkout_abs = checkout.to_str().unwrap();
     let orphan_invocations: Vec<(&Path, Vec<&str>)> = vec![
-        (&ws, vec!["orphans", "--json"]),
-        (&ws, vec!["orphans", "checkout", "--json"]),
-        (&ws, vec!["orphans", checkout_abs, "--json"]),
-        (&checkout, vec!["orphans", "--json"]),
+        (&ws, vec!["orphans", "--include-orphans", "--json"]),
+        (&ws, vec!["orphans", "--include-orphans", "checkout", "--json"]),
+        (&ws, vec!["orphans", "--include-orphans", checkout_abs, "--json"]),
+        (&checkout, vec!["orphans", "--include-orphans", "--json"]),
     ];
 
     let mut expected_branch: Option<String> = None;
@@ -324,7 +324,7 @@ fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
         let out = Command::new(sj_bin())
             .current_dir(home)
             .env("HOME", home)
-            .args(["orphans", input, "--json"])
+            .args(["orphans", "--include-orphans", input, "--json"])
             .output()
             .unwrap();
         assert_eq!(
@@ -431,7 +431,7 @@ fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
 
     let orphans_out = Command::new(sj_bin())
         .env("HOME", home)
-        .args(["orphans", ws.to_str().unwrap(), "--json"])
+        .args(["orphans", "--include-orphans", ws.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     assert_eq!(
@@ -548,7 +548,7 @@ fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
 
     let blocked_orphans = Command::new(sj_bin())
         .env("HOME", home)
-        .args(["orphans", ws.to_str().unwrap(), "--json"])
+        .args(["orphans", "--include-orphans", ws.to_str().unwrap(), "--json"])
         .output()
         .unwrap();
     assert_eq!(blocked_orphans.status.code(), Some(0));
@@ -617,4 +617,74 @@ fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
         rollback_leftovers.is_empty(),
         "expected zero .sj-stage-* residue after rollback, found: {rollback_leftovers:?}"
     );
+}
+
+
+/// A `git` shim first on PATH: records every invocation. Used to prove nothing spawns git when the
+/// orphan scan is off.
+#[cfg(unix)]
+fn git_shim(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+    use std::os::unix::fs::PermissionsExt;
+    let bin = dir.join("shimbin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = dir.join("GIT_SPAWNED");
+    let shim = bin.join("git");
+    fs::write(&shim, format!("#!/bin/sh\necho \"$@\" >> \"{}\"\nexit 1\n", marker.display())).unwrap();
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o755)).unwrap();
+    (bin, marker)
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let home = root.join("home");
+    let ws = root.join("ws");
+    fs::create_dir_all(&home).unwrap();
+    // a repo that WOULD be scanned if scanning were on
+    fs::create_dir_all(ws.join("repo").join(".git")).unwrap();
+    let (shim_bin, marker) = git_shim(root);
+    let path = format!("{}:{}", shim_bin.display(), std::env::var("PATH").unwrap_or_default());
+
+    let orphans = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .args(["orphans", ws.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(orphans.status.code(), Some(0), "{}", String::from_utf8_lossy(&orphans.stderr));
+    let j: serde_json::Value = serde_json::from_slice(&orphans.stdout).unwrap();
+    assert_eq!(j["schema"], "spacejanitor.orphans.v1");
+    assert_eq!(j["scanned"], false, "must say not scanned, not 'no orphans': {j}");
+    assert_eq!(j["not_scanned_reason"], "orphan_scan_disabled_by_default");
+
+    for args in [
+        vec!["plan", ws.to_str().unwrap(), "--json"],
+        vec!["plan", ws.to_str().unwrap(), "--include-trash", "--json"],
+    ] {
+        let plan = Command::new(sj_bin())
+            .env("HOME", &home)
+            .env("PATH", &path)
+            .args(&args)
+            .output()
+            .unwrap();
+        assert_eq!(plan.status.code(), Some(0), "{:?}: {}", args, String::from_utf8_lossy(&plan.stderr));
+        let pj: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+        assert!(
+            pj["items"].as_array().unwrap().iter().all(|i| i["kind"] != "orphan_worktree"),
+            "default plan must not contain orphan items: {pj}"
+        );
+    }
+    assert!(!marker.exists(), "git was spawned although the orphan scan is off: {}", fs::read_to_string(&marker).unwrap_or_default());
+
+    // opt-in: now git IS used and the user gets the warning
+    let on = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("PATH", &path)
+        .args(["orphans", ws.to_str().unwrap(), "--include-orphans", "--json"])
+        .output()
+        .unwrap();
+    assert!(String::from_utf8_lossy(&on.stderr).contains("experimental"), "opt-in must warn");
+    assert!(marker.exists(), "opt-in scan should reach git");
 }

@@ -8,6 +8,9 @@
     "spacejanitor": "./bin/spacejanitor.mjs",
     "spacejanitor-axi": "./bin/spacejanitor.mjs"
   },
+  "scripts": {
+    "test": "node --test test/*.test.mjs"
+  },
   "dependencies": {
     "@spacejanitor/core": "0.1.0"
   }

@@ -1,3 +1,5 @@
+import { isProtectedPath } from "../../core/src/index.mjs";
+
 const VALID_CAPABILITIES = new Set([
   "rule-pack",
   "collector",
@@ -34,6 +36,38 @@ export function definePlugin(manifest) {
     apiVersion: "1",
     capabilities: Object.freeze([...manifest.capabilities]),
     rules: Object.freeze([...(manifest.rules || [])]),
+    collectors: Object.freeze([...(manifest.collectors || [])]),
     widgets: Object.freeze([...(manifest.widgets || [])]),
+    exporters: Object.freeze([...(manifest.exporters || [])]),
   });
+}
+
+/**
+ * Validate every rule in a plugin against @spacejanitor/core immutable protected paths (FR-4.5).
+ */
+export function validatePluginRules(plugin, options = {}) {
+  const allowedRules = [];
+  const rejectedRules = [];
+
+  for (const rule of plugin?.rules || []) {
+    const paths = Array.isArray(rule?.paths) ? rule.paths : [];
+    let blockedReason = "";
+    for (const p of paths) {
+      const check = isProtectedPath(p, options);
+      if (check.protected) {
+        blockedReason = check.reason;
+        break;
+      }
+    }
+    if (blockedReason) {
+      rejectedRules.push({
+        ruleId: String(rule?.id || "unknown"),
+        reason: blockedReason,
+      });
+    } else {
+      allowedRules.push(rule);
+    }
+  }
+
+  return { allowedRules, rejectedRules };
 }

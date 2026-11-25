@@ -1,0 +1,14 @@
+{
+  "comment": "Shared descendant-protection fixtures. Each case is a directory tree (a Trash/cleanup candidate) built in a temp dir; entries ending in '/' are directories, 'link:NAME' is a symlink. A candidate whose subtree holds ANY protected descendant (or a symlink) must be blocked in full by both crates/sj-core (check_dir_descendants_safe) and packages/core (findProtectedDescendant), because recursive removal would delete it.",
+  "cases": [
+    { "name": "clean project", "protected": false, "entries": ["src/", "src/main.rs", "node_modules/", "node_modules/x/", "node_modules/x/index.js", "README.md"] },
+    { "name": "ssh key inside project", "protected": true, "entries": ["src/", "src/main.rs", ".ssh/", ".ssh/id_ed25519"] },
+    { "name": "dotenv deep inside project", "protected": true, "entries": ["app/", "app/config/", "app/config/.env"] },
+    { "name": "dotenv production", "protected": true, "entries": ["app/.env.production"] },
+    { "name": "vm disk image", "protected": true, "entries": ["vm/", "vm/disk.qcow2"] },
+    { "name": "pem certificate", "protected": true, "entries": ["certs/", "certs/server.pem"] },
+    { "name": "aws credentials dir", "protected": true, "entries": ["tools/", "tools/.aws/", "tools/.aws/credentials"] },
+    { "name": "quarantine stage leftover", "protected": true, "entries": ["x/", "x/.sj-stage-abc123/", "x/.sj-stage-abc123/f"] },
+    { "name": "symlink descendant", "protected": true, "entries": ["src/", "link:escape"] }
+  ]
+}

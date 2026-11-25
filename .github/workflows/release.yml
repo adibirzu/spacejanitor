@@ -1,0 +1,247 @@
+name: SpaceJanitor Multi-OS Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Build all CLI & Desktop artifacts without publishing a GitHub Release"
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  hygiene-and-secrets:
+    name: OSS Hygiene & Secret Scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4 # v4.2.2
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-node@v4 # v4.1.0
+        with:
+          node-version: 22
+      - name: Validate tag matches package.json version (on tag push)
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          TAG_VER="${GITHUB_REF_NAME#v}"
+          PKG_VER="$(node -p "require('./apps/desktop/package.json').version")"
+          echo "Tag version: $TAG_VER | Desktop package.json version: $PKG_VER"
+          if [ "$TAG_VER" != "$PKG_VER" ]; then
+            echo "ERROR: Tag $GITHUB_REF_NAME does not match apps/desktop/package.json ($PKG_VER)"
+            exit 1
+          fi
+      - name: Run SpaceJanitor OSS hygiene gate
+        run: node scripts/check-oss-hygiene.mjs
+      - name: Install and run gitleaks over git history
+        run: |
+          GITLEAKS_VER="8.24.2"
+          curl -sSL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VER}/gitleaks_${GITLEAKS_VER}_linux_x64.tar.gz" -o /tmp/gitleaks.tar.gz
+          tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
+          /tmp/gitleaks git --no-banner -v
+
+  # Platform note: this gate runs on ubuntu only. The per-OS Node/Rust matrix and the desktop suite on
+  # ubuntu+macOS run in ci.yml on every PR and push to main, so a tagged commit has already passed
+  # them; add windows desktop tests here once that suite is green on windows.
+  verify-tests:
+    name: Test gate (Node, Rust, Desktop)
+    runs-on: ubuntu-latest
+    env:
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install workspace dependencies
+        run: npm ci
+      - name: Node tests
+        run: npm test
+      - name: Rust tests
+        run: cargo test --workspace
+      - name: Desktop typecheck
+        run: npm run desktop:typecheck
+      - name: Desktop tests
+        run: npm run desktop:test
+
+  rust-cli-matrix:
+    name: Build sj CLI (${{ matrix.artifact }})
+    needs: [hygiene-and-secrets, verify-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-15
+            target: aarch64-apple-darwin
+            artifact: sj-darwin-arm64
+            ext: tar.gz
+          - os: macos-15
+            target: x86_64-apple-darwin
+            artifact: sj-darwin-x64
+            ext: tar.gz
+          - os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            artifact: sj-linux-x64
+            ext: tar.gz
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            artifact: sj-linux-arm64
+            ext: tar.gz
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            artifact: sj-win32-x64
+            ext: zip
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            artifact: sj-win32-arm64
+            ext: zip
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4 # v4.2.2
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: Build sj-cli release binary
+        run: cargo build --release -p sj-cli --target ${{ matrix.target }}
+      - name: Package CLI archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          mkdir -p dist-cli
+          cp target/${{ matrix.target }}/release/sj dist-cli/sj
+          tar -czf dist-cli/${{ matrix.artifact }}.${{ matrix.ext }} -C dist-cli sj
+      - name: Package CLI archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist-cli | Out-Null
+          Copy-Item target/${{ matrix.target }}/release/sj.exe dist-cli/sj.exe
+          Compress-Archive -Path dist-cli/sj.exe -DestinationPath dist-cli/${{ matrix.artifact }}.${{ matrix.ext }}
+      - uses: actions/upload-artifact@v4 # v4.4.3
+        with:
+          name: cli-${{ matrix.artifact }}
+          path: dist-cli/${{ matrix.artifact }}.${{ matrix.ext }}
+
+  desktop-installer-matrix:
+    name: Build Desktop Installers (${{ matrix.label }})
+    needs: [rust-cli-matrix, verify-tests]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: macos-universal
+            os: macos-15
+            cli_artifact: cli-sj-darwin-arm64
+            cli_artifact_x64: cli-sj-darwin-x64
+            eb_flags: "--mac --universal"
+          - label: linux-x64
+            os: ubuntu-24.04
+            cli_artifact: cli-sj-linux-x64
+            eb_flags: "--linux --x64"
+          - label: linux-arm64
+            os: ubuntu-24.04-arm
+            cli_artifact: cli-sj-linux-arm64
+            eb_flags: "--linux --arm64"
+          - label: windows-x64
+            os: windows-latest
+            cli_artifact: cli-sj-win32-x64
+            eb_flags: "--win --x64"
+          - label: windows-arm64
+            os: windows-latest
+            cli_artifact: cli-sj-win32-arm64
+            eb_flags: "--win --arm64"
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4 # v4.2.2
+      - uses: actions/setup-node@v4 # v4.1.0
+        with:
+          node-version: 22
+          cache: npm
+      - name: Install dependencies
+        run: npm ci
+      - name: Download matching Rust sj binary
+        uses: actions/download-artifact@v4 # v4.1.8
+        with:
+          name: ${{ matrix.cli_artifact }}
+          path: .tmp-cli/primary
+      - name: Download x64 Rust sj binary for macOS universal lipo
+        if: matrix.label == 'macos-universal'
+        uses: actions/download-artifact@v4 # v4.1.8
+        with:
+          name: ${{ matrix.cli_artifact_x64 }}
+          path: .tmp-cli/x64
+      - name: Stage universal sj binary on macOS
+        if: matrix.label == 'macos-universal'
+        run: |
+          mkdir -p apps/desktop/resources/bin .tmp-cli/arm64-bin .tmp-cli/x64-bin
+          tar -xzf .tmp-cli/primary/*.tar.gz -C .tmp-cli/arm64-bin
+          tar -xzf .tmp-cli/x64/*.tar.gz -C .tmp-cli/x64-bin
+          lipo -create .tmp-cli/arm64-bin/sj .tmp-cli/x64-bin/sj -output apps/desktop/resources/bin/sj
+          chmod +x apps/desktop/resources/bin/sj
+          file apps/desktop/resources/bin/sj
+      - name: Stage sj binary into apps/desktop/resources/bin (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          mkdir -p apps/desktop/resources/bin
+          tar -xzf .tmp-cli/primary/*.tar.gz -C apps/desktop/resources/bin
+          chmod +x apps/desktop/resources/bin/sj
+      - name: Stage sj binary into apps/desktop/resources/bin (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path apps/desktop/resources/bin | Out-Null
+          Expand-Archive -Path .tmp-cli/primary/*.zip -DestinationPath apps/desktop/resources/bin -Force
+      - name: Build UI & Electron main/preload
+        run: npm run desktop:build
+      - name: Package installers with electron-builder
+        # Optional code signing & notarization (unsigned community builds work when secrets are unset):
+        #   CSC_LINK: ${{ secrets.CSC_LINK }}
+        #   CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        #   APPLE_ID: ${{ secrets.APPLE_ID }}
+        #   APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+        #   APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: "false"
+        run: npx --workspace @spacejanitor/desktop electron-builder --config electron-builder.yml --publish never ${{ matrix.eb_flags }}
+      - uses: actions/upload-artifact@v4 # v4.4.3
+        with:
+          name: desktop-${{ matrix.label }}
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/*.AppImage
+            apps/desktop/release/*.deb
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.msi
+
+  publish-release:
+    name: Checksums & GitHub Release
+    needs: [verify-tests, rust-cli-matrix, desktop-installer-matrix]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4 # v4.1.8
+        with:
+          path: release-assets
+          merge-multiple: true
+      - name: Generate unified SHA256SUMS.txt
+        run: |
+          cd release-assets
+          sha256sum ./* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4 # v4.4.3
+        with:
+          name: release-checksums
+          path: release-assets/SHA256SUMS.txt
+      - name: Publish GitHub Release on tag push (skipped when dry_run=true)
+        if: startsWith(github.ref, 'refs/tags/v') && github.event_name == 'push' && inputs.dry_run != true
+        uses: softprops/action-gh-release@v2 # v2.1.0
+        with:
+          generate_release_notes: true
+          files: release-assets/*

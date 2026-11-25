@@ -1,8 +1,11 @@
 # Dependencies & build outputs
 node_modules/
 dist/
+dist-test/
 build/
 out/
+release/
+apps/desktop/resources/bin/
 target/
 coverage/
 

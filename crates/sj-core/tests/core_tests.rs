@@ -1,10 +1,10 @@
 use sj_core::{
-    orphans::{discover_nested_repos_exhaustive, inspect_orphans, OrphanOptions},
+    orphans::{discover_nested_repos_exhaustive, executable_config_key, inspect_orphans, OrphanOptions},
     plan::{
         build_remediation_plan, execute_plan_item, execute_plan_item_with_roots, ExecutionGate,
         PlanOptions,
     },
-    protect::{check_path_protection, ProtectionContext},
+    protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions, ScanStatus, ScanThresholds},
     trash::discover_trash_at,
     SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
@@ -2193,5 +2193,452 @@ fn staged_orphan_execution_preserves_relative_git_remote_and_worktree_gitdir() {
     assert!(
         stage_leftovers.is_empty(),
         "expected zero .sj-stage-* residue in workspaces, found: {stage_leftovers:?}"
+    );
+}
+
+
+#[test]
+fn shared_protect_vectors_match_node_implementation() {
+    use sj_core::protect::is_protected_path;
+    let raw = include_str!("fixtures/protect_vectors.json");
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let home = v["home"].as_str().unwrap();
+    for p in v["protected"].as_array().unwrap() {
+        let p = p.as_str().unwrap();
+        assert!(
+            is_protected_path(p, home, &[]).protected,
+            "shared vector expected protected: {p}"
+        );
+    }
+    for p in v["unprotected"].as_array().unwrap() {
+        let p = p.as_str().unwrap();
+        assert!(
+            !is_protected_path(p, home, &[]).protected,
+            "shared vector expected unprotected: {p}"
+        );
+    }
+}
+
+
+#[test]
+fn shared_descendant_vectors_match_node_implementation() {
+    let raw = include_str!("fixtures/descendant_vectors.json");
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    for case in v["cases"].as_array().unwrap() {
+        let name = case["name"].as_str().unwrap();
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&project).unwrap();
+        for entry in case["entries"].as_array().unwrap() {
+            let e = entry.as_str().unwrap();
+            if let Some(link) = e.strip_prefix("link:") {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink("/", project.join(link)).unwrap();
+            } else if let Some(dir) = e.strip_suffix('/') {
+                fs::create_dir_all(project.join(dir)).unwrap();
+            } else {
+                let f = project.join(e);
+                fs::create_dir_all(f.parent().unwrap()).unwrap();
+                fs::write(f, "x").unwrap();
+            }
+        }
+        let ctx = ProtectionContext::new(home, vec![]);
+        let verdict = check_dir_descendants_safe(&project, &ctx, 100_000);
+        let expect = case["protected"].as_bool().unwrap();
+        #[cfg(not(unix))]
+        if name.contains("symlink") {
+            continue;
+        }
+        assert_eq!(verdict.protected, expect, "descendant vector '{name}': {verdict:?}");
+    }
+}
+
+#[test]
+fn orphan_blocks_assume_unchanged_and_skip_worktree_entries() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    for (name, flag) in [
+        ("assume_repo", "--assume-unchanged"),
+        ("skip_repo", "--skip-worktree"),
+        ("control_repo", ""),
+    ] {
+        let bare_remote = remotes_dir.join(format!("{name}.git"));
+        fs::create_dir_all(&bare_remote).unwrap();
+        run_git(&bare_remote, &["init", "--bare"]);
+        let repo = workspace_dir.join(name);
+        run_git(&workspace_dir, &["clone", bare_remote.to_str().unwrap(), name]);
+        let file = format!("{name}.txt");
+        fs::write(repo.join(&file), "original\n").unwrap();
+        run_git(&repo, &["add", &file]);
+        run_git(&repo, &["commit", "-m", "init"]);
+        run_git(&repo, &["push", "-u", "origin", "HEAD"]);
+        if !flag.is_empty() {
+            run_git(&repo, &["update-index", flag, &file]);
+            fs::write(repo.join(&file), "UNCOMMITTED EDIT\n").unwrap();
+        }
+    }
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report.safe_to_prune.iter().any(|c| c.path.ends_with("control_repo")),
+        "control repo (clean, pushed, no flags) must stay safe: {:?}",
+        report.blocked
+    );
+    for name in ["assume_repo", "skip_repo"] {
+        assert!(
+            !report.safe_to_prune.iter().any(|c| c.path.ends_with(name)),
+            "{name} hides edits behind index flags and must not be safe_to_prune"
+        );
+        assert!(
+            report.blocked.iter().any(|b| b.path.ends_with(name)
+                && b.reasons.iter().any(|r| r == "index_flags_hide_changes")),
+            "{name} must be blocked with index_flags_hide_changes: {:?}",
+            report.blocked
+        );
+    }
+}
+
+
+#[cfg(unix)]
+#[test]
+fn orphan_scan_ignores_lying_fsmonitor_and_never_runs_repo_hooks() {
+    use std::os::unix::fs::PermissionsExt;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let remotes_dir = root.join("remotes");
+    let workspace_dir = root.join("workspaces");
+    fs::create_dir_all(&remotes_dir).unwrap();
+    fs::create_dir_all(&workspace_dir).unwrap();
+    let bare = remotes_dir.join("origin.git");
+    fs::create_dir_all(&bare).unwrap();
+    run_git(&bare, &["init", "--bare"]);
+    let repo = workspace_dir.join("fsm_repo");
+    run_git(&workspace_dir, &["clone", bare.to_str().unwrap(), "fsm_repo"]);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    run_git(&repo, &["add", "a.txt"]);
+    run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["push", "-u", "origin", "HEAD"]);
+
+    let marker = root.join("HOOK_RAN");
+    let hook = root.join("hook.sh");
+    fs::write(
+        &hook,
+        format!("#!/bin/sh\ntouch \"{}\"\nprintf 'token-1\\0'\n", marker.display()),
+    )
+    .unwrap();
+    fs::set_permissions(&hook, fs::Permissions::from_mode(0o755)).unwrap();
+    run_git(&repo, &["config", "core.fsmonitor", hook.to_str().unwrap()]);
+    run_git(&repo, &["config", "core.fsmonitorHookVersion", "2"]);
+    run_git(&repo, &["status"]);
+    run_git(&repo, &["status"]);
+    fs::write(repo.join("a.txt"), "UNCOMMITTED EDIT\n").unwrap();
+    let _ = fs::remove_file(&marker);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&workspace_dir, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(!marker.exists(), "repo fsmonitor hook must never run during a read-only scan");
+    assert!(
+        !report.safe_to_prune.iter().any(|c| c.path.ends_with("fsm_repo")),
+        "modified file hidden by a lying fsmonitor must block the prune"
+    );
+}
+
+/// Builds `<workspace>/<name>` as a clone of a fresh bare remote with one pushed commit.
+fn pushed_clone(root: &Path, workspace: &Path, name: &str) -> PathBuf {
+    let bare = root.join("remotes").join(format!("{name}.git"));
+    fs::create_dir_all(&bare).unwrap();
+    run_git(&bare, &["init", "--bare"]);
+    run_git(workspace, &["clone", bare.to_str().unwrap(), name]);
+    let repo = workspace.join(name);
+    fs::write(repo.join("a.txt"), "a\n").unwrap();
+    run_git(&repo, &["add", "a.txt"]);
+    run_git(&repo, &["commit", "-m", "init"]);
+    run_git(&repo, &["push", "-u", "origin", "HEAD"]);
+    repo
+}
+
+#[test]
+fn orphan_blocks_commits_held_only_by_tags_worktree_refs_bisect_refs_or_head_reflog() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let ws = root.join("workspaces");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(root.join("remotes")).unwrap();
+
+    let control = pushed_clone(root, &ws, "control");
+    let leave_local_commit = |repo: &Path| {
+        fs::write(repo.join("local.txt"), "only here\n").unwrap();
+        run_git(repo, &["add", "local.txt"]);
+        run_git(repo, &["commit", "-m", "local-only"]);
+    };
+    let back_to_pushed = |repo: &Path| run_git(repo, &["reset", "--hard", "@{upstream}"]);
+
+    let light = pushed_clone(root, &ws, "tag_light");
+    leave_local_commit(&light);
+    run_git(&light, &["tag", "keep-light"]);
+    back_to_pushed(&light);
+
+    let annotated = pushed_clone(root, &ws, "tag_annotated");
+    leave_local_commit(&annotated);
+    run_git(&annotated, &["tag", "-a", "keep-ann", "-m", "m"]);
+    back_to_pushed(&annotated);
+
+    let wref = pushed_clone(root, &ws, "ref_worktree");
+    leave_local_commit(&wref);
+    run_git(&wref, &["update-ref", "refs/worktree/keep", "HEAD"]);
+    back_to_pushed(&wref);
+
+    let bisect = pushed_clone(root, &ws, "ref_bisect");
+    leave_local_commit(&bisect);
+    run_git(&bisect, &["update-ref", "refs/bisect/bad", "HEAD"]);
+    back_to_pushed(&bisect);
+
+    let reflog = pushed_clone(root, &ws, "head_reflog");
+    let branch = {
+        let out = Command::new("git")
+            .args(["symbolic-ref", "--short", "HEAD"])
+            .current_dir(&reflog)
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    run_git(&reflog, &["checkout", "--detach"]);
+    leave_local_commit(&reflog);
+    run_git(&reflog, &["checkout", &branch]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&ws, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report.safe_to_prune.iter().any(|c| c.path.ends_with("control")),
+        "control must stay safe: {:?}",
+        report.blocked
+    );
+    for name in ["tag_light", "tag_annotated", "ref_worktree", "ref_bisect", "head_reflog"] {
+        assert!(
+            !report.safe_to_prune.iter().any(|c| c.path.ends_with(name)),
+            "{name} holds a commit nothing else references and must not be safe_to_prune"
+        );
+    }
+}
+
+#[test]
+fn orphan_blocks_main_repo_with_linked_worktrees_and_locked_linked_worktrees() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let ws = root.join("workspaces");
+    let outside = root.join("outside");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("remotes")).unwrap();
+
+    // main repo in the scan root, linked worktree OUTSIDE the scan root with staged work
+    let main_repo = pushed_clone(root, &ws, "owner_main");
+    let lw = outside.join("lw");
+    run_git(&main_repo, &["worktree", "add", "-b", "lwb", lw.to_str().unwrap()]);
+    fs::write(lw.join("staged.txt"), "staged work\n").unwrap();
+    run_git(&lw, &["add", "staged.txt"]);
+
+    // plain repo, no linked worktrees: control
+    let solo = pushed_clone(root, &ws, "solo");
+
+    // linked worktrees INSIDE the scan root: one locked, one not (control)
+    let home_main = pushed_clone(root, &outside, "elsewhere_main");
+    let locked = ws.join("locked_wt");
+    run_git(&home_main, &["worktree", "add", "-b", "lockb", locked.to_str().unwrap()]);
+    run_git(&locked, &["push", "-u", "origin", "lockb"]);
+    run_git(&home_main, &["worktree", "lock", locked.to_str().unwrap()]);
+    let free = ws.join("free_wt");
+    run_git(&home_main, &["worktree", "add", "-b", "freeb", free.to_str().unwrap()]);
+    run_git(&free, &["push", "-u", "origin", "freeb"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&ws, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(report.safe_to_prune.iter().any(|c| c.path.ends_with("solo")), "{:?}", report.blocked);
+    assert!(report.safe_to_prune.iter().any(|c| c.path.ends_with("free_wt")), "{:?}", report.blocked);
+    assert!(
+        !report.safe_to_prune.iter().any(|c| c.path.ends_with("owner_main")),
+        "a main repo that owns a linked worktree must not be prunable"
+    );
+    assert!(
+        !report.safe_to_prune.iter().any(|c| c.path.ends_with("locked_wt")),
+        "a locked worktree must not be prunable"
+    );
+    let _ = solo;
+}
+
+
+#[test]
+fn executable_config_keys_match_shared_vectors() {
+    let v: serde_json::Value =
+        serde_json::from_str(include_str!("fixtures/exec_config_keys.json")).unwrap();
+    for k in v["block"].as_array().unwrap() {
+        let k = k.as_str().unwrap();
+        assert!(executable_config_key(k).is_some(), "expected block: {k}");
+    }
+    for k in v["allow"].as_array().unwrap() {
+        let k = k.as_str().unwrap();
+        assert!(executable_config_key(k).is_none(), "expected allow: {k}");
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn orphan_scan_blocks_executable_repo_config_without_running_it() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let ws = root.join("workspaces");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(root.join("remotes")).unwrap();
+    type Arm = fn(&Path, &Path);
+    let arms: Vec<(&str, Arm)> = vec![
+        ("uploadpack", |repo, marker| {
+            run_git(repo, &["config", "remote.origin.uploadpack", &format!("touch {}; git-upload-pack", marker.display())]);
+        }),
+        ("sshcommand", |repo, marker| {
+            run_git(repo, &["config", "remote.origin.url", "ssh://example.invalid/x.git"]);
+            run_git(repo, &["config", "core.sshCommand", &format!("touch {}; false", marker.display())]);
+        }),
+        ("cleanfilter", |repo, marker| {
+            fs::write(repo.join(".gitattributes"), "*.txt filter=evil\n").unwrap();
+            run_git(repo, &["add", ".gitattributes"]);
+            run_git(repo, &["commit", "-m", "attr"]);
+            run_git(repo, &["push"]);
+            run_git(repo, &["config", "filter.evil.clean", &format!("touch {}; cat", marker.display())]);
+            let _ = Command::new("touch").args(["-t", "202001010000"]).arg(repo.join("a.txt")).status();
+        }),
+        ("gitproxy", |repo, marker| {
+            run_git(repo, &["config", "remote.origin.url", "git://127.0.0.1:9/x.git"]);
+            run_git(repo, &["config", "core.gitProxy", &format!("touch {}", marker.display())]);
+        }),
+        ("credential", |repo, marker| {
+            run_git(repo, &["config", "credential.helper", &format!("!touch {}", marker.display())]);
+        }),
+    ];
+    for (name, arm) in arms {
+        let repo = pushed_clone(root, &ws, name);
+        let marker = root.join(format!("MARK_{name}"));
+        arm(&repo, &marker);
+        let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+        let report = inspect_orphans(&ws, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+        assert!(!marker.exists(), "{name}: repo config command ran during a read-only scan");
+        assert!(
+            !report.safe_to_prune.iter().any(|c| c.path.ends_with(name)),
+            "{name}: must not be safe_to_prune"
+        );
+        assert!(
+            report.blocked.iter().any(|b| b.path.ends_with(name)
+                && b.reasons.iter().any(|r| r.starts_with("repo_config_can_execute"))),
+            "{name}: expected repo_config_can_execute: {:?}",
+            report.blocked
+        );
+        let _ = fs::remove_dir_all(&repo);
+    }
+}
+
+#[test]
+fn orphan_proof_is_fast_with_thousands_of_remote_pull_refs_and_agrees_on_remote_tags() {
+    use std::time::Instant;
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let ws = root.join("workspaces");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(root.join("remotes")).unwrap();
+
+    // 2,000 refs/pull/* on the remote (as GitHub exposes them) must not slow the proof down
+    let perf = pushed_clone(root, &ws, "perf_pull_refs");
+    let bare = root.join("remotes").join("perf_pull_refs.git");
+    let sha = {
+        let out = Command::new("git").args(["rev-parse", "HEAD"]).current_dir(&perf).output().unwrap();
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+    let mut cmds = String::new();
+    for i in 0..2000 {
+        cmds.push_str(&format!("create refs/pull/{i}/head {sha}\n"));
+    }
+    let mut child = Command::new("git")
+        .args(["update-ref", "--stdin"])
+        .current_dir(&bare)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    {
+        use std::io::Write;
+        child.stdin.take().unwrap().write_all(cmds.as_bytes()).unwrap();
+    }
+    assert!(child.wait().unwrap().success());
+    // an amended commit + five pushed tags on a commit on no branch
+    fs::write(perf.join("b.txt"), "b\n").unwrap();
+    run_git(&perf, &["add", "b.txt"]);
+    run_git(&perf, &["commit", "-m", "to-amend"]);
+    run_git(&perf, &["commit", "--amend", "-m", "amended"]);
+    run_git(&perf, &["push", "origin", "HEAD"]);
+
+    // a commit that is on no branch but IS held by a tag pushed to the remote: SAFE
+    let tagged = pushed_clone(root, &ws, "remote_tag_only");
+    run_git(&tagged, &["checkout", "--detach"]);
+    fs::write(tagged.join("t.txt"), "t\n").unwrap();
+    run_git(&tagged, &["add", "t.txt"]);
+    run_git(&tagged, &["commit", "-m", "tagged-only"]);
+    run_git(&tagged, &["tag", "pushed-tag"]);
+    run_git(&tagged, &["push", "origin", "pushed-tag"]);
+    run_git(&tagged, &["checkout", "-"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let t0 = Instant::now();
+    let report = inspect_orphans(&ws, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    let elapsed = t0.elapsed().as_secs_f64();
+    assert!(elapsed < 20.0, "proof took {elapsed:.1}s with 2,000 refs/pull refs (budget 20s)");
+    assert!(
+        report.safe_to_prune.iter().any(|c| c.path.ends_with("remote_tag_only")),
+        "a commit held by a tag pushed to the remote is safe: {:?}",
+        report.blocked
+    );
+}
+
+#[test]
+fn orphan_linked_worktree_ignores_reflog_only_commits_held_by_surviving_branch_reflogs() {
+    let tmp = tempdir().unwrap();
+    let root = tmp.path();
+    let ws = root.join("workspaces");
+    let outside = root.join("outside");
+    fs::create_dir_all(&ws).unwrap();
+    fs::create_dir_all(&outside).unwrap();
+    fs::create_dir_all(root.join("remotes")).unwrap();
+    let main_repo = pushed_clone(root, &outside, "main_repo");
+    let lw = ws.join("amended_wt");
+    run_git(&main_repo, &["worktree", "add", "-b", "amendb", lw.to_str().unwrap()]);
+    fs::write(lw.join("x.txt"), "x\n").unwrap();
+    run_git(&lw, &["add", "x.txt"]);
+    run_git(&lw, &["commit", "-m", "first"]);
+    run_git(&lw, &["commit", "--amend", "-m", "second"]);
+    run_git(&lw, &["push", "-u", "origin", "amendb"]);
+
+    // control: a detached commit abandoned in the worktree's own HEAD reflog must still block
+    let lost = ws.join("detached_wt");
+    run_git(&main_repo, &["worktree", "add", "-b", "lostb", lost.to_str().unwrap()]);
+    run_git(&lost, &["push", "-u", "origin", "lostb"]);
+    run_git(&lost, &["checkout", "--detach"]);
+    fs::write(lost.join("y.txt"), "y\n").unwrap();
+    run_git(&lost, &["add", "y.txt"]);
+    run_git(&lost, &["commit", "-m", "abandoned"]);
+    run_git(&lost, &["checkout", "lostb"]);
+
+    let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
+    let report = inspect_orphans(&ws, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
+    assert!(
+        report.safe_to_prune.iter().any(|c| c.path.ends_with("amended_wt")),
+        "an amend-before-push must not block forever: {:?}",
+        report.blocked
+    );
+    assert!(
+        !report.safe_to_prune.iter().any(|c| c.path.ends_with("detached_wt")),
+        "an abandoned detached commit held only by this worktree's HEAD reflog must still block"
     );
 }

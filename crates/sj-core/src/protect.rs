@@ -1,8 +1,27 @@
 use std::io::ErrorKind;
 use std::path::{Component, Path, PathBuf};
 
-pub const PROTECTED_HOME_SUBPATHS: &[&str] =
-    &[".ssh", ".gnupg", ".aws", ".kube", ".claude", ".config/gh"];
+pub const PROTECTED_HOME_SUBPATHS: &[&str] = &[
+    ".ssh",
+    ".gnupg",
+    ".aws",
+    ".kube",
+    ".claude",
+    ".config/gh",
+    "Library",
+    "AppData",
+];
+
+/// Cache carve-outs inside the blanket-protected `Library` / `AppData` subtrees. Only these exact
+/// subtrees (and their children) may be proposed for cleanup. Keep in sync with
+/// `homeAllowSubpaths` in packages/core/src/protect.mjs.
+pub const PROTECTED_HOME_ALLOW_SUBPATHS: &[&str] = &[
+    "Library/Caches/Homebrew",
+    "Library/Caches/pip",
+    "Library/Caches/pnpm",
+    "AppData/Local/npm-cache",
+    "AppData/Local/pip/Cache",
+];
 
 pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "/System",
@@ -15,6 +34,10 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "/private/var/db",
     "/Windows",
     "C:/Windows",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
 ];
 
 const PROTECTED_VM_EXTENSIONS: &[&str] = &["vmdk", "qcow2", "vhdx", "vdi", "raw", "img"];
@@ -209,6 +232,12 @@ pub fn is_protected_path(
         return ProtectionVerdict::deny("protected_root");
     }
 
+    // Fail closed on filesystem alias roots (macOS /.nofollow, /.vol, /.resolve, /.file, ...):
+    // any root-level dot entry is a magic alias for the whole tree, never a cleanup target.
+    if cand.starts_with("/.") {
+        return ProtectionVerdict::deny("protected_alias_root");
+    }
+
     let cand_low = cand.to_ascii_lowercase();
 
     for sys_root in PROTECTED_SYSTEM_ROOTS {
@@ -224,6 +253,16 @@ pub fn is_protected_path(
         for sub in PROTECTED_HOME_SUBPATHS {
             let full_low = format!("{home_low}/{sub}").to_ascii_lowercase();
             if cand_low == full_low || cand_low.starts_with(&format!("{full_low}/")) {
+                let allowed = PROTECTED_HOME_ALLOW_SUBPATHS.iter().any(|a| {
+                    if !a.starts_with(&format!("{sub}/")) {
+                        return false;
+                    }
+                    let allow_low = format!("{home_low}/{a}").to_ascii_lowercase();
+                    cand_low == allow_low || cand_low.starts_with(&format!("{allow_low}/"))
+                });
+                if allowed {
+                    continue;
+                }
                 return ProtectionVerdict::deny(format!("protected_credential_store:~/{sub}"));
             }
         }
@@ -243,7 +282,7 @@ pub fn is_protected_path(
                 let seg_low = seg.to_ascii_lowercase();
                 if matches!(
                     seg_low.as_str(),
-                    ".ssh" | ".gnupg" | ".aws" | ".kube" | ".claude"
+                    ".ssh" | ".gnupg" | ".aws" | ".kube"
                 ) {
                     return ProtectionVerdict::deny(format!("protected_credential_dir:{seg}"));
                 }
