@@ -27,7 +27,7 @@ for (const c of vectors.cases) {
     try {
       const home = path.join(base, "home");
       fs.mkdirSync(home);
-      const project = path.join(base, "project");
+      const project = path.join(home, "project");
       build(project, c.entries);
       const found = findProtectedDescendant(project, { homeDir: home });
       assert.equal(found.protected, c.protected, JSON.stringify(found));
@@ -47,7 +47,7 @@ test("R7-B22: a descendant that becomes protected AFTER planning is caught at au
   try {
     const home = path.join(base, "home");
     fs.mkdirSync(home);
-    const project = path.join(base, "project");
+    const project = path.join(home, "project");
     build(project, ["src/", "src/main.rs"]);
     const plan = createRemediationPlan([{ id: "p", path: project, bytes: 1, kind: "dir" }], { homeDir: home });
     assert.equal(plan.items.length, 1);
@@ -66,7 +66,7 @@ test("R7-B22: an unreadable or oversized subtree fails closed", { skip: process.
   try {
     const home = path.join(base, "home");
     fs.mkdirSync(home);
-    const project = path.join(base, "project");
+    const project = path.join(home, "project");
     build(project, ["a/", "a/f1", "a/f2", "a/f3"]);
     assert.equal(findProtectedDescendant(project, { homeDir: home, maxEntries: 2 }).protected, true);
     fs.chmodSync(path.join(project, "a"), 0o000);
