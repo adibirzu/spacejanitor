@@ -424,6 +424,35 @@ function stripUrlPaths(text) {
   return { text: out, risky };
 }
 
+// Pull HTTP headers out of argv (`--header "N: v"`, `--header=N:v`, `-H "N: v"`, `-H"N: v"`) so their
+// values are never printed. Returns the argv without the values plus [name, value] pairs.
+function extractHeaderArgs(args) {
+  const rest = [];
+  const headers = [];
+  const take = (raw) => {
+    const text = String(raw);
+    const i = text.indexOf(":");
+    if (i === -1) headers.push([text.trim(), ""]);
+    else headers.push([text.slice(0, i).trim(), text.slice(i + 1).trim()]);
+  };
+  for (let i = 0; i < args.length; i++) {
+    const a = String(args[i]);
+    if (a === "--header" || a === "-H" || a === "--headers") {
+      if (i + 1 < args.length) take(args[++i]);
+      rest.push(a);
+    } else if (a.startsWith("--header=")) {
+      take(a.slice("--header=".length));
+      rest.push("--header");
+    } else if (a.startsWith("-H") && a.length > 2 && !a.startsWith("--")) {
+      take(a.slice(2));
+      rest.push("-H");
+    } else {
+      rest.push(a);
+    }
+  }
+  return { rest, headers };
+}
+
 function parseTomlMcpServers(tomlText) {
   const servers = {};
   let current = null;
@@ -480,11 +509,14 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
   const recordServer = (name, cfg, sourceFile) => {
     const count = (seenNames.get(name) || 0) + 1;
     seenNames.set(name, count);
-    const argsList = Array.isArray(cfg?.args) ? cfg.args.map(String) : [];
+    const rawArgs = Array.isArray(cfg?.args) ? cfg.args.map(String) : [];
+    const { rest: argsList, headers: argHeaders } = extractHeaderArgs(rawArgs);
     // Header VALUES are never emitted: names only. A header whose name or value looks credential-like
     // flags the server as secret-risky.
-    const headerEntries =
-      cfg?.headers && typeof cfg.headers === "object" ? Object.entries(cfg.headers) : [];
+    const headerEntries = [
+      ...(cfg?.headers && typeof cfg.headers === "object" ? Object.entries(cfg.headers) : []),
+      ...argHeaders,
+    ];
     const headerNames = headerEntries.map(([k]) => redactFn(String(k)));
     const headerHasSecret = headerEntries.some(
       ([k, v]) =>
@@ -582,6 +614,8 @@ export async function collectCleanableCaches({ homeDir = os.homedir(), isProtect
     path.join(homeDir, "Library", "Caches", "Homebrew"),
     path.join(homeDir, "Library", "Caches", "pip"),
     path.join(homeDir, "Library", "Caches", "pnpm"),
+    path.join(homeDir, "AppData", "Local", "npm-cache"),
+    path.join(homeDir, "AppData", "Local", "pip", "Cache"),
     path.join(homeDir, ".cargo", "registry", "cache"),
     path.join(homeDir, ".gradle", "caches"),
   ];

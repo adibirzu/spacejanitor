@@ -53,6 +53,16 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
   ]),
   // Account roots whose children belong to some other user unless they sit under the current home.
   foreignHomeRoots: Object.freeze(["/Users", "/home", "C:/Users"]),
+  // Explicit cache carve-outs inside otherwise blanket-protected home subtrees (Library, AppData).
+  // Only these exact subtrees (and their children) may be offered for cleanup; every other path under
+  // the blanket entry stays denied. Keep in sync with crates/sj-core/src/protect.rs.
+  homeAllowSubpaths: Object.freeze([
+    "Library/Caches/Homebrew",
+    "Library/Caches/pip",
+    "Library/Caches/pnpm",
+    "AppData/Local/npm-cache",
+    "AppData/Local/pip/Cache",
+  ]),
   homeSubpaths: Object.freeze([
     ".ssh",
     ".gnupg",
@@ -119,8 +129,6 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
     "*/.aws/*",
     "*/.kube",
     "*/.kube/*",
-    "*/.claude",
-    "*/.claude/*",
     "*/.config/gh",
     "*/.config/gh/*",
   ]),
@@ -145,7 +153,7 @@ const WIN_DRIVE_RE = /^[A-Za-z]:[\\/]/;
 // Resolve a path the way the OS does: components left to right, a symlink is replaced by its
 // target before a following ".." is applied (so "link/.." is the parent of the link TARGET).
 // Nonexistent tails are appended lexically.
-function resolveOsStyle(absPath) {
+function resolveOsStyle(absPath, { strict = false } = {}) {
   const root = path.parse(absPath).root;
   const comps = absPath.slice(root.length).split(/[\\/]+/);
   let cur = root;
@@ -158,16 +166,22 @@ function resolveOsStyle(absPath) {
     }
     const next = path.join(cur, comp);
     if (exists) {
+      let present = true;
       try {
         fs.lstatSync(next);
+      } catch {
+        present = false;
+        exists = false;
+      }
+      if (present) {
         try {
           cur = (fs.realpathSync.native || fs.realpathSync)(next);
         } catch {
+          // dangling or looping symlink: the OS target is unknowable, so a candidate fails closed
+          if (strict) throw new Error("unresolvable_path");
           cur = next;
         }
         continue;
-      } catch {
-        exists = false;
       }
     }
     cur = next;
@@ -175,7 +189,7 @@ function resolveOsStyle(absPath) {
   return cur;
 }
 
-function normalizePath(rawPath, homeDir = os.homedir(), { resolveSymlinks = true } = {}) {
+function normalizePath(rawPath, homeDir = os.homedir(), { resolveSymlinks = true, strict = false } = {}) {
   const expanded = expandHome(String(rawPath).trim(), homeDir);
   if (!expanded) return "";
   let out;
@@ -184,7 +198,7 @@ function normalizePath(rawPath, homeDir = os.homedir(), { resolveSymlinks = true
     out = path.posix.normalize(expanded.replace(/\\/g, "/"));
   } else {
     const abs = path.isAbsolute(expanded) ? expanded : path.resolve(expanded);
-    out = resolveSymlinks ? resolveOsStyle(abs) : path.resolve(abs);
+    out = resolveSymlinks ? resolveOsStyle(abs, { strict }) : path.resolve(abs);
   }
   out = out.replace(/\\/g, "/").replace(/\/+$/, "") || "/";
   // macOS APFS Data volume is the same tree as "/": strip the alias (mirrors sj-core protect.rs).
@@ -219,7 +233,19 @@ function globToRegExp(globPattern) {
  * lexical form of the candidate, so neither a symlink nor a case variant can slip past the denylist.
  */
 export function isProtectedPath(candidatePath, options = {}) {
+  try {
+    return evaluateProtection(candidatePath, options);
+  } catch {
+    // Fail closed: any unexpected error while judging a path means "protected".
+    return { protected: true, reason: "protection_check_error" };
+  }
+}
+
+function evaluateProtection(candidatePath, options = {}) {
   const raw = String(candidatePath || "").trim();
+  if (/[\u0000-\u001f\u007f]/.test(raw)) {
+    return { protected: true, reason: "control_character_in_path" };
+  }
   if (!raw) {
     return { protected: true, reason: "empty_path" };
   }
@@ -241,7 +267,7 @@ export function isProtectedPath(candidatePath, options = {}) {
   const lexicalHome = normalizePath(homeDir, homeDir, { resolveSymlinks: false });
   const homes = [...new Set([normalizedHome, lexicalHome])];
   const homeParent = normalizePath(path.dirname(normalizedHome), homeDir, { resolveSymlinks: false });
-  const realCand = normalizePath(raw, homeDir);
+  const realCand = normalizePath(raw, homeDir, { strict: true });
   if (!realCand) {
     return { protected: true, reason: "empty_path" };
   }
@@ -306,6 +332,16 @@ export function isProtectedPath(candidatePath, options = {}) {
         ]),
       ];
       if (forms.some((f) => anyUnder(f))) {
+        // Carve-out: allowed only if EVERY form of the candidate (real and lexical) sits under an
+        // allow-listed subtree. Allow roots are built textually from the home (never by resolving the
+        // leaf), so a symlink inside an allowed cache cannot launder a sensitive target.
+        const allowRoots = DEFAULT_PROTECTED_PATTERNS.homeAllowSubpaths
+          .filter((a) => a.startsWith(`${sub}/`))
+          .flatMap((a) => homes.map((hh) => `${hh}/${a}`.toLowerCase()));
+        const allowed =
+          allowRoots.length > 0 &&
+          cands.every((c) => allowRoots.some((r) => isSameOrChild(c, r, true)));
+        if (allowed) continue;
         return { protected: true, reason: `protected_credential_store:~/${sub}` };
       }
     }

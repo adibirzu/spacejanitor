@@ -14,7 +14,6 @@
     "/Users/alice/a/../.ssh/id_x",
     "/data/proj/.aws/credentials",
     "/data/proj/.kube",
-    "/data/proj/.claude/x",
     "/Users/alice/proj/.env",
     "/Users/alice/proj/.env.production",
     "/Users/alice/certs/server.pem",
@@ -58,7 +57,16 @@
     "/proc/self/root/Users/alice/.ssh",
     "/sys/kernel",
     "/dev/disk0",
-    "/boot/vmlinuz"
+    "/boot/vmlinuz",
+    "/Users/alice/Library/Keychains/login.keychain-db",
+    "/Users/alice/Library/Mail/V10/x",
+    "/Users/alice/Library/Messages/chat.db",
+    "/Users/alice/Library/Application Support/Slack/Cookies",
+    "/Users/alice/Library/Caches",
+    "/Users/alice/Library/Caches/com.apple.Safari/x",
+    "/Users/alice/Library/Caches/Homebrew/../../Keychains/login.keychain-db",
+    "/Users/alice/Library/Caches/HomebrewEvil/x",
+    "/Users/alice/.claude/worktrees/w1/src/x"
   ],
   "unprotected": [
     "/Users/alice/.cache/npm",
@@ -68,6 +76,14 @@
     "/Users/alice/.npm/_cacache",
     "/tmp/build-123",
     "/var/folders/ab/cd/T/sj-tmp",
-    "/System/Volumes/Data/Users/alice/.cache/npm"
+    "/System/Volumes/Data/Users/alice/.cache/npm",
+    "/Users/alice/Library/Caches/Homebrew",
+    "/Users/alice/Library/Caches/Homebrew/downloads/x.tar.gz",
+    "/Users/alice/Library/Caches/pip",
+    "/Users/alice/Library/Caches/pip/wheels/x",
+    "/Users/alice/Library/Caches/pnpm",
+    "/Users/alice/Library/Caches/pnpm/store/x",
+    "/data/proj/.claude/x",
+    "/Users/alice/proj/.claude/worktrees/wt1/src/main.rs"
   ]
 }

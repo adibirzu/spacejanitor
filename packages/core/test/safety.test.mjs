@@ -351,3 +351,55 @@ test("R4-B15: drive-letter strings fail closed on POSIX hosts unless Windows sem
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("R5-B18: allow-listed cache subpaths under Library/AppData are accepted; sensitive siblings stay denied", () => {
+  const home = "/Users/alice";
+  const o = { homeDir: home };
+  for (const ok of ["Library/Caches/Homebrew", "Library/Caches/pip/wheels", "Library/Caches/pnpm", "AppData/Local/npm-cache", "AppData/Local/pip/Cache"]) {
+    assert.equal(isProtectedPath(`${home}/${ok}`, o).protected, false, `expected accepted: ${ok}`);
+  }
+  for (const bad of ["Library", "Library/Caches", "Library/Keychains", "Library/Mail", "Library/Messages", "Library/Application Support/Slack", "Library/Caches/com.apple.Safari", "Library/Caches/Homebrew/../../Keychains", "AppData", "AppData/Roaming/Mozilla", "AppData/Local/Microsoft/Credentials", "AppData/Local/Temp"]) {
+    assert.equal(isProtectedPath(`${home}/${bad}`, o).protected, true, `expected denied: ${bad}`);
+  }
+});
+
+test("R5-B18: a symlink inside an allow-listed cache that points at a sensitive dir is still denied", () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r5b18-")));
+  try {
+    fs.mkdirSync(path.join(home, "Library", "Caches"), { recursive: true });
+    fs.mkdirSync(path.join(home, "Library", "Keychains"));
+    fs.symlinkSync(path.join(home, "Library", "Keychains"), path.join(home, "Library", "Caches", "pip"));
+    assert.equal(isProtectedPath(path.join(home, "Library", "Caches", "pip", "x"), { homeDir: home }).protected, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("R5-N2: NUL/control characters and dangling or looping symlinks fail closed", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r5n2-")));
+  try {
+    const home = path.join(base, "home");
+    fs.mkdirSync(path.join(home, ".cache"), { recursive: true });
+    assert.equal(isProtectedPath(`${home}/.cache/a\u0000b`, { homeDir: home }).protected, true);
+    assert.equal(isProtectedPath(`${home}/.cache/a\nb`, { homeDir: home }).protected, true);
+    fs.symlinkSync(path.join(base, "nowhere"), path.join(home, ".cache", "dangling"));
+    fs.symlinkSync(path.join(home, ".cache", "loop2"), path.join(home, ".cache", "loop1"));
+    fs.symlinkSync(path.join(home, ".cache", "loop1"), path.join(home, ".cache", "loop2"));
+    assert.equal(isProtectedPath(path.join(home, ".cache", "dangling"), { homeDir: home }).protected, true);
+    assert.equal(isProtectedPath(path.join(home, ".cache", "dangling", "x"), { homeDir: home }).protected, true);
+    assert.equal(isProtectedPath(path.join(home, ".cache", "loop1"), { homeDir: home }).protected, true);
+    // a dangling symlink among the ROOTS (e.g. ~/.npmrc) must not block unrelated cleanups
+    fs.symlinkSync(path.join(base, "nowhere2"), path.join(home, ".npmrc"));
+    fs.mkdirSync(path.join(home, ".cache", "vite"));
+    assert.equal(isProtectedPath(path.join(home, ".cache", "vite"), { homeDir: home }).protected, false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R5-N4: only the real Claude home config is protected, not project .claude dirs or Claude Code worktrees", () => {
+  const o = { homeDir: "/Users/alice" };
+  assert.equal(isProtectedPath("/Users/alice/.claude/settings.json", o).protected, true);
+  assert.equal(isProtectedPath("/Users/alice/proj/.claude/worktrees/wt1", o).protected, false);
+  assert.equal(isProtectedPath("/data/repo/.claude/worktrees/wt1/src/x.rs", o).protected, false);
+});

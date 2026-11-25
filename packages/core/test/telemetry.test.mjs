@@ -14,6 +14,7 @@ import {
   collectTrash,
   collectMcpAudit,
   collectSummary,
+  collectCleanableCaches,
   createRemediationPlan,
   verifyRemediationGate,
   validateLoopbackSlmUrl,
@@ -414,5 +415,58 @@ test("R4-B16: collectMcpAudit prints header names only, never header values", as
     assert.equal(srv.hasSecretRisk, true);
   } finally {
     fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("R5-B17: mcp-audit prints header names only for every args-based header form (JSON and TOML)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r5-"));
+  const V = (t) => `FAKEVAL-${t}-0123456789abcdef`;
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          sep: { command: "npx", args: ["-y", "mcp-remote", "https://mcp.example.com/sse", "--header", `X-Custom: ${V("sep")}`] },
+          eq: { command: "npx", args: ["mcp-remote", "https://mcp.example.com/sse", `--header=X-Tenant:${V("eq")}`] },
+          short: { command: "x", args: ["-H", `X-Sess: ${V("short")}`] },
+          glued: { command: "x", args: [`-HX-Glued: ${V("glued")}`] },
+          multi: { command: "x", args: ["--header", `A-One: ${V("m1")}`, "--header", `B-Two: ${V("m2")}`] },
+        },
+      })
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, "config.toml"),
+      `[mcp_servers.tomlhdr]\ncommand = "npx"\nargs = ["mcp-remote", "https://mcp.example.com/sse", "--header", "X-Toml: ${V("toml")}"]\n`
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const text = JSON.stringify(audit);
+    for (const t of ["sep", "eq", "short", "glued", "m1", "m2", "toml"]) {
+      assert.equal(text.includes(V(t)), false, `header value leaked: ${t}`);
+    }
+    assert.equal(audit.totalServers, 6);
+    const by = Object.fromEntries(audit.servers.map((s) => [s.name, s]));
+    assert.deepEqual(by.sep.headerNames, ["X-Custom"]);
+    assert.deepEqual(by.eq.headerNames, ["X-Tenant"]);
+    assert.deepEqual(by.short.headerNames, ["X-Sess"]);
+    assert.deepEqual(by.glued.headerNames, ["X-Glued"]);
+    assert.deepEqual(by.multi.headerNames, ["A-One", "B-Two"]);
+    assert.deepEqual(by.tomlhdr.headerNames, ["X-Toml"]);
+    for (const s of audit.servers) assert.equal(s.hasSecretRisk, true, s.name);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("R5-B18: collectCleanableCaches offers the macOS Library/Caches targets", async () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-caches-")));
+  try {
+    for (const rel of ["Library/Caches/Homebrew", "Library/Caches/pip", "Library/Caches/pnpm", ".npm/_cacache", "Library/Keychains"]) {
+      fs.mkdirSync(path.join(home, rel), { recursive: true });
+      fs.writeFileSync(path.join(home, rel, "f"), "x");
+    }
+    const found = (await collectCleanableCaches({ homeDir: home })).map((c) => path.relative(home, c.path)).sort();
+    assert.deepEqual(found, [".npm/_cacache", "Library/Caches/Homebrew", "Library/Caches/pip", "Library/Caches/pnpm"]);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
   }
 });

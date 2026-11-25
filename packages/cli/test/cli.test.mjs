@@ -81,7 +81,7 @@ test("R2-B8: SPACEJANITOR_NO_SJ=1 forces the Node fallback even when a Rust sj b
     const canExecShebang = process.platform !== "win32";
     if (canExecShebang) fs.writeFileSync(fake, '#!/bin/sh\necho \'{"schema":"spacejanitor.storage.v1","status":"OK"}\'\n', { mode: 0o755 });
     if (canExecShebang) {
-      const viaSj = JSON.parse(runCli(["disk", "--json"], { SPACEJANITOR_SJ_BIN: fake }));
+      const viaSj = JSON.parse(runCli(["disk", "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_NO_SJ: "" }));
       assert.equal(viaSj.schema, "spacejanitor.storage.v1");
     }
     const hermetic = JSON.parse(runCli(["disk", "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_NO_SJ: "1" }));
