@@ -393,3 +393,26 @@ test("R3-B12: collectMcpAudit never prints URL paths/queries (secret-in-path) an
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("R4-B16: collectMcpAudit prints header names only, never header values", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r4-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({
+        mcpServers: {
+          hdr: { url: "https://mcp.example.com/sse", headers: { "X-Honeycomb-Team": "hcSecretValue0123456789", "X-Custom-Thing": "customSecretVal99" } },
+        },
+      })
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const text = JSON.stringify(audit);
+    assert.equal(text.includes("hcSecretValue0123456789"), false);
+    assert.equal(text.includes("customSecretVal99"), false);
+    const srv = audit.servers[0];
+    assert.deepEqual(srv.headerNames, ["X-Honeycomb-Team", "X-Custom-Thing"]);
+    assert.equal(srv.hasSecretRisk, true);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

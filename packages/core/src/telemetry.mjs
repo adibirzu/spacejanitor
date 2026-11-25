@@ -481,11 +481,18 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
     const count = (seenNames.get(name) || 0) + 1;
     seenNames.set(name, count);
     const argsList = Array.isArray(cfg?.args) ? cfg.args.map(String) : [];
-    const headerList =
-      cfg?.headers && typeof cfg.headers === "object"
-        ? Object.entries(cfg.headers).map(([k, v]) => `${k}: ${v}`)
-        : [];
-    const combinedRaw = [cfg?.url ? String(cfg.url) : "", ...argsList, ...headerList]
+    // Header VALUES are never emitted: names only. A header whose name or value looks credential-like
+    // flags the server as secret-risky.
+    const headerEntries =
+      cfg?.headers && typeof cfg.headers === "object" ? Object.entries(cfg.headers) : [];
+    const headerNames = headerEntries.map(([k]) => redactFn(String(k)));
+    const headerHasSecret = headerEntries.some(
+      ([k, v]) =>
+        /KEY|TOKEN|SECRET|PASSWORD|AUTH|COOKIE|SIGN|TEAM|CRED/i.test(String(k)) ||
+        redactFn(String(v)) !== String(v) ||
+        /[A-Za-z0-9_-]{16,}/.test(String(v))
+    );
+    const combinedRaw = [cfg?.url ? String(cfg.url) : "", ...argsList]
       .filter(Boolean)
       .join(" ");
     const safeName = redactFn(String(name));
@@ -500,6 +507,7 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
     );
     const hasSecretRisk =
       stripped.risky ||
+      headerHasSecret ||
       redactedArgs !== combinedRaw ||
       redactedCommand !== rawCommand ||
       safeName !== String(name) ||
@@ -511,6 +519,7 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
       name: safeName,
       command: redactedCommand,
       argsRedacted: redactedArgs,
+      headerNames,
       duplicateCount: count,
       hasSecretRisk,
       sourceFile: redactFn(String(sourceFile)),

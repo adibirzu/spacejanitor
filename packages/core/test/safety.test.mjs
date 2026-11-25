@@ -244,12 +244,13 @@ test("R2-B7: redactSecrets handles JSON-quoted keys and stays linear on long inp
 
 test("R3-B9: Windows-style home is not swallowed by a C:/Users root; foreign Windows homes stay protected", () => {
   const home = "C:/Users/runner";
-  assert.equal(isProtectedPath("C:/Users/runner/.cache/vite", { homeDir: home }).protected, false);
-  assert.equal(isProtectedPath("C:\\Users\\runner\\.cache\\vite", { homeDir: home }).protected, false);
-  assert.equal(isProtectedPath("C:/Users", { homeDir: home }).protected, true);
-  assert.equal(isProtectedPath("C:/Users/alice/.cache/x", { homeDir: home }).protected, true);
-  assert.equal(isProtectedPath("C:/Users/runner/.SSH/id", { homeDir: home }).protected, true);
-  assert.equal(isProtectedPath("C:/Windows/System32", { homeDir: home }).protected, true);
+  const o = { homeDir: home, windowsSemantics: true };
+  assert.equal(isProtectedPath("C:/Users/runner/.cache/vite", o).protected, false);
+  assert.equal(isProtectedPath("C:\\Users\\runner\\.cache\\vite", o).protected, false);
+  assert.equal(isProtectedPath("C:/Users", o).protected, true);
+  assert.equal(isProtectedPath("C:/Users/alice/.cache/x", o).protected, true);
+  assert.equal(isProtectedPath("C:/Users/runner/.SSH/id", o).protected, true);
+  assert.equal(isProtectedPath("C:/Windows/System32", o).protected, true);
 });
 
 test("R3-B10: symlink followed by '..' is resolved the way the OS does (symlink first, then parent)", () => {
@@ -299,5 +300,51 @@ test("R3-B12: redactSecrets covers underscore and single-dash credential flags, 
     const t0 = Date.now();
     redactSecrets(s);
     assert.ok(Date.now() - t0 < 1000, "redactSecrets slow on dash-heavy input");
+  }
+});
+
+test("R4: shared Rust/Node protect vectors (crates/sj-core/tests/fixtures/protect_vectors.json)", { skip: process.platform === "win32" }, () => {
+  const vectors = JSON.parse(
+    fs.readFileSync(new URL("../../../crates/sj-core/tests/fixtures/protect_vectors.json", import.meta.url), "utf8")
+  );
+  const opts = { homeDir: vectors.home };
+  for (const p of vectors.protected) {
+    assert.equal(isProtectedPath(p, opts).protected, true, `shared vector expected protected: ${p}`);
+  }
+  for (const p of vectors.unprotected) {
+    assert.equal(isProtectedPath(p, opts).protected, false, `shared vector expected unprotected: ${p}`);
+  }
+});
+
+test("R4-B13/B14: /System subtree and filesystem alias roots are protected; unknown root-level dot entries fail closed", () => {
+  const o = { homeDir: "/Users/alice" };
+  for (const p of ["/System/Volumes", "/System/Volumes/VM", "/System/Cryptexes", "/System/DriverKit", "/.nofollow/Users/alice/.ssh", "/.vol/1/2", "/.resolve/1/x", "/.somethingnew/x"]) {
+    assert.equal(isProtectedPath(p, o).protected, true, p);
+  }
+});
+
+test("R4-B14: a real alias path through /.nofollow to a protected dir is denied (macOS only)", { skip: process.platform !== "darwin" }, () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r4b14-")));
+  try {
+    fs.mkdirSync(path.join(home, ".ssh"));
+    assert.equal(isProtectedPath(`/.nofollow${home}/.ssh/x`, { homeDir: home }).protected, true);
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("R4-B15: drive-letter strings fail closed on POSIX hosts unless Windows semantics are requested", { skip: process.platform === "win32" }, () => {
+  const cwd = process.cwd();
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "sj-r4b15-"));
+  try {
+    process.chdir(tmp);
+    fs.mkdirSync(path.join(tmp, "C:"));
+    fs.mkdirSync(path.join(tmp, ".ssh"));
+    const r = isProtectedPath("C:/../.ssh", { homeDir: "/Users/alice" });
+    assert.equal(r.protected, true, "C:/../.ssh must not be treated as unprotected on POSIX");
+    assert.equal(isProtectedPath("D:/data/x", { homeDir: "/Users/alice" }).protected, true);
+  } finally {
+    process.chdir(cwd);
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });

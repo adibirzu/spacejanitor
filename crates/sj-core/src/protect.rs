@@ -15,6 +15,10 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "/private/var/db",
     "/Windows",
     "C:/Windows",
+    "/proc",
+    "/sys",
+    "/dev",
+    "/boot",
 ];
 
 const PROTECTED_VM_EXTENSIONS: &[&str] = &["vmdk", "qcow2", "vhdx", "vdi", "raw", "img"];
@@ -207,6 +211,12 @@ pub fn is_protected_path(
 
     if cand == "/" || (!home_norm.is_empty() && cand == home_norm) {
         return ProtectionVerdict::deny("protected_root");
+    }
+
+    // Fail closed on filesystem alias roots (macOS /.nofollow, /.vol, /.resolve, /.file, ...):
+    // any root-level dot entry is a magic alias for the whole tree, never a cleanup target.
+    if cand.starts_with("/.") {
+        return ProtectionVerdict::deny("protected_alias_root");
     }
 
     let cand_low = cand.to_ascii_lowercase();

@@ -2195,3 +2195,26 @@ fn staged_orphan_execution_preserves_relative_git_remote_and_worktree_gitdir() {
         "expected zero .sj-stage-* residue in workspaces, found: {stage_leftovers:?}"
     );
 }
+
+
+#[test]
+fn shared_protect_vectors_match_node_implementation() {
+    use sj_core::protect::is_protected_path;
+    let raw = include_str!("fixtures/protect_vectors.json");
+    let v: serde_json::Value = serde_json::from_str(raw).unwrap();
+    let home = v["home"].as_str().unwrap();
+    for p in v["protected"].as_array().unwrap() {
+        let p = p.as_str().unwrap();
+        assert!(
+            is_protected_path(p, home, &[]).protected,
+            "shared vector expected protected: {p}"
+        );
+    }
+    for p in v["unprotected"].as_array().unwrap() {
+        let p = p.as_str().unwrap();
+        assert!(
+            !is_protected_path(p, home, &[]).protected,
+            "shared vector expected unprotected: {p}"
+        );
+    }
+}

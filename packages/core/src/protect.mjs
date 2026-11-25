@@ -14,6 +14,11 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
     "/Library",
     "/boot",
     "/dev",
+    "/System",
+    "/.nofollow",
+    "/.vol",
+    "/.resolve",
+    "/.file",
     "/proc",
     "/sys",
     "/lib",
@@ -36,7 +41,6 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
   ]),
   // Protected as the directory itself only (children are governed by the other rules).
   exactOnlyRoots: Object.freeze([
-    "/System",
     "/Users",
     "/home",
     "/var",
@@ -99,6 +103,26 @@ export const DEFAULT_PROTECTED_PATTERNS = Object.freeze({
     "id_rsa*",
     "id_ed25519*",
     "id_ecdsa*",
+    "id_dsa*",
+    "*.vmdk",
+    "*.qcow2",
+    "*.vhdx",
+    "*.vdi",
+    "*.raw",
+    "*.img",
+    "*/.sj-stage-*",
+    // credential directories at any depth (mirrors the segment rule in crates/sj-core/src/protect.rs)
+    "*/.ssh",
+    "*/.gnupg",
+    "*/.gnupg/*",
+    "*/.aws",
+    "*/.aws/*",
+    "*/.kube",
+    "*/.kube/*",
+    "*/.claude",
+    "*/.claude/*",
+    "*/.config/gh",
+    "*/.config/gh/*",
   ]),
 });
 
@@ -205,6 +229,12 @@ export function isProtectedPath(candidatePath, options = {}) {
     return { protected: true, reason: "relative_path_rejected" };
   }
 
+  // A drive-letter path means nothing to a POSIX kernel (it is relative to the cwd), so it cannot be
+  // judged lexically: fail closed unless the caller explicitly asks for Windows semantics.
+  if (WIN_DRIVE_RE.test(expanded) && path.sep !== "\\" && !options.windowsSemantics) {
+    return { protected: true, reason: "windows_path_on_posix_rejected" };
+  }
+
   // Fail closed: ignore any caller attempt to make matching case-sensitive.
   const ci = true;
   const normalizedHome = normalizePath(homeDir, homeDir);
@@ -226,6 +256,10 @@ export function isProtectedPath(candidatePath, options = {}) {
   ];
 
   for (const c of cands) {
+    // Root-level dot entries are filesystem aliases (/.nofollow, /.vol, /.resolve, ...): never a target.
+    if (c.startsWith("/.")) {
+      return { protected: true, reason: "protected_alias_root" };
+    }
     if (
       c === "/" ||
       homes.some((h) => eq(c, h)) ||
