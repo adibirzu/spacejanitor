@@ -1,5 +1,6 @@
 use crate::protect::{check_path_protection, ProtectionContext};
-use crate::{is_sensitive_flag_name, redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
+use crate::redact::{redact_token, RedactState};
+use crate::{redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
@@ -182,30 +183,11 @@ fn redact_arg_token(arg: &str) -> (String, Option<(String, String)>) {
             Some((safe_arg_key_name(arg), "[REDACTED]".to_string())),
         );
     }
-    if let Some((k, v)) = arg.split_once('=') {
-        if (is_sensitive_env_key(k) || looks_like_secret_value(v))
-            && !k.contains(['/', ':', '?', '@'])
-        {
-            let key = if is_plain_identifier(k) {
-                k.to_string()
-            } else {
-                "inline-secret".to_string()
-            };
-            return (
-                format!("{key}=<REDACTED>"),
-                Some((key, redact_secret_preview(v))),
-            );
-        }
-    }
-    if looks_like_secret_value(arg) {
-        return (
-            "<REDACTED>".to_string(),
-            Some(("inline_arg".to_string(), redact_secret_preview(arg))),
-        );
-    }
     (arg.to_string(), None)
 }
 
+/// Allowlist redaction over the whole argv: state carries across elements, so a credential
+/// split from its marker (`["--header", "Authorization:", "Bearer", "X"]`) is still caught.
 fn sanitize_args(
     args: &[String],
     server_name: &str,
@@ -213,74 +195,22 @@ fn sanitize_args(
     findings: &mut Vec<SecretFinding>,
 ) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
-    let mut redact_next_flag: Option<String> = None;
-
+    let mut st = RedactState::default();
     for arg in args {
-        if let Some(flag_name) = redact_next_flag.take() {
-            if flag_name == "--header" {
-                let (clean_hdr, _) = redact_arg_token(arg);
-                findings.push(SecretFinding {
-                    server_name: server_name.to_string(),
-                    source_file: source_file.to_string(),
-                    location: "args".to_string(),
-                    key_name: flag_name,
-                    redacted_preview: redact_secret_preview(arg),
-                });
-                out.push(if clean_hdr != *arg {
-                    clean_hdr
-                } else {
-                    "<REDACTED>".to_string()
-                });
-                // `Authorization:Bearer` / `Authorization:` split from its value
-                // by the JSON array: the next element is the credential.
-                if let Some((hdr, rest)) = arg.split_once(':') {
-                    let hdr_low = hdr.trim().to_ascii_lowercase();
-                    let rest_low = rest.trim().to_ascii_lowercase();
-                    if matches!(
-                        hdr_low.as_str(),
-                        "authorization"
-                            | "x-api-key"
-                            | "x-auth-token"
-                            | "cookie"
-                            | "proxy-authorization"
-                    ) && matches!(
-                        rest_low.as_str(),
-                        "" | "bearer" | "basic" | "token" | "digest"
-                    ) {
-                        redact_next_flag = Some("header-value".to_string());
-                    }
-                }
-                continue;
-            }
-            findings.push(SecretFinding {
-                server_name: server_name.to_string(),
-                source_file: source_file.to_string(),
-                location: "args".to_string(),
-                key_name: flag_name,
-                redacted_preview: redact_secret_preview(arg),
-            });
-            out.push("<REDACTED>".to_string());
-            continue;
-        }
-        let low = arg.to_ascii_lowercase();
-        if matches!(low.as_str(), "-h" | "--header") {
-            redact_next_flag = Some("--header".to_string());
-            out.push(arg.clone());
-            continue;
-        }
-        if is_plain_identifier(arg) && is_sensitive_flag_name(&low, false) {
-            redact_next_flag = Some(arg.clone());
-            out.push(arg.clone());
-            continue;
-        }
-        let (clean, maybe_finding) = redact_arg_token(arg);
-        if let Some((key_name, redacted_preview)) = maybe_finding {
+        let marker_before = st.marker.clone();
+        let clean = redact_token(arg, &mut st);
+        if clean != *arg {
+            let key_name = if st.consumed {
+                marker_before
+            } else {
+                safe_arg_key_name(arg)
+            };
             findings.push(SecretFinding {
                 server_name: server_name.to_string(),
                 source_file: source_file.to_string(),
                 location: "args".to_string(),
                 key_name,
-                redacted_preview,
+                redacted_preview: redact_secret_preview(arg),
             });
         }
         out.push(clean);
@@ -484,6 +414,23 @@ fn parse_toml_string_array(raw: &str) -> Vec<String> {
     out
 }
 
+/// Splits `name.rest` / `"quoted.name".rest` from a `[mcp_servers.<...>]` header into the
+/// server name and the remaining dotted tail (empty, or starting with `.`).
+fn split_toml_server_header(rest: &str) -> (String, &str) {
+    let rest = rest.trim();
+    for q in ['"', '\''] {
+        if let Some(body) = rest.strip_prefix(q) {
+            if let Some(end) = body.find(q) {
+                return (body[..end].to_string(), body[end + 1..].trim());
+            }
+        }
+    }
+    match rest.find('.') {
+        Some(i) => (rest[..i].trim().to_string(), rest[i..].trim()),
+        None => (rest.to_string(), ""),
+    }
+}
+
 fn parse_toml_mcp_config(
     raw: &str,
     source_file: &str,
@@ -511,12 +458,22 @@ fn parse_toml_mcp_config(
         if line.starts_with('[') && line.ends_with(']') {
             let section = line[1..line.len() - 1].trim();
             if let Some(rest) = section.strip_prefix("mcp_servers.") {
-                if let Some(name) = rest.strip_suffix(".env") {
-                    current_server = Some(unquote_toml_str(name));
-                    in_env_section = true;
-                } else {
-                    current_server = Some(unquote_toml_str(rest));
-                    in_env_section = false;
+                let (name, tail) = split_toml_server_header(rest);
+                match tail {
+                    "" => {
+                        current_server = Some(name);
+                        in_env_section = false;
+                    }
+                    ".env" => {
+                        current_server = Some(name);
+                        in_env_section = true;
+                    }
+                    // `.http_headers`, `.env_http_headers`, `.tools.*`, ...: subtables of a
+                    // server, never servers themselves, and never parsed (headers hold secrets).
+                    _ => {
+                        current_server = None;
+                        in_env_section = false;
+                    }
                 }
             } else {
                 current_server = None;

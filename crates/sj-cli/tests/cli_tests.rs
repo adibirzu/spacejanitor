@@ -1277,3 +1277,143 @@ fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
         .unwrap();
     assert_ne!(ex.status.code(), Some(0));
 }
+
+// ---- R3 blocker regressions (item 70): every probe must stay out of CLI output ----
+
+fn run_sj(args: &[&str], home: Option<&Path>) -> String {
+    let mut cmd = Command::new(sj_bin());
+    cmd.args(args);
+    if let Some(h) = home {
+        cmd.env("HOME", h);
+    }
+    let out = cmd.output().unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn r3_b1_redaction_is_allowlist_based_and_leaks_no_probe() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("mcp.json"),
+        r#"{"mcpServers":{"probe":{
+ "command":"bash -lc 'npx some-mcp --token PROBE_SHELL_CMD'",
+ "args":["OPTS=-pPROBE_OPTS_P","JAVA_OPTS=-Dapi.key=PROBE_JAVA_OPTS",
+ "-c","sh -c 'npx mcp --token PROBE_SHELL_INNER'",
+ "--token:PROBE_COLON_B64=","--header=Authorization:Bearer","PROBE_HDR_EQ_SPLIT"]}}}"#,
+    )
+    .unwrap();
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            tmp.path().to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    assert!(out.contains("\"probe\""), "{out}");
+    assert!(!out.contains("PROBE_"), "leak: {out}");
+}
+
+#[test]
+fn r3_b2_split_bearer_and_authorization_args_leak_nothing() {
+    let tmp = tempdir().unwrap();
+    fs::write(
+        tmp.path().join("mcp.json"),
+        r#"{"mcpServers":{"split":{"command":"npx","args":[
+ "--header","Authorization:","Bearer","PROBE_HDR_SPLIT3",
+ "--auth","Bearer","PROBE_AUTH_BEARER3","Bearer","PROBE_BEARER_PAIR"]}}}"#,
+    )
+    .unwrap();
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            tmp.path().to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    assert!(out.contains("\"split\""), "{out}");
+    assert!(!out.contains("PROBE_"), "leak: {out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b3_symlinked_home_cannot_bypass_protection() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir_all(real.join(".cursor")).unwrap();
+    fs::create_dir_all(real.join("Library/Application Support/Claude/Local Storage")).unwrap();
+    fs::write(
+        real.join(".claude.json"),
+        r#"{"mcpServers":{"srv-inside-claude-json":{"command":"npx","args":["srv-x"]}}}"#,
+    )
+    .unwrap();
+    symlink(real.join(".claude.json"), real.join(".mcp.json")).unwrap();
+    symlink(
+        real.join("Library/Application Support/Claude"),
+        real.join(".cursor/skills"),
+    )
+    .unwrap();
+    // non-canonical home: reach `real` through a symlink
+    let link_home = tmp.path().join("homelink");
+    symlink(&real, &link_home).unwrap();
+    let out = run_sj(&["mcp-audit", "--json"], Some(&link_home));
+    assert!(!out.contains("srv-inside-claude-json"), "{out}");
+    let out = run_sj(
+        &["llm-audit", "--home", link_home.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("Local Storage"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b4_llm_audit_never_descends_through_symlinked_roots() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".ssh/SecretSubDir")).unwrap();
+    fs::create_dir_all(h.join(".gemini")).unwrap();
+    fs::create_dir_all(h.join(".cursor")).unwrap();
+    symlink(h.join(".ssh"), h.join(".gemini/extensions")).unwrap();
+    symlink(h.join(".ssh"), h.join(".cursor/skills")).unwrap();
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("SecretSubDir"), "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["skills_by_client"].get("cursor").is_none(), "{out}");
+    let roots = v["symlinked_roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|r| r["client"] == "cursor" && r["target_protected"] == true),
+        "{out}"
+    );
+}
+
+#[test]
+fn r3_b5_codex_toml_subtables_are_not_phantom_servers() {
+    let tmp = tempdir().unwrap();
+    let h = tmp.path();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[mcp_servers.multillm]\nurl = \"https://example.com/mcp\"\n[mcp_servers.multillm.http_headers]\nAuthorization = \"Bearer SECRET_HDR\"\n",
+    )
+    .unwrap();
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("multillm.http_headers"), "{out}");
+    assert!(!out.contains("SECRET_HDR"), "{out}");
+}

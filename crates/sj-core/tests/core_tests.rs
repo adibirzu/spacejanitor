@@ -3105,3 +3105,57 @@ fn protect_covers_claude_state_files_and_app_support_pure_string_windows_and_pos
         .protected
     );
 }
+
+// ---- R3 blocker regressions (item 70) ----
+
+#[test]
+fn r3_b6_windows_drive_exact_paths_match_case_insensitively() {
+    let exact = ["C:\\Users\\alice\\Documents\\tax"];
+    for cand in [
+        "c:\\users\\alice\\documents\\tax\\2025.pdf",
+        "C:\\Users\\alice\\DOCUMENTS\\tax",
+        "C:\\Users\\alice\\Documents\\tax\\2025.pdf",
+    ] {
+        let v = sj_core::is_protected_path(cand, "C:\\Users\\alice", &exact);
+        assert!(v.protected, "{cand} must be protected: {v:?}");
+    }
+    assert!(
+        !sj_core::is_protected_path(
+            "c:\\users\\alice\\documents\\other.pdf",
+            "C:\\Users\\alice",
+            &exact
+        )
+        .protected
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b3_non_canonical_home_still_protects_claude_json_and_app_support() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir_all(real.join("Library/Application Support/Claude")).unwrap();
+    fs::write(real.join(".claude.json"), "{}").unwrap();
+    symlink(&real, tmp.path().join("homelink")).unwrap();
+    let home = tmp.path().join("homelink");
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+    for rel in [
+        ".claude.json",
+        "Library/Application Support/Claude",
+        "Library/Application Support/Claude/Local Storage",
+    ] {
+        // reached through the symlinked home, and through its canonical spelling
+        assert!(
+            check_path_protection(&home.join(rel), &ctx).protected,
+            "{rel} via link"
+        );
+        assert!(
+            check_path_protection(&real.canonicalize().unwrap().join(rel), &ctx).protected,
+            "{rel} via canonical"
+        );
+    }
+    // a symlink inside the home pointing at the protected file is denied too
+    symlink(real.join(".claude.json"), real.join(".mcp.json")).unwrap();
+    assert!(check_path_protection(&home.join(".mcp.json"), &ctx).protected);
+}

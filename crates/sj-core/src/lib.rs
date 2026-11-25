@@ -9,6 +9,7 @@ pub mod orphans;
 pub mod plan;
 pub mod protect;
 pub mod reap;
+pub mod redact;
 pub(crate) mod safe_remove;
 pub mod scan;
 pub mod trash;
@@ -44,64 +45,7 @@ pub enum SjError {
     Json(#[from] serde_json::Error),
 }
 
-fn redact_url_userinfo(token: &str) -> String {
-    if let Some(scheme_idx) = token.find("://") {
-        let after_scheme = &token[scheme_idx + 3..];
-        let auth_end = after_scheme
-            .find(['/', '?', '#'])
-            .unwrap_or(after_scheme.len());
-        let authority = &after_scheme[..auth_end];
-        if let Some(at_idx) = authority.rfind('@') {
-            let prefix = &token[..scheme_idx + 3];
-            let host_and_rest = &after_scheme[at_idx + 1..];
-            return format!("{prefix}<REDACTED>@{host_and_rest}");
-        }
-    }
-    token.to_string()
-}
-
-fn is_sensitive_query_key(k_low: &str) -> bool {
-    const NEEDLES: &[&str] = &[
-        "token",
-        "secret",
-        "key",
-        "pass",
-        "pwd",
-        "auth",
-        "credential",
-        "sig",
-        "dsn",
-        "session",
-        "cookie",
-        "bearer",
-    ];
-    NEEDLES.iter().any(|n| k_low.contains(n))
-}
-
-fn redact_url_query_params(token: &str) -> String {
-    let Some(q_idx) = token.find('?') else {
-        return token.to_string();
-    };
-    let (base, query_and_frag) = token.split_at(q_idx + 1);
-    let (query, frag) = match query_and_frag.find('#') {
-        Some(f_idx) => (&query_and_frag[..f_idx], &query_and_frag[f_idx..]),
-        None => (query_and_frag, ""),
-    };
-    let mut parts = Vec::new();
-    for pair in query.split('&') {
-        if let Some((k, _v)) = pair.split_once('=') {
-            let k_low = k.to_ascii_lowercase();
-            if is_sensitive_query_key(&k_low) {
-                parts.push(format!("{k}=<REDACTED>"));
-                continue;
-            }
-        }
-        parts.push(pair.to_string());
-    }
-    format!("{base}{}{frag}", parts.join("&"))
-}
-
-fn split_shell_like_tokens(input: &str) -> Vec<(String, Option<char>)> {
+pub(crate) fn split_shell_like_tokens(input: &str) -> Vec<(String, Option<char>)> {
     let mut tokens = Vec::new();
     let mut cur = String::new();
     let mut quote: Option<char> = None;
@@ -183,23 +127,7 @@ pub fn is_sensitive_flag_name(flag_low: &str, has_equals: bool) -> bool {
         || flag_low.contains("dsn")
 }
 
-fn is_sensitive_header_name(header_low: &str) -> bool {
-    matches!(
-        header_low.trim(),
-        "authorization" | "x-api-key" | "x-auth-token" | "cookie" | "proxy-authorization"
-    )
-}
-
-fn redact_header_value(raw: &str) -> Option<String> {
-    let (hdr, _val) = raw.split_once(':')?;
-    if is_sensitive_header_name(&hdr.to_ascii_lowercase()) {
-        Some(format!("{hdr}: <REDACTED>"))
-    } else {
-        None
-    }
-}
-
-fn has_known_secret_prefix(tok: &str) -> bool {
+pub(crate) fn has_known_secret_prefix(tok: &str) -> bool {
     tok.starts_with("sk-")
         || tok.starts_with("sk_")
         || tok.starts_with("ghp_")
@@ -211,143 +139,10 @@ fn has_known_secret_prefix(tok: &str) -> bool {
         || tok.starts_with("AIza")
 }
 
-/// Redacts common secret flags, headers, inline `KEY=VAL`, URL credentials/query params, and known token prefixes.
+/// Redacts a command line for audit output using an allowlist: only clearly non-secret
+/// tokens are shown, everything else (and anything after an auth-ish marker) is `<REDACTED>`.
 pub fn redact_secrets(input: &str) -> String {
-    let mut tokens: Vec<String> = Vec::new();
-    let mut redact_next = false;
-    let mut redact_next_header = false;
-
-    for (part, outer_quote) in split_shell_like_tokens(input) {
-        let low = part.to_ascii_lowercase();
-
-        if redact_next_header {
-            redact_next_header = false;
-            if let Some((hdr, rest)) = part.split_once(':') {
-                if is_sensitive_header_name(&hdr.to_ascii_lowercase()) {
-                    if rest.trim().is_empty() {
-                        tokens.push(part);
-                        redact_next = true;
-                        continue;
-                    }
-                    if matches!(
-                        rest.trim().to_ascii_lowercase().as_str(),
-                        "bearer" | "basic" | "token" | "digest"
-                    ) {
-                        tokens.push(format!("{hdr}: <REDACTED>"));
-                        redact_next = true;
-                        continue;
-                    }
-                    let redacted_hdr = format!("{hdr}: <REDACTED>");
-                    tokens.push(match outer_quote {
-                        Some(q) => format!("{q}{redacted_hdr}{q}"),
-                        None => redacted_hdr,
-                    });
-                    continue;
-                }
-            }
-        }
-
-        if redact_next {
-            if matches!(low.as_str(), "bearer" | "basic") {
-                tokens.push(part);
-                continue;
-            }
-            if !part.starts_with("--") {
-                tokens.push("<REDACTED>".to_string());
-                redact_next = false;
-                continue;
-            }
-            redact_next = false;
-        }
-
-        if matches!(low.as_str(), "-h" | "--header") {
-            tokens.push(part);
-            redact_next_header = true;
-            continue;
-        }
-
-        if let Some(after_hdr) = low.strip_prefix("--header=") {
-            let _ = after_hdr;
-            let raw_val = &part["--header=".len()..];
-            if let Some(redacted_hdr) = redact_header_value(raw_val) {
-                tokens.push(format!("--header=\"{redacted_hdr}\""));
-                continue;
-            }
-        }
-
-        if part.starts_with('-')
-            && !part.starts_with("--")
-            && part.len() > 2
-            && low.starts_with("-p")
-        {
-            // glued short password flag, e.g. `mysql -pSECRET`
-            tokens.push("-p<REDACTED>".to_string());
-            continue;
-        }
-        if part.starts_with("--") && !part.contains('=') && !part.contains("://") {
-            if let Some((lhs, _rhs)) = part.split_once(':') {
-                if is_sensitive_flag_name(&lhs.to_ascii_lowercase(), true) {
-                    tokens.push(format!("{lhs}:<REDACTED>"));
-                    continue;
-                }
-            }
-        }
-        if part.starts_with('-') {
-            if let Some((lhs, _rhs)) = part.split_once('=') {
-                if is_sensitive_flag_name(&lhs.to_ascii_lowercase(), true) {
-                    tokens.push(format!("{lhs}=<REDACTED>"));
-                    continue;
-                }
-            } else if is_sensitive_flag_name(&low, false) {
-                tokens.push(part);
-                redact_next = true;
-                continue;
-            }
-        }
-
-        if matches!(low.as_str(), "bearer" | "basic") {
-            tokens.push(part);
-            redact_next = true;
-            continue;
-        }
-
-        if !part.starts_with('-') && !part.contains("://") {
-            if let Some((k, v)) = part.split_once('=') {
-                if !k.is_empty() && !k.contains(['/', ':', '?']) {
-                    let k_up = k.to_ascii_uppercase();
-                    if k_up.contains("TOKEN")
-                        || k_up.contains("SECRET")
-                        || k_up.contains("KEY")
-                        || k_up.contains("PASSWORD")
-                        || k_up.contains("PASSWD")
-                        || k_up.contains("AUTH")
-                        || k_up.contains("CREDENTIAL")
-                        || k_up.contains("DSN")
-                    {
-                        if v.trim() != "<REDACTED>" {
-                            tokens.push(format!("{k}=<REDACTED>"));
-                        } else {
-                            tokens.push(part);
-                        }
-                        continue;
-                    }
-                }
-            }
-        }
-
-        if has_known_secret_prefix(&part) {
-            tokens.push("<REDACTED>".to_string());
-            continue;
-        }
-
-        let url_clean = redact_url_query_params(&redact_url_userinfo(&part));
-        tokens.push(match outer_quote {
-            Some(q) if url_clean == part => format!("{q}{url_clean}{q}"),
-            _ => url_clean,
-        });
-    }
-
-    tokens.join(" ")
+    redact::redact_command(input)
 }
 
 #[cfg(test)]

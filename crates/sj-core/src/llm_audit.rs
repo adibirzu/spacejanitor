@@ -171,6 +171,15 @@ pub struct PlannedAction {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct SymlinkedRoot {
+    pub client: String,
+    pub path: String,
+    /// Link target as text only; the target is never opened or enumerated.
+    pub target: String,
+    pub target_protected: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct LlmAuditReport {
     pub schema: String,
     pub mode: String,
@@ -180,6 +189,7 @@ pub struct LlmAuditReport {
     pub skills_by_client: BTreeMap<String, SkillClientSummary>,
     pub stale_skills: Vec<StaleSkill>,
     pub broken_skill_symlinks: Vec<BrokenSkillLink>,
+    pub symlinked_roots: Vec<SymlinkedRoot>,
     pub duplicate_skill_dirs: Vec<DuplicateSkill>,
     pub unused_mcp_servers: Vec<UnusedMcpServer>,
     pub idle_sessions: Vec<IdleSession>,
@@ -249,11 +259,45 @@ fn parse_codex_plugin_states(raw: &str) -> BTreeMap<String, bool> {
     out
 }
 
+/// If `root` is itself a symlink, records it (target as text, protection of the canonical
+/// target) and returns true so the caller never descends into it.
+fn note_symlinked_root(
+    client: &str,
+    root: &Path,
+    ctx: &ProtectionContext,
+    out: &mut Vec<SymlinkedRoot>,
+) -> bool {
+    let Ok(meta) = fs::symlink_metadata(root) else {
+        return false;
+    };
+    if !meta.file_type().is_symlink() {
+        return false;
+    }
+    let target = fs::read_link(root)
+        .map(|t| t.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let target_protected = match fs::canonicalize(root) {
+        Ok(canon) => check_path_protection(&canon, ctx).protected,
+        Err(_) => true,
+    };
+    out.push(SymlinkedRoot {
+        client: client.to_string(),
+        path: root.to_string_lossy().into_owned(),
+        target,
+        target_protected,
+    });
+    true
+}
+
+/// Names of real (non-symlink) subdirectories. Never follows a symlinked root or entry.
 fn dir_names(dir: &Path) -> Vec<String> {
+    if fs::symlink_metadata(dir).is_ok_and(|m| m.file_type().is_symlink()) {
+        return Vec::new();
+    }
     let mut v: Vec<String> = fs::read_dir(dir)
         .map(|rd| {
             rd.flatten()
-                .filter(|e| e.path().is_dir())
+                .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
                 .filter_map(|e| e.file_name().into_string().ok())
                 .filter(|n| !n.starts_with('.'))
                 .collect()
@@ -470,7 +514,9 @@ pub fn audit_llm_with_processes(
             disable_candidate: cand,
         });
     }
+    let mut symlinked_roots: Vec<SymlinkedRoot> = Vec::new();
     let cache = home.join(".codex").join("plugins").join("cache");
+    note_symlinked_root("codex", &cache, &ctx, &mut symlinked_roots);
     for mkt in dir_names(&cache) {
         for plug in dir_names(&cache.join(&mkt)) {
             let id = format!("{plug}@{mkt}");
@@ -501,6 +547,7 @@ pub fn audit_llm_with_processes(
         ),
         ("gemini-extension", home.join(".gemini").join("extensions")),
     ] {
+        note_symlinked_root(client, &dir, &ctx, &mut symlinked_roots);
         for name in dir_names(&dir) {
             plugins.push(PluginEntry {
                 rule_id: format!("plugin-{client}-{}", slug(&name)),
@@ -514,7 +561,9 @@ pub fn audit_llm_with_processes(
         }
     }
     // Claude: directory names only, never file contents, never a candidate.
-    for name in dir_names(&home.join(".claude").join("plugins")) {
+    let claude_plugins = home.join(".claude").join("plugins");
+    note_symlinked_root("claude", &claude_plugins, &ctx, &mut symlinked_roots);
+    for name in dir_names(&claude_plugins) {
         plugins.push(PluginEntry {
             rule_id: format!("plugin-claude-{}", slug(&name)),
             client: "claude".into(),
@@ -539,6 +588,10 @@ pub fn audit_llm_with_processes(
     let mut broken = Vec::new();
     let mut real_locations: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (client, root, force_ro) in &roots {
+        // Never open a symlinked skills root: it may point into a protected tree.
+        if note_symlinked_root(client, root, &ctx, &mut symlinked_roots) {
+            continue;
+        }
         let Ok(rd) = fs::read_dir(root) else { continue };
         let ro = *force_ro || check_path_protection(root, &ctx).protected;
         let mut sum = SkillClientSummary::default();
@@ -701,6 +754,7 @@ pub fn audit_llm_with_processes(
         skills_by_client: by_client,
         stale_skills,
         broken_skill_symlinks: broken,
+        symlinked_roots,
         duplicate_skill_dirs,
         unused_mcp_servers: unused,
         idle_sessions,
