@@ -4,6 +4,7 @@ import {
   collectDisk as _collectDisk,
   collectTrash,
   collectOrphans,
+  inspectWorktree,
   collectMemory as _collectMemory,
   collectBlockers,
   collectMcpAudit as _collectMcpAudit,
@@ -30,6 +31,7 @@ export { DEFAULT_PROTECTED_PATTERNS, isProtectedPath };
 export { redactSecrets };
 
 export {
+  inspectWorktree,
   collectDoctor,
   collectTrash,
   collectOrphans,

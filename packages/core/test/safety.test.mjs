@@ -403,3 +403,36 @@ test("R5-N4: only the real Claude home config is protected, not project .claude 
   assert.equal(isProtectedPath("/Users/alice/proj/.claude/worktrees/wt1", o).protected, false);
   assert.equal(isProtectedPath("/data/repo/.claude/worktrees/wt1/src/x.rs", o).protected, false);
 });
+
+test("R6-B20: tilde candidates with planted symlink + '..' are judged on the OS-resolved path", () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r6b20-")));
+  try {
+    const home = path.join(base, "home");
+    for (const d of ["Library/Caches/Homebrew", "Library/Caches/pnpm", "Library/Keychains", "Library/Mail", "AppData/Local/npm-cache", "AppData/Roaming", ".cache/npm", ".ssh/sub"]) {
+      fs.mkdirSync(path.join(home, d), { recursive: true });
+    }
+    fs.symlinkSync(path.join(home, "Library", "Keychains"), path.join(home, "Library", "Caches", "Homebrew", "to-keychains"));
+    fs.symlinkSync(home, path.join(home, "Library", "Caches", "pnpm", "to-home"));
+    fs.symlinkSync(path.join(home, ".ssh"), path.join(home, "Library", "Caches", "pnpm", "to-ssh"));
+    fs.symlinkSync("/", path.join(home, "Library", "Caches", "pnpm", "to-root"));
+    fs.symlinkSync(path.join(home, "AppData", "Roaming"), path.join(home, "AppData", "Local", "npm-cache", "to-roaming"));
+    fs.symlinkSync(path.join(home, ".ssh", "sub"), path.join(home, ".cache", "npm", "to-ssh-sub"));
+    const o = { homeDir: home };
+    for (const c of [
+      "~/Library/Caches/Homebrew/to-keychains/..",
+      "~/Library/Caches/Homebrew/to-keychains/../Mail",
+      "~/Library/Caches/pnpm/to-home/..",
+      "~/Library/Caches/pnpm/to-ssh/..",
+      "~/Library/Caches/pnpm/to-root/..",
+      "~/AppData/Local/npm-cache/to-roaming/..",
+      "~/.cache/npm/to-ssh-sub/..",
+    ]) {
+      assert.equal(isProtectedPath(c, o).protected, true, `tilde form must be protected: ${c}`);
+    }
+    // controls: plain tilde cache stays allowed
+    assert.equal(isProtectedPath("~/Library/Caches/Homebrew", o).protected, false);
+    assert.equal(isProtectedPath("~/.cache/npm", o).protected, false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

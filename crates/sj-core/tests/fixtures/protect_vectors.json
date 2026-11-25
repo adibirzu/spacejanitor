@@ -66,7 +66,12 @@
     "/Users/alice/Library/Caches/com.apple.Safari/x",
     "/Users/alice/Library/Caches/Homebrew/../../Keychains/login.keychain-db",
     "/Users/alice/Library/Caches/HomebrewEvil/x",
-    "/Users/alice/.claude/worktrees/w1/src/x"
+    "/Users/alice/.claude/worktrees/w1/src/x",
+    "~/Library/Caches/Homebrew/../..",
+    "~/Library/Caches/pnpm/../../Mail",
+    "~/Library/Caches/pip/x/../../../.ssh",
+    "~/AppData/Local/npm-cache/../../Roaming",
+    "/Users/alice/Library/Caches/Homebrew/../../../.aws"
   ],
   "unprotected": [
     "/Users/alice/.cache/npm",
@@ -84,6 +89,10 @@
     "/Users/alice/Library/Caches/pnpm",
     "/Users/alice/Library/Caches/pnpm/store/x",
     "/data/proj/.claude/x",
-    "/Users/alice/proj/.claude/worktrees/wt1/src/main.rs"
+    "/Users/alice/proj/.claude/worktrees/wt1/src/main.rs",
+    "~/Library/Caches/Homebrew",
+    "~/Library/Caches/pip/wheels/x",
+    "~/AppData/Local/npm-cache/_cacache",
+    "~/AppData/Local/pip/Cache/http"
   ]
 }

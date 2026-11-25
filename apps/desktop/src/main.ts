@@ -12,6 +12,7 @@ import {
   validateTargetPath,
 } from "./ipcValidation";
 import { RemediationCandidate, RemediationGate } from "./remediationGate";
+import { worktreePruneBlockReason } from "./worktreeGuard";
 import { resolveSjBinary, SjBridge } from "./sjBridge";
 import { SlmAdvisorService } from "./slmAdvisor";
 
@@ -244,6 +245,11 @@ function registerIpcHandlers(): void {
             continue;
           }
           if (item.kind === "git-worktree") {
+            const blocked = await worktreePruneBlockReason(item.path);
+            if (blocked) {
+              failed.push({ path: item.path, error: blocked });
+              continue;
+            }
             await execFileAsync("git", ["worktree", "remove", item.path], {
               cwd: path.dirname(item.path),
               timeout: 5000,

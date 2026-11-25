@@ -190,6 +190,68 @@ async function safeExec(cmd, args, cwd) {
   return res.stdout;
 }
 
+/**
+ * Prove (or fail to prove) that a linked worktree can be removed without losing anything.
+ * Mirrors the Rust core (crates/sj-core/src/orphans.rs): dirty, untracked, ignored files, stashes,
+ * unpushed commits/branches, no remote and detached/unborn HEAD all block; any git failure blocks.
+ */
+export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
+  const base = {
+    id: `wt-${path.basename(wtPath)}`,
+    path: wtPath,
+    kind: "git-worktree",
+    maxAgeDays,
+  };
+  const unverified = (extra = {}) => ({
+    ...base,
+    clean: false,
+    hasRemote: false,
+    hasUnpushed: true,
+    hasIgnored: false,
+    hasStashes: false,
+    proofStatus: "unverified",
+    safeToPrune: false,
+    ...extra,
+  });
+  if (!wtPath || !fs.existsSync(wtPath)) return unverified();
+
+  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes] = await Promise.all([
+    safeExecResult("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"], wtPath),
+    safeExecResult("git", ["remote"], wtPath),
+    safeExecResult("git", ["rev-list", "--branches", "--not", "--remotes", "--count"], wtPath),
+    safeExecResult("git", ["rev-list", "HEAD", "--not", "--remotes", "--count"], wtPath),
+    safeExecResult("git", ["stash", "list"], wtPath),
+    safeExecResult("git", ["symbolic-ref", "-q", "HEAD"], wtPath),
+    safeExecResult("git", ["rev-parse", "--verify", "-q", "HEAD"], wtPath),
+  ]);
+  if (![statusRes, remotesRes, branchesRes, headRes, stashRes].every((r) => r.ok)) {
+    return unverified({ hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false });
+  }
+  const lines = statusRes.stdout.split(/\r?\n/).filter(Boolean);
+  const hasIgnored = lines.some((l) => l.startsWith("!!"));
+  const hasDirty = lines.some((l) => !l.startsWith("!!"));
+  const hasRemote = remotesRes.stdout.length > 0;
+  const hasStashes = stashRes.stdout.length > 0;
+  const branchCount = Number(branchesRes.stdout);
+  const headCount = Number(headRes.stdout);
+  const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
+  const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0;
+  const onBranch = symRes.ok && symRes.stdout.length > 0 && headOkRes.ok;
+  const proofStatus = countsValid ? "verified" : "unverified";
+  return {
+    ...base,
+    clean: !hasDirty && !hasIgnored,
+    hasRemote,
+    hasUnpushed,
+    hasIgnored,
+    hasStashes,
+    detachedHead: !onBranch,
+    proofStatus,
+    safeToPrune:
+      !hasDirty && !hasIgnored && hasRemote && !hasUnpushed && !hasStashes && onBranch && proofStatus === "verified",
+  };
+}
+
 export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 14 } = {}) {
   const resolved = path.resolve(targetPath);
   const candidates = [];
@@ -198,61 +260,17 @@ export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 
   if (insideGit.ok && insideGit.stdout === "true") {
     const wtOut = await safeExecResult("git", ["worktree", "list", "--porcelain"], resolved);
     if (wtOut.ok) {
-      const lines = wtOut.stdout.split(/\r?\n/);
-      for (const line of lines) {
+      let seenMain = false;
+      for (const line of wtOut.stdout.split(/\r?\n/)) {
         if (!line.startsWith("worktree ")) continue;
         const wtPath = line.slice("worktree ".length).trim();
-        if (!wtPath || wtPath === resolved) continue;
-
-        const dirtyRes = await safeExecResult("git", ["status", "--porcelain"], wtPath);
-        const remotesRes = await safeExecResult("git", ["remote"], wtPath);
-        const branchesUnpushedRes = await safeExecResult(
-          "git",
-          ["rev-list", "--branches", "--not", "--remotes", "--count"],
-          wtPath
-        );
-        const headUnpushedRes = await safeExecResult(
-          "git",
-          ["rev-list", "HEAD", "--not", "--remotes", "--count"],
-          wtPath
-        );
-
-        const allOk =
-          dirtyRes.ok && remotesRes.ok && branchesUnpushedRes.ok && headUnpushedRes.ok;
-        if (!allOk) {
-          candidates.push({
-            id: `wt-${path.basename(wtPath)}`,
-            path: wtPath,
-            kind: "git-worktree",
-            clean: false,
-            hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false,
-            hasUnpushed: true,
-            proofStatus: "unverified",
-            safeToPrune: false,
-            maxAgeDays,
-          });
+        // git lists the main working tree first: it is never an orphan, however the target is spelled.
+        if (!seenMain) {
+          seenMain = true;
           continue;
         }
-
-        const isClean = dirtyRes.stdout.length === 0;
-        const hasRemote = remotesRes.stdout.length > 0;
-        const branchCount = Number(branchesUnpushedRes.stdout);
-        const headCount = Number(headUnpushedRes.stdout);
-        const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
-        const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0;
-        const proofStatus = countsValid ? "verified" : "unverified";
-
-        candidates.push({
-          id: `wt-${path.basename(wtPath)}`,
-          path: wtPath,
-          kind: "git-worktree",
-          clean: isClean,
-          hasRemote,
-          hasUnpushed,
-          proofStatus,
-          safeToPrune: isClean && hasRemote && !hasUnpushed && proofStatus === "verified",
-          maxAgeDays,
-        });
+        if (!wtPath || wtPath === resolved) continue;
+        candidates.push(await inspectWorktree(wtPath, { maxAgeDays }));
       }
     }
   }
@@ -435,13 +453,23 @@ function extractHeaderArgs(args) {
     if (i === -1) headers.push([text.trim(), ""]);
     else headers.push([text.slice(0, i).trim(), text.slice(i + 1).trim()]);
   };
+  const isFlag = (x) => typeof x === "string" && x.startsWith("-");
   for (let i = 0; i < args.length; i++) {
     const a = String(args[i]);
     if (a === "--header" || a === "-H" || a === "--headers") {
-      if (i + 1 < args.length) take(args[++i]);
       rest.push(a);
-    } else if (a.startsWith("--header=")) {
-      take(a.slice("--header=".length));
+      if (i + 1 >= args.length) continue;
+      const first = String(args[++i]);
+      if (first.includes(":")) {
+        take(first); // "Name: value"
+      } else if (i + 1 < args.length && !isFlag(String(args[i + 1]))) {
+        // mcp-proxy style two-argument form: KEY VALUE
+        headers.push([first.trim(), String(args[++i])]);
+      } else {
+        headers.push([first.trim(), ""]);
+      }
+    } else if (a.startsWith("--header=") || a.startsWith("--headers=")) {
+      take(a.slice(a.indexOf("=") + 1));
       rest.push("--header");
     } else if (a.startsWith("-H") && a.length > 2 && !a.startsWith("--")) {
       take(a.slice(2));

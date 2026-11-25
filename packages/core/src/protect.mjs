@@ -138,7 +138,8 @@ function expandHome(rawPath, homeDir = os.homedir()) {
   if (!rawPath) return "";
   if (rawPath === "~") return homeDir;
   if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
-    return path.join(homeDir, rawPath.slice(2));
+    // Concatenate textually: path.join would collapse ".." lexically, before symlinks are resolved.
+    return `${String(homeDir).replace(/[\\/]+$/, "")}/${rawPath.slice(2)}`;
   }
   return rawPath;
 }

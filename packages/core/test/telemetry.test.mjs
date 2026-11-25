@@ -15,6 +15,7 @@ import {
   collectMcpAudit,
   collectSummary,
   collectCleanableCaches,
+  inspectWorktree,
   createRemediationPlan,
   verifyRemediationGate,
   validateLoopbackSlmUrl,
@@ -468,5 +469,102 @@ test("R5-B18: collectCleanableCaches offers the macOS Library/Caches targets", a
     assert.deepEqual(found, [".npm/_cacache", "Library/Caches/Homebrew", "Library/Caches/pip", "Library/Caches/pnpm"]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("R6-B19: mcp-audit redacts the value of every two-argument header form (-H KEY VALUE, --headers KEY VALUE)", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r6-"));
+  const V = (t) => `FAKEVAL-${t}-0123456789`;
+  try {
+    const servers = {
+      a: ["-H", "X-API-Key", V("a")],
+      b: ["--headers", "X-API-Key", V("b")],
+      c: ["-H", "X-Auth-Token", V("c")],
+      d: ["-H", "X-Secret", "shortv"],
+      e: ["-H", "Authorization", V("e")],
+      f: ["-H", "Cookie", `sid=${V("f")}`],
+      g: ["-H", "X-Custom", V("g")],
+      h: ["--headers", "Authorization", `Bearer ${V("h")}`],
+      i: ["--header", "X-Two", V("i"), "--url", "https://mcp.example.com/sse"],
+    };
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({ mcpServers: Object.fromEntries(Object.entries(servers).map(([k, args]) => [k, { command: "mcp-proxy", args }])) })
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const text = JSON.stringify(audit);
+    for (const t of "abcefghi") assert.equal(text.includes(V(t)), false, `value leaked: ${t}`);
+    assert.equal(text.includes("shortv"), false);
+    const by = Object.fromEntries(audit.servers.map((x) => [x.name, x]));
+    assert.deepEqual(by.a.headerNames, ["X-API-Key"]);
+    assert.deepEqual(by.d.headerNames, ["X-Secret"]);
+    assert.deepEqual(by.h.headerNames, ["Authorization"]);
+    assert.deepEqual(by.i.headerNames, ["X-Two"]);
+    assert.ok(text.includes("--url"), "following flag must be preserved");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+function git(cwd, ...args) {
+  return execFileSync("git", ["-c", "user.email=t@example.com", "-c", "user.name=t", "-c", "commit.gpgsign=false", ...args], { cwd, encoding: "utf8" });
+}
+
+test("R6-B21: worktree safety proof treats ignored, untracked, stashed, unpushed, detached and no-remote worktrees as NOT safe", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r6b21-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, ".gitignore"), "*.secret\nlocal-data/\n");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name, branch) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", branch, p);
+      git(p, "push", "-u", "origin", branch);
+      return p;
+    };
+    const clean = mk("wt-clean", "b-clean");
+    const ignored = mk("wt-ignored", "b-ignored");
+    const untracked = mk("wt-untracked", "b-untracked");
+    const unpushed = mk("wt-unpushed", "b-unpushed");
+    const stashed = mk("wt-stashed", "b-stashed");
+    // proof for the clean worktree is taken BEFORE any sibling gets an unpushed branch (the unpushed
+    // check is repo-wide, as in the Rust core)
+    assert.equal((await inspectWorktree(clean)).safeToPrune, true, "clean pushed worktree is safe");
+    fs.writeFileSync(path.join(ignored, "db.secret"), "precious");
+    fs.mkdirSync(path.join(ignored, "local-data"));
+    fs.writeFileSync(path.join(untracked, "notes.txt"), "n");
+    fs.writeFileSync(path.join(unpushed, "u.txt"), "u");
+    git(unpushed, "add", "u.txt");
+    git(unpushed, "commit", "-m", "local only");
+    fs.writeFileSync(path.join(stashed, "a.txt"), "changed");
+    git(stashed, "stash", "push");
+    const detached = path.join(base, "wt-detached");
+    git(repo, "worktree", "add", "--detach", detached);
+
+    const proof = async (p) => (await inspectWorktree(p)).safeToPrune;
+    for (const [name, p] of Object.entries({ ignored, untracked, unpushed, stashed, detached })) {
+      assert.equal(await proof(p), false, `${name} must not be safe to prune`);
+    }
+    const report = await collectOrphans({ targetPath: repo });
+    const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
+    assert.equal(byBase["wt-ignored"].safeToPrune, false);
+    assert.equal(byBase["wt-ignored"].hasIgnored, true);
+    assert.equal(byBase["wt-stashed"].hasStashes, true);
+    assert.equal(report.candidates.some((c) => c.path === repo), false, "main checkout is never listed");
+    // from inside a linked worktree the main checkout must still not be offered
+    const fromLinked = await collectOrphans({ targetPath: clean });
+    assert.equal(fromLinked.candidates.some((c) => c.path === repo), false);
+    // unverifiable path -> not safe
+    assert.equal(await proof(path.join(base, "does-not-exist")), false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
   }
 });
