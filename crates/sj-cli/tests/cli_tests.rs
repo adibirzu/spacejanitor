@@ -1208,3 +1208,72 @@ fn cli_serve_stdio_omits_notification_responses_and_handles_invalid_utf8() {
     assert_eq!(r2["id"], 9);
     assert_eq!(r2["result"]["schema"], "spacejanitor.doctor.v1");
 }
+
+#[cfg(unix)]
+#[test]
+fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
+    let tmp = tempdir().unwrap();
+    let h = tmp.path();
+    fs::create_dir_all(h.join(".codex/skills")).unwrap();
+    fs::create_dir_all(h.join(".agents/skills/stale-skill")).unwrap();
+    fs::write(h.join(".agents/skills/stale-skill/SKILL.md"), "x").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+    for p in [
+        h.join(".agents/skills/stale-skill/SKILL.md"),
+        h.join(".agents/skills/stale-skill"),
+    ] {
+        let _ = fs::File::open(&p).unwrap().set_modified(old);
+    }
+    std::os::unix::fs::symlink("/nonexistent-sj-cli-fixture", h.join(".codex/skills/dead"))
+        .unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"extra@mkt\"]\nenabled = true\n[mcp_servers.sjfixtureunused]\ncommand = \"npx\"\nargs = [\"sjfixture-unused-mcp-x\", \"--token\", \"CLI_TOK_SECRET\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        h.join(".claude.json"),
+        "{\"mcpServers\":{\"CLI_CLAUDE_MARKER\":{\"command\":\"x\"}}}",
+    )
+    .unwrap();
+
+    let out = Command::new(sj_bin())
+        .args(["llm-audit", "--home"])
+        .arg(h)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["schema"], "spacejanitor.llm_audit.v1");
+    assert_eq!(v["mode"], "dry-run");
+    assert_eq!(v["mutated"], false);
+    assert_eq!(v["stale_skills"][0]["name"], "stale-skill");
+    assert_eq!(v["broken_skill_symlinks"][0]["name"], "dead");
+    assert_eq!(
+        v["unused_mcp_servers"][0]["server_name"], "sjfixtureunused",
+        "{text}"
+    );
+    assert!(v["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["plugin_id"] == "extra@mkt" && p["disable_candidate"] == true));
+    assert!(!text.contains("CLI_TOK_SECRET") && !text.contains("CLI_CLAUDE_MARKER"));
+    // nothing moved
+    assert!(h.join(".agents/skills/stale-skill").is_dir());
+    assert!(fs::symlink_metadata(h.join(".codex/skills/dead")).is_ok());
+
+    // no execute path exists
+    let ex = Command::new(sj_bin())
+        .args(["llm-audit", "--execute"])
+        .output()
+        .unwrap();
+    assert_ne!(ex.status.code(), Some(0));
+}

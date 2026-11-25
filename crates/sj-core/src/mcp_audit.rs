@@ -1,4 +1,4 @@
-use crate::protect::ProtectionContext;
+use crate::protect::{check_path_protection, ProtectionContext};
 use crate::{is_sensitive_flag_name, redact_secrets, SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -9,6 +9,8 @@ use std::process::Command;
 #[derive(Debug, Clone, Default)]
 pub struct McpAuditOptions {
     pub config_dirs: Vec<PathBuf>,
+    /// Overrides `$HOME` for default config discovery and protected-path checks.
+    pub home_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -25,6 +27,10 @@ pub struct ObservedProcess {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ConfiguredMcpServer {
     pub server_name: String,
+    /// Owning client inferred from the config path (`codex`, `gemini`, `cursor`, `vscode`, ...).
+    pub client: String,
+    /// False when the config marks the server `enabled = false` / `"disabled": true`.
+    pub enabled: bool,
     pub source_file: String,
     pub transport: String,
     pub command: Option<String>,
@@ -365,8 +371,12 @@ fn parse_json_mcp_config(
                 "stdio".to_string()
             };
 
+            let enabled = cfg_obj.get("enabled").and_then(|v| v.as_bool()) != Some(false)
+                && cfg_obj.get("disabled").and_then(|v| v.as_bool()) != Some(true);
             servers.push(ConfiguredMcpServer {
                 server_name: name.clone(),
+                client: client_from_path(source_file),
+                enabled,
                 source_file: source_file.to_string(),
                 transport,
                 command,
@@ -378,6 +388,23 @@ fn parse_json_mcp_config(
     }
 
     Ok(())
+}
+
+fn client_from_path(source_file: &str) -> String {
+    let low = source_file.replace('\\', "/").to_ascii_lowercase();
+    for (needle, client) in [
+        ("/.codex/", "codex"),
+        ("/.gemini/", "gemini"),
+        ("/.cursor/", "cursor"),
+        ("/code/user/", "vscode"),
+        ("/opencode/", "opencode"),
+        ("/.claude", "claude"),
+    ] {
+        if low.contains(needle) {
+            return client.to_string();
+        }
+    }
+    "other".to_string()
 }
 
 fn strip_toml_comment(line: &str) -> &str {
@@ -467,6 +494,7 @@ fn parse_toml_mcp_config(
     struct TempServer {
         command: Option<String>,
         url: Option<String>,
+        enabled: Option<bool>,
         args: Vec<String>,
         env: BTreeMap<String, String>,
     }
@@ -513,6 +541,7 @@ fn parse_toml_mcp_config(
         match key.as_str() {
             "command" => entry.command = Some(redact_secrets(&unquote_toml_str(val))),
             "url" => entry.url = Some(unquote_toml_str(val)),
+            "enabled" => entry.enabled = unquote_toml_str(val).parse::<bool>().ok(),
             "args" => entry.args = parse_toml_string_array(val),
             "env" if val.starts_with('{') && val.ends_with('}') => {
                 let inner = &val[1..val.len() - 1];
@@ -536,6 +565,8 @@ fn parse_toml_mcp_config(
         };
         servers.push(ConfiguredMcpServer {
             server_name: name,
+            client: client_from_path(source_file),
+            enabled: ts.enabled != Some(false),
             source_file: source_file.to_string(),
             transport,
             command: ts.command,
@@ -547,9 +578,14 @@ fn parse_toml_mcp_config(
 
 fn default_mcp_config_files(home_dir: &Path) -> Vec<PathBuf> {
     let mut candidates = vec![
-        home_dir.join(".claude.json"),
-        home_dir.join(".claude").join("settings.json"),
+        // `~/.claude.json` and `~/.claude/**` are never opened (protected).
         home_dir.join(".codex").join("config.toml"),
+        home_dir.join(".gemini").join("settings.json"),
+        home_dir
+            .join(".gemini")
+            .join("antigravity")
+            .join("mcp_config.json"),
+        home_dir.join(".mcp.json"),
         home_dir.join(".cursor").join("mcp.json"),
         home_dir
             .join(".config")
@@ -623,7 +659,12 @@ fn infer_mcp_server_name(
         }
         for arg in &srv.args {
             let arg_low = arg.to_ascii_lowercase();
-            if !arg_low.starts_with('-') && arg_low.len() >= 6 && low.contains(&arg_low) {
+            // sanitized placeholders are not identifying text
+            if !arg_low.starts_with('-')
+                && arg_low.len() >= 6
+                && !arg_low.contains("<redacted>")
+                && low.contains(&arg_low)
+            {
                 return Some(srv.server_name.clone());
             }
         }
@@ -847,7 +888,10 @@ pub fn audit_mcp_with_processes(
     opts: &McpAuditOptions,
     processes: &[ObservedProcess],
 ) -> Result<McpAuditReport, SjError> {
-    let ctx = ProtectionContext::from_env();
+    let ctx = match &opts.home_dir {
+        Some(h) => ProtectionContext::new(h.clone(), Vec::new()),
+        None => ProtectionContext::from_env(),
+    };
     let files = if opts.config_dirs.is_empty() {
         default_mcp_config_files(&ctx.home_dir)
     } else {
@@ -861,6 +905,10 @@ pub fn audit_mcp_with_processes(
 
     for file in files {
         let file_str = file.to_string_lossy().into_owned();
+        if check_path_protection(&file, &ctx).protected {
+            warnings.push(format!("protected config file not read: {file_str}"));
+            continue;
+        }
         let Ok(raw) = fs::read_to_string(&file) else {
             warnings.push(format!("unreadable config file: {file_str}"));
             continue;
@@ -1050,6 +1098,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
 
         let opts = McpAuditOptions {
             config_dirs: vec![tmp.path().to_path_buf()],
+            home_dir: None,
         };
         let report = audit_mcp_with_processes(&opts, &processes).unwrap();
 
@@ -1101,6 +1150,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
 
         let opts = McpAuditOptions {
             config_dirs: vec![tmp.path().to_path_buf()],
+            home_dir: None,
         };
         let report = audit_mcp_with_processes(&opts, &[]).unwrap();
         let json = serde_json::to_string(&report).unwrap();
@@ -1144,6 +1194,7 @@ DOCS_API_KEY = "{dummy_secret_a}"
         .unwrap();
         let opts = McpAuditOptions {
             config_dirs: vec![tmp.path().to_path_buf()],
+            home_dir: None,
         };
         let report = audit_mcp_with_processes(&opts, &[]).unwrap();
         let json = serde_json::to_string(&report).unwrap();
@@ -1158,5 +1209,39 @@ DOCS_API_KEY = "{dummy_secret_a}"
                 f.key_name
             );
         }
+    }
+
+    #[test]
+    fn mcp_audit_redacted_placeholder_args_never_match_unrelated_processes() {
+        let tmp = tempdir().unwrap();
+        fs::write(
+            tmp.path().join("mcp.json"),
+            r#"{"mcpServers":{"zzsolo":{"command":"npx","args":["zz-solo-mcp","--token","SOLO_SECRET_VALUE"]}}}"#,
+        )
+        .unwrap();
+        let procs = vec![ObservedProcess {
+            pid: 900,
+            ppid: 800,
+            uid: None,
+            start_time: String::new(),
+            elapsed_secs: 10,
+            command: "other-tool --note <REDACTED> mcp".to_string(),
+        }];
+        let report = audit_mcp_with_processes(
+            &McpAuditOptions {
+                config_dirs: vec![tmp.path().to_path_buf()],
+                home_dir: None,
+            },
+            &procs,
+        )
+        .unwrap();
+        assert!(
+            report
+                .running_processes
+                .iter()
+                .all(|r| r.server_name != "zzsolo"),
+            "{:?}",
+            report.running_processes
+        );
     }
 }

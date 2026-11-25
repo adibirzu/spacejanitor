@@ -134,7 +134,7 @@ fn has_mcp_lineage(command: &str) -> bool {
 }
 
 /// Wrapper hosts that supervise MCP children and must never be signalled.
-fn is_protected_wrapper(command: &str) -> bool {
+pub(crate) fn is_protected_wrapper(command: &str) -> bool {
     let low = command.to_ascii_lowercase();
     low.contains("codex-code-mode-host")
         || low.contains("codexcli.app/contents/macos/codex app-server")

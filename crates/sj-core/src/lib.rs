@@ -2,6 +2,7 @@
 //! orphan git validator, and deterministic dry-run remediation planner.
 
 pub mod blockers;
+pub mod llm_audit;
 pub mod mcp_audit;
 pub mod memory;
 pub mod orphans;
@@ -376,7 +377,6 @@ mod tests {
             "{keep}"
         );
     }
-    use super::*;
 
     const TEST_HOME: &str = "/home/developer";
 

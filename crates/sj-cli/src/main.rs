@@ -1,6 +1,7 @@
 use clap::{Parser, Subcommand};
 use sj_core::{
     blockers::collect_blockers_report,
+    llm_audit::{audit_llm_fleet, AuditPolicy, LlmAuditOptions},
     mcp_audit::{audit_mcp_fleet, McpAuditOptions},
     memory::{collect_memory_report, MemoryOptions},
     orphans::{inspect_orphans, OrphanOptions},
@@ -94,6 +95,31 @@ enum Commands {
         /// Override MCP configuration directories to scan
         #[arg(long = "config-dir")]
         config_dir: Vec<PathBuf>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Read-only audit of unused LLM plugins/skills, unused MCP servers and idle MCP sessions
+    /// (dry-run only: there is no execute path in this release)
+    LlmAudit {
+        /// Home directory to inventory (defaults to $HOME / %USERPROFILE%)
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Idle-session threshold in hours
+        #[arg(long, default_value_t = 2.0)]
+        idle_hours: f64,
+        /// Skill staleness threshold in days
+        #[arg(long, default_value_t = 30)]
+        unused_skill_days: u64,
+        /// Additional plugin ids to keep enabled (repeatable)
+        #[arg(long = "keep-plugin")]
+        keep_plugin: Vec<String>,
+        /// Additional skill names to keep (repeatable)
+        #[arg(long = "keep-skill")]
+        keep_skill: Vec<String>,
+        /// Additional MCP server names to keep (repeatable)
+        #[arg(long = "keep-mcp")]
+        keep_mcp: Vec<String>,
         /// Emit versioned JSON output
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -389,8 +415,25 @@ fn dispatch_rpc_method(
                         .collect()
                 })
                 .unwrap_or_default();
-            let report = audit_mcp_fleet(&McpAuditOptions { config_dirs })
-                .map_err(|e| (-32000, e.to_string()))?;
+            let report = audit_mcp_fleet(&McpAuditOptions {
+                config_dirs,
+                home_dir: None,
+            })
+            .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "llm_audit" => {
+            let home_dir = params
+                .get("home")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.home_dir.clone());
+            let report = audit_llm_fleet(&LlmAuditOptions {
+                home_dir,
+                policy: AuditPolicy::default(),
+                now_epoch_secs: None,
+            })
+            .map_err(|e| (-32000, e.to_string()))?;
             serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
         }
         "plan_reap" => {
@@ -807,6 +850,7 @@ fn run() -> Result<(), CliError> {
         Commands::McpAudit { config_dir, json } => {
             let report = audit_mcp_fleet(&McpAuditOptions {
                 config_dirs: config_dir,
+                home_dir: None,
             })?;
             if json {
                 println!(
@@ -822,6 +866,48 @@ fn run() -> Result<(), CliError> {
                     report.duplicate_groups.len(),
                     report.orphan_processes.len(),
                     report.secret_findings.len()
+                );
+            }
+        }
+        Commands::LlmAudit {
+            home,
+            idle_hours,
+            unused_skill_days,
+            keep_plugin,
+            keep_skill,
+            keep_mcp,
+            json,
+        } => {
+            let mut policy = AuditPolicy {
+                idle_session_hours: idle_hours,
+                unused_skill_days,
+                ..AuditPolicy::default()
+            };
+            policy.keep_enabled_plugins.extend(keep_plugin);
+            policy.keep_enabled_skills.extend(keep_skill);
+            policy.keep_enabled_mcps.extend(keep_mcp);
+            let home_dir = home.unwrap_or_else(|| ctx.home_dir.clone());
+            let report = audit_llm_fleet(&LlmAuditOptions {
+                home_dir,
+                policy,
+                now_epoch_secs: None,
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "llm-audit (dry-run): plugins={} stale_plugin_caches={} stale_skills={} broken_symlinks={} duplicate_skills={} unused_mcp={} idle_sessions={} planned_actions={}",
+                    report.plugins.len(),
+                    report.stale_plugin_caches.len(),
+                    report.stale_skills.len(),
+                    report.broken_skill_symlinks.len(),
+                    report.duplicate_skill_dirs.len(),
+                    report.unused_mcp_servers.len(),
+                    report.idle_sessions.len(),
+                    report.planned_actions.len()
                 );
             }
         }
