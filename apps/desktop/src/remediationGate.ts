@@ -108,7 +108,6 @@ export class RemediationGate {
   private planRoot: string;
   private active: ActivePlan | null = null;
   private readonly approved = new Map<string, RemediationCandidate>();
-  private readonly usedDigests = new Set<string>();
   private executing = false;
 
   constructor(options: { homeDir?: string; runSj?: RunSj; planRoot?: string } = {}) {
@@ -189,7 +188,6 @@ export class RemediationGate {
     nowMs?: number;
   }): { allowed: boolean; reason: string; plan?: ActivePlan } {
     if (this.executing) return { allowed: false, reason: "remediation_mutex_locked" };
-    if (this.usedDigests.has(params.planSha256)) return { allowed: false, reason: "confirmation_token_already_used" };
     const active = this.active;
     if (!active) return { allowed: false, reason: "no_active_dry_run_plan" };
     if (active.items.length === 0) return { allowed: false, reason: "empty_or_missing_plan" };
@@ -198,7 +196,10 @@ export class RemediationGate {
       return { allowed: false, reason: "confirmation_phrase_mismatch" };
     }
     if ((params.nowMs ?? Date.now()) > active.plan.expiresAtMs) return { allowed: false, reason: "confirmation_token_expired" };
-    this.usedDigests.add(params.planSha256);
+    // Single use per dry-run. sj's digest is content-addressed (no nonce), so single use is enforced
+    // by consuming this plan instance, never by remembering the digest: re-planning the same
+    // leftovers after a failed or cancelled cleanup must stay possible.
+    this.active = null;
     return { allowed: true, reason: "verified", plan: active };
   }
 
@@ -213,19 +214,28 @@ export class RemediationGate {
     const removed: string[] = [];
     const failed: Array<{ path: string; error: string }> = [];
     try {
-      let first = true;
+      // The user confirmed one digest. If sj no longer reports it, nothing runs.
+      let planError: string | null = null;
+      try {
+        const current = parseSjPlan(await this.runSj(["plan", active.root, "--json"], { timeoutMs: PLAN_TIMEOUT_MS }));
+        if (current.planSha256 !== active.sha) planError = "plan_changed_since_confirmation";
+      } catch (err) {
+        planError = reasonOf(err);
+      }
       for (const item of active.items) {
+        if (planError) {
+          failed.push({ path: item.path, error: planError });
+          continue;
+        }
         try {
-          await this.executeItem(active, item, first);
+          await this.executeItem(active, item);
           removed.push(item.path);
         } catch (err) {
           failed.push({ path: item.path, error: reasonOf(err) });
         }
-        first = false;
       }
     } finally {
       this.executing = false;
-      this.active = null;
     }
     return {
       schema: "spacejanitor.reap.v1",
@@ -237,7 +247,7 @@ export class RemediationGate {
     };
   }
 
-  private async executeItem(active: ActivePlan, item: SjPlanItem, first: boolean): Promise<void> {
+  private async executeItem(active: ActivePlan, item: SjPlanItem): Promise<void> {
     // sj rebuilds and re-proves the plan at execution. Removing an item changes the digest of the
     // rest, so later items are bound to a freshly planned digest, but only when sj still reports
     // the exact item the user confirmed.
@@ -245,9 +255,6 @@ export class RemediationGate {
     const current = fresh.items.find((i) => i.id === item.id);
     if (!current || JSON.stringify(current) !== JSON.stringify(item)) {
       throw new Error("item_changed_since_plan");
-    }
-    if (first && fresh.planSha256 !== active.sha) {
-      throw new Error("plan_changed_since_confirmation");
     }
     const out = await this.runSj(
       ["plan", active.root, "--execute", "--confirm", "--plan-sha256", fresh.planSha256, "--item", item.id, "--json"],

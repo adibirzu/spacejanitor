@@ -126,7 +126,48 @@ test("execute: wrong sha, wrong phrase, expiry, reuse and concurrent runs are re
   assert.equal(ok.executed, true);
   assert.deepEqual(ok.removed, ["/h/.Trash/a"]);
   const reuse = await gate.run({ planSha256: SHA, phrase: plan.confirmationPhrase, nowMs: 1002 });
-  assert.equal(reuse.error, "confirmation_token_already_used");
+  assert.equal(reuse.error, "no_active_dry_run_plan", "a consumed plan cannot be replayed");
+});
+
+test("a failed or cancelled cleanup can be retried: sj's digest is content-addressed, so re-planning the same items works again", async () => {
+  const a = item("/h/.Trash/a", "item_a");
+  let fail = true;
+  const sj = fakeSj((args) => {
+    if (!args.includes("--execute")) return sjPlan([a]);
+    if (fail) return new core.SjGateError("sj_exit_2");
+    return { schema: "spacejanitor.proposal.v1", mode: "executed", mutated: true, plan_sha256: SHA, executed_item: a };
+  });
+  const gate = new RemediationGate({ runSj: sj.run, planRoot: "/h" });
+  gate.registerApprovedCandidates([cand(a.path)]);
+  const p1 = await gate.createDryRunPlan([cand(a.path)]);
+  assert.equal((await gate.run({ planSha256: p1.planSha256, phrase: p1.confirmationPhrase })).executed, false);
+  fail = false;
+  const p2 = await gate.createDryRunPlan([cand(a.path)]);
+  assert.equal(p2.planSha256, p1.planSha256, "same leftovers hash to the same sj digest");
+  const res = await gate.run({ planSha256: p2.planSha256, phrase: p2.confirmationPhrase });
+  assert.equal(res.executed, true);
+});
+
+test("a plan that changed since confirmation aborts EVERY item, not just the first", async () => {
+  const items = [item("/h/.Trash/a", "item_a"), item("/h/.Trash/b", "item_b")];
+  let phase = 0;
+  const sj = fakeSj((args) => {
+    if (args.includes("--execute")) return new Error("must not execute");
+    phase += 1;
+    // confirmed plan has both items; by execution time sj reports a different set (new digest)
+    return phase === 1 ? sjPlan(items) : sjPlan(items, {}, "d".repeat(64));
+  });
+  const gate = new RemediationGate({ runSj: sj.run, planRoot: "/h" });
+  gate.registerApprovedCandidates(items.map((i) => cand(i.path)));
+  const plan = await gate.createDryRunPlan(items.map((i) => cand(i.path)));
+  const res = await gate.run({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
+  assert.equal(res.executed, false);
+  assert.deepEqual(res.removed, []);
+  assert.deepEqual(
+    (res.failed as Array<{ error: string }>).map((f) => f.error),
+    ["plan_changed_since_confirmation", "plan_changed_since_confirmation"]
+  );
+  assert.equal(sj.calls.some((c) => c.includes("--execute")), false);
 });
 
 test("execute: every deletion is an sj --execute call bound to the fresh plan sha and item id", async () => {
