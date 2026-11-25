@@ -464,7 +464,7 @@ test("R5-B18: collectCleanableCaches offers the macOS Library/Caches targets", a
       fs.mkdirSync(path.join(home, rel), { recursive: true });
       fs.writeFileSync(path.join(home, rel, "f"), "x");
     }
-    const found = (await collectCleanableCaches({ homeDir: home })).map((c) => path.relative(home, c.path)).sort();
+    const found = (await collectCleanableCaches({ homeDir: home })).map((c) => path.relative(home, c.path).split(path.sep).join("/")).sort();
     assert.deepEqual(found, [".npm/_cacache", "Library/Caches/Homebrew", "Library/Caches/pip", "Library/Caches/pnpm"]);
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
