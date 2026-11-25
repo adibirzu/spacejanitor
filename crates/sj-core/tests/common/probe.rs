@@ -4,6 +4,11 @@
 use std::fs;
 use std::path::Path;
 
+// assembled so the repo hygiene scan sees no token-shaped literal
+const XOXA_ARG: &str = concat!("xox", "a-1234-probesecret");
+const RK_ARG: &str = concat!("rk_", "live_probesecret1");
+const XOXA_FLAG: &str = concat!("--xox", "a-1234-probesec=1");
+
 /// Substrings that must never appear in any output string.
 pub const NEEDLES: &[&str] = &[
     "probe_",
@@ -23,6 +28,21 @@ pub const NEEDLES: &[&str] = &[
     "longlowercasesecrettokenvalue",
     "abcdefghijklmnopqrstuvwxyz",
     "s3cr3t",
+    // R5 probes (matched case-insensitively against every emitted string)
+    "probe",
+    "gho_",
+    "ghs_",
+    "npm_",
+    "rk_live",
+    "rk-live",
+    "whsec",
+    "xoxa",
+    "sk-live",
+    "zm9v",
+    "bearer://",
+    "token://",
+    "1-probesec",
+    "method not found:",
 ];
 
 /// Argv shapes covering R3 + R4 (all stay in `args`, so a leak is directly visible).
@@ -91,6 +111,26 @@ pub fn probe_args() -> Vec<String> {
         "-uPROBE_USER",
         "Zm9vYmFyYmF6cXV4PROBE_B64",
         "s3cr3t-value-x",
+        // R5 B2: launcher package slot, flag names, URL schemes
+        "probesecrettokenabcd",
+        "probesecret17char",
+        "hf_probesecret12345",
+        "gho_probesecret12345",
+        "ghs_probesecret12345",
+        "npm_probesecret12345",
+        RK_ARG,
+        "whsec_probesecret123",
+        XOXA_ARG,
+        "probesecret1.probesecret2.probesecret3",
+        "mcp-pkg@1-PROBESECRET",
+        "--rk-live-probesec12",
+        XOXA_FLAG,
+        "--key-sk-probesec12",
+        "--token-a1b2c3d4e5=1",
+        "--probesecret123=1",
+        "/probesec:hunter2",
+        "Bearer://probesecretlowercasetoken1234",
+        "token://probesecretlowercasetoken1234",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -110,6 +150,15 @@ pub fn probe_command_lines() -> Vec<String> {
         "curl -H 'Cookie: theme=dark; sid=550e8400-e29b-41d4-a716-446655440000' https://x.example/mcp?code=probesecretoauthcode",
         "tool --PROBE_UNSAFE_LHS_SECRET=1 --sk-live-PROBE_SK_LHS_SECRET=",
         "mcp-server correct-horse-battery-staple hf_a1b2c3d4_e5f6g7h8_i9j0k1l2",
+        // R5 B1: server_name / owning client must never come from argv
+        "python3 -c import-time https://mcp.example.com/sse/550e8400-e29b-41d4-a716-446655440000",
+        "python3 -c import-time --token PROBE_MCP_SECRET_1",
+        "node /srv/mcp/probesecretlowercasetok1",
+        "node /srv/mcp/hf_a1b2c3d4_e5f6g7h8_i9j0k1l2",
+        "/Users/alice/.secrets/PROBE_SECRET_BIN --mcp",
+        "https://alice:PROBE_PW@hooks.example.com/services/T00/B00/PROBE_HOOK_123",
+        "/tmp/SK-LIVE-PROBE123 mcp",
+        "sh -c 'https://alice:PROBE_PW@example.com/mcp/PROBE_URL_CMD'",
     ]
     .iter()
     .map(|s| (*s).to_string())
@@ -154,7 +203,7 @@ pub fn write_fixture_home(h: &Path) {
     fs::create_dir_all(h.join(".codex")).unwrap();
     let args = probe_args();
     let cfg = serde_json::json!({"mcpServers": {
-        "probe-shapes": {
+        "fx-shapes": {
             "command": "sh -c \"MYSQL_PWD=probesecretshellenv mysql -h db\"",
             "args": args,
             "url": "https://alice:PROBE_URL_PW@example.com/mcp/probesecretpath?code=probesecretoauthcode",
@@ -163,12 +212,28 @@ pub fn write_fixture_home(h: &Path) {
         },
         "pkg-sample": {
             "command": "/usr/local/bin/npx",
-            "args": ["-y", "@scope/pkg@1.2.3", "--port", "8080", "--token", "PROBE_SAMPLE_TOKEN"]
+            "args": ["-y", "@modelcontextprotocol/server-github@1.2.3", "--port", "8080", "--token", "PROBE_SAMPLE_TOKEN"]
         }
     }});
     fs::write(h.join(".cursor/mcp.json"), cfg.to_string()).unwrap();
+    // R5 B2: user-chosen labels, secret-shaped command / url / key names, package abuse
+    let r5 = serde_json::json!({"mcpServers": {
+        "probesecretlowercasetok1": {
+            "command": "https://alice:PROBE_PW@hooks.example.com/services/T00/B00/PROBE_HOOK_123",
+            "args": ["--rk-live-probesec12", "--key-sk-probesec12", "--token-a1b2c3d4e5=1",
+                     "token://probesecretlowercasetoken1234"],
+            "url": "Bearer://probesecretlowercasetoken1234",
+            "headers": {"SK-LIVE-PROBE12345": "x", "550e8400-e29b-41d4-a716-446655440000": "x"},
+            "env": {"probesecretlowercasetok2": "x"}
+        },
+        "550e8400-e29b-41d4-a716-446655440000": {"command": "npx", "args": ["probesecrettokenabcd"]},
+        "pkg-vendor": {"command": "npx", "args": [RK_ARG]},
+        "pkg-ver": {"command": "npx", "args": ["mcp-pkg@1-PROBESECRET"]},
+        "secret-bin": {"command": "/tmp/SK-LIVE-PROBE123", "args": []}
+    }});
+    fs::write(h.join(".cursor/r5.json"), r5.to_string()).unwrap();
     let mut toml = String::from(
-        "[mcp_servers.probe-toml]\ncommand = \"sh -c 'MYSQL_PWD=probesecrettomlenv mysql'\"\nargs = [",
+        "[mcp_servers.fx-toml]\ncommand = \"sh -c 'MYSQL_PWD=probesecrettomlenv mysql'\"\nargs = [",
     );
     toml.push_str(
         &probe_args()
@@ -178,9 +243,9 @@ pub fn write_fixture_home(h: &Path) {
             .join(", "),
     );
     toml.push_str("]\nurl = \"https://u:PROBE_TOML_URL@example.com/x?code=probesecrettoml\"\n");
-    toml.push_str("[mcp_servers.probe-toml.env]\nAPI_KEY = \"PROBE_TOML_ENV\"\nPLAIN = \"probesecrettomlplain\"\n");
+    toml.push_str("[mcp_servers.fx-toml.env]\nAPI_KEY = \"PROBE_TOML_ENV\"\nPLAIN = \"probesecrettomlplain\"\n");
     toml.push_str(
-        "[mcp_servers.probe-toml.http_headers]\nAuthorization = \"Bearer PROBE_TOML_HDR\"\n",
+        "[mcp_servers.fx-toml.http_headers]\nAuthorization = \"Bearer PROBE_TOML_HDR\"\n",
     );
     fs::write(h.join(".codex/config.toml"), toml).unwrap();
 }

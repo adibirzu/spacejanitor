@@ -1,5 +1,9 @@
 use crate::protect::{check_path_protection, ProtectionContext};
-use crate::redact::{redact_argv, redact_command, safe_key_name, safe_label, safe_url};
+use crate::redact::{
+    env_key_label, header_key_label, is_secret_name, known_client, known_command, known_key,
+    known_package_in, redact_argv, redact_command, server_label, unknown_label, url_label,
+};
+use crate::safe_read::{read_config_file, ReadPolicy};
 use crate::{SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -40,8 +44,15 @@ pub struct ConfiguredMcpServer {
     pub args_count: usize,
     /// `scheme://host` only; never userinfo, path, query or fragment.
     pub url: Option<String>,
+    /// Env key names from the fixed known-safe list only; every other key is only counted.
     pub env_keys: Vec<String>,
+    pub env_key_count: usize,
     pub header_keys: Vec<String>,
+    pub header_key_count: usize,
+    /// Lowercased raw tokens used only to *match* a live process to this config entry. They
+    /// decide which label is shown and are never serialized or printed.
+    #[serde(skip)]
+    pub(crate) match_tokens: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -112,21 +123,7 @@ fn is_env_var_reference(val: &str) -> bool {
 
 fn looks_like_secret_value(val: &str) -> bool {
     let t = val.trim();
-    if t.is_empty() || is_env_var_reference(t) {
-        return false;
-    }
-    let low = t.to_ascii_lowercase();
-    low.starts_with("sk-")
-        || low.starts_with("sk_")
-        || low.starts_with("ghp_")
-        || low.starts_with("github_pat_")
-        || low.starts_with("glpat-")
-        || low.starts_with("akia")
-        || low.starts_with("aiza")
-        || low.starts_with("xoxb-")
-        || low.starts_with("xoxp-")
-        || low.starts_with("bearer ")
-        || low.starts_with("basic ")
+    !t.is_empty() && !is_env_var_reference(t) && crate::redact::has_known_secret_prefix(t)
 }
 
 fn redact_secret_preview(_val: &str) -> String {
@@ -141,23 +138,33 @@ fn sanitize_args(
     server_name: &str,
     source_file: &str,
     findings: &mut Vec<SecretFinding>,
-) -> Vec<String> {
-    redact_argv(command, args)
+) -> (Vec<String>, Vec<String>) {
+    let mut tokens = Vec::new();
+    let out = redact_argv(command, args)
         .into_iter()
-        .map(|r| {
-            if r.redacted && !matches!(r.label.as_str(), "command" | "shell-inner" | "url") {
+        .zip(args)
+        .map(|(r, raw)| {
+            // a process matches this entry by its package slot or a plain positional, never by
+            // the value of a flag
+            if (r.label == "package" || (!r.redacted && !r.text.starts_with('-'))) && raw.len() >= 6
+            {
+                tokens.push(raw.to_ascii_lowercase());
+            }
+            // only a real secret signal is a finding; benign redacted values are not
+            if r.secret {
                 findings.push(SecretFinding {
                     server_name: server_name.to_string(),
                     source_file: source_file.to_string(),
                     location: "args".to_string(),
-                    // labels are fixed words or flag names already validated by redact.rs
+                    // labels are catalog flag names or fixed placeholders (redact.rs)
                     key_name: r.label,
                     redacted_preview: redact_secret_preview(&r.text),
                 });
             }
             r.text
         })
-        .collect()
+        .collect();
+    (out, tokens)
 }
 
 fn inspect_env_map(
@@ -165,10 +172,12 @@ fn inspect_env_map(
     server_name: &str,
     source_file: &str,
     findings: &mut Vec<SecretFinding>,
-) -> Vec<String> {
+) -> (Vec<String>, usize) {
     let mut keys = Vec::new();
     for (k, v) in env_map {
-        keys.push(safe_key_name(k));
+        if let Some(known) = known_key(k) {
+            keys.push(known);
+        }
         if !v.trim().is_empty()
             && !is_env_var_reference(v)
             && (is_sensitive_env_key(k) || looks_like_secret_value(v))
@@ -177,12 +186,43 @@ fn inspect_env_map(
                 server_name: server_name.to_string(),
                 source_file: source_file.to_string(),
                 location: "env".to_string(),
-                key_name: safe_key_name(k),
+                key_name: env_key_label(k),
                 redacted_preview: redact_secret_preview(v),
             });
         }
     }
-    keys
+    keys.sort();
+    keys.dedup();
+    (keys, env_map.len())
+}
+
+/// Header names: a finding only when the name itself names a credential.
+fn inspect_header_keys<'a>(
+    keys: impl Iterator<Item = &'a String>,
+    server_name: &str,
+    source_file: &str,
+    findings: &mut Vec<SecretFinding>,
+) -> (Vec<String>, usize) {
+    let mut known = Vec::new();
+    let mut n = 0;
+    for k in keys {
+        n += 1;
+        if let Some(kn) = known_key(k) {
+            known.push(kn);
+        }
+        if is_secret_name(k) {
+            findings.push(SecretFinding {
+                server_name: server_name.to_string(),
+                source_file: source_file.to_string(),
+                location: "headers".to_string(),
+                key_name: header_key_label(k),
+                redacted_preview: redact_secret_preview(k),
+            });
+        }
+    }
+    known.sort();
+    known.dedup();
+    (known, n)
 }
 
 fn parse_json_mcp_config(
@@ -224,29 +264,17 @@ fn parse_json_mcp_config(
                         .collect()
                 })
                 .unwrap_or_default();
-            let server_label = safe_label(name);
-            let args = sanitize_args(raw_command, &raw_args, &server_label, source_file, findings);
-            let url = cfg_obj
-                .get("url")
-                .and_then(|v| v.as_str())
-                .map(|u| safe_url(u).unwrap_or_else(|| crate::redact::RED.to_string()));
-            let mut header_keys: Vec<String> = Vec::new();
-            for hk in ["headers", "http_headers"] {
-                if let Some(h) = cfg_obj.get(hk).and_then(|v| v.as_object()) {
-                    for k in h.keys() {
-                        let kn = safe_key_name(k);
-                        findings.push(SecretFinding {
-                            server_name: server_label.clone(),
-                            source_file: source_file.to_string(),
-                            location: "headers".to_string(),
-                            key_name: kn.clone(),
-                            redacted_preview: redact_secret_preview(k),
-                        });
-                        header_keys.push(kn);
-                    }
-                }
-            }
-            header_keys.sort();
+            let server_label = server_label(name);
+            let (args, match_tokens) =
+                sanitize_args(raw_command, &raw_args, &server_label, source_file, findings);
+            let url = cfg_obj.get("url").and_then(|v| v.as_str()).map(url_label);
+            let header_names: Vec<String> = ["headers", "http_headers"]
+                .iter()
+                .filter_map(|hk| cfg_obj.get(*hk).and_then(|v| v.as_object()))
+                .flat_map(|h| h.keys().cloned())
+                .collect();
+            let (header_keys, header_key_count) =
+                inspect_header_keys(header_names.iter(), &server_label, source_file, findings);
 
             let mut env_map = BTreeMap::new();
             if let Some(env_obj) = cfg_obj.get("env").and_then(|v| v.as_object()) {
@@ -256,7 +284,8 @@ fn parse_json_mcp_config(
                     }
                 }
             }
-            let env_keys = inspect_env_map(&env_map, &server_label, source_file, findings);
+            let (env_keys, env_key_count) =
+                inspect_env_map(&env_map, &server_label, source_file, findings);
             let transport = if cfg_obj.contains_key("url") {
                 "http".to_string()
             } else {
@@ -276,7 +305,10 @@ fn parse_json_mcp_config(
                 args,
                 url,
                 env_keys,
+                env_key_count,
                 header_keys,
+                header_key_count,
+                match_tokens,
             });
         }
         break;
@@ -493,32 +525,18 @@ fn parse_toml_mcp_config(
     }
 
     for (raw_name, ts) in map {
-        let name = safe_label(&raw_name);
-        let args = sanitize_args(
+        let name = server_label(&raw_name);
+        let (args, match_tokens) = sanitize_args(
             ts.command.as_deref(),
             &ts.args,
             &name,
             source_file,
             findings,
         );
-        let env_keys = inspect_env_map(&ts.env, &name, source_file, findings);
-        let mut header_keys: Vec<String> = Vec::new();
-        for k in &ts.header_keys {
-            let kn = safe_key_name(k);
-            findings.push(SecretFinding {
-                server_name: name.clone(),
-                source_file: source_file.to_string(),
-                location: "headers".to_string(),
-                key_name: kn.clone(),
-                redacted_preview: redact_secret_preview(k),
-            });
-            header_keys.push(kn);
-        }
-        header_keys.sort();
-        let url = ts
-            .url
-            .as_deref()
-            .map(|u| safe_url(u).unwrap_or_else(|| crate::redact::RED.to_string()));
+        let (env_keys, env_key_count) = inspect_env_map(&ts.env, &name, source_file, findings);
+        let (header_keys, header_key_count) =
+            inspect_header_keys(ts.header_keys.iter(), &name, source_file, findings);
+        let url = ts.url.as_deref().map(url_label);
         let transport = if ts.url.is_some() {
             "http".to_string()
         } else {
@@ -535,7 +553,10 @@ fn parse_toml_mcp_config(
             args,
             url,
             env_keys,
+            env_key_count,
             header_keys,
+            header_key_count,
+            match_tokens,
         });
     }
 }
@@ -578,30 +599,61 @@ fn default_mcp_config_files(home_dir: &Path) -> Vec<PathBuf> {
     candidates.into_iter().filter(|p| p.is_file()).collect()
 }
 
-fn collect_config_files_in_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
+/// Enumerates `*.json` / `*.toml` under explicit `--config-dir` roots. Every root and every
+/// entry is protection-checked *before* it is descended into or named, entries are classified
+/// without following symlinks, and a protected root yields a single `protected_target` warning
+/// and nothing else.
+fn collect_config_files_in_dirs(
+    dirs: &[PathBuf],
+    ctx: &ProtectionContext,
+    warnings: &mut Vec<String>,
+) -> Vec<PathBuf> {
+    const MAX_DEPTH: usize = 3;
     let mut files = Vec::new();
     for dir in dirs {
-        if dir.is_file() {
+        let canon = fs::canonicalize(dir).ok();
+        let protected = check_path_protection(dir, ctx).protected
+            || canon
+                .as_ref()
+                .is_some_and(|c| check_path_protection(c, ctx).protected);
+        if protected {
+            warnings.push(format!("protected_target: {}", dir.display()));
+            continue;
+        }
+        let Ok(lm) = fs::symlink_metadata(dir) else {
+            continue;
+        };
+        if lm.file_type().is_symlink() {
+            warnings.push(format!("symlinked_config_dir not read: {}", dir.display()));
+            continue;
+        }
+        if lm.is_file() {
             files.push(dir.clone());
             continue;
         }
-        if !dir.is_dir() {
+        if !lm.is_dir() {
             continue;
         }
-        for entry in jwalk::WalkDir::new(dir)
-            .max_depth(3)
-            .follow_links(false)
-            .skip_hidden(false)
-            .into_iter()
-            .flatten()
-        {
-            if !entry.file_type().is_file() {
-                continue;
-            }
-            let p = entry.path();
-            if let Some(ext) = p.extension().and_then(|e| e.to_str()) {
-                if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("toml") {
-                    files.push(p);
+        let mut stack: Vec<(PathBuf, usize)> = vec![(dir.clone(), 0)];
+        while let Some((d, depth)) = stack.pop() {
+            let Ok(rd) = fs::read_dir(&d) else { continue };
+            for e in rd.flatten() {
+                let p = e.path();
+                // protection first: a protected entry is neither descended into nor named
+                if check_path_protection(&p, ctx).protected {
+                    continue;
+                }
+                let Ok(ft) = e.file_type() else { continue };
+                if ft.is_dir() {
+                    if depth + 1 < MAX_DEPTH {
+                        stack.push((p, depth + 1));
+                    }
+                } else if ft.is_file() {
+                    if let Some(ext) = p.extension().and_then(|x| x.to_str()) {
+                        if ext.eq_ignore_ascii_case("json") || ext.eq_ignore_ascii_case("toml") {
+                            files.push(p);
+                        }
+                    }
                 }
             }
         }
@@ -611,6 +663,9 @@ fn collect_config_files_in_dirs(dirs: &[PathBuf]) -> Vec<PathBuf> {
     files
 }
 
+/// Server label for a live process. It is only ever (a) the label of a config entry the
+/// process matches, (b) a catalog package id, or (c) `unknown-<hash8(argv)>`; never a
+/// substring of argv.
 fn infer_mcp_server_name(
     command: &str,
     configured_servers: &[ConfiguredMcpServer],
@@ -618,46 +673,23 @@ fn infer_mcp_server_name(
     let low = command.to_ascii_lowercase();
     for srv in configured_servers {
         let name_low = srv.server_name.to_ascii_lowercase();
-        if low.contains(&name_low) {
+        if name_low.len() >= 3 && low.contains(&name_low) {
             return Some(srv.server_name.clone());
         }
-        for arg in &srv.args {
-            let arg_low = arg.to_ascii_lowercase();
-            // sanitized placeholders are not identifying text
-            if !arg_low.starts_with('-')
-                && arg_low.len() >= 6
-                && !arg_low.contains("<redacted>")
-                && low.contains(&arg_low)
-            {
-                return Some(srv.server_name.clone());
-            }
+        // the raw tokens only decide the match; the label shown is the config entry's own
+        if srv.match_tokens.iter().any(|t| low.contains(t.as_str())) {
+            return Some(srv.server_name.clone());
         }
+    }
+    if let Some(pkg) = known_package_in(command) {
+        return Some(pkg);
     }
     let is_mcp_proc = low.contains("mcp") || low.contains("modelcontextprotocol");
-    if !is_mcp_proc {
-        return None;
-    }
-    for tok in command.split_whitespace() {
-        let clean = tok.trim_matches(|c| c == '"' || c == '\'');
-        if clean.starts_with('-')
-            || matches!(
-                clean,
-                "node" | "npx" | "npm" | "exec" | "uvx" | "python" | "python3" | "-y" | "--yes"
-            )
-        {
-            continue;
-        }
-        if clean.to_ascii_lowercase().contains("mcp") {
-            let base = Path::new(clean)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or(clean);
-            return Some(base.to_string());
-        }
-    }
-    Some("mcp-server".to_string())
+    is_mcp_proc.then(|| unknown_label(command))
 }
 
+/// Owning client for a process: a catalog client or launcher of the parent, else
+/// `unknown-<hash8(parent argv)>`.
 fn infer_owning_client(ppid: u32, pid_map: &BTreeMap<u32, &ObservedProcess>) -> String {
     if ppid <= 1 {
         return "orphan(ppid=1)".to_string();
@@ -665,26 +697,9 @@ fn infer_owning_client(ppid: u32, pid_map: &BTreeMap<u32, &ObservedProcess>) -> 
     let Some(parent) = pid_map.get(&ppid) else {
         return format!("pid:{ppid}");
     };
-    let low = parent.command.to_ascii_lowercase();
-    for client in [
-        "claude", "codex", "cursor", "opencode", "code", "zed", "windsurf",
-    ] {
-        if low.contains(client) {
-            return client.to_string();
-        }
-    }
-    safe_label(
-        Path::new(
-            parent
-                .command
-                .split_whitespace()
-                .next()
-                .unwrap_or("unknown"),
-        )
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("unknown"),
-    )
+    known_client(&parent.command)
+        .or_else(|| known_command(&parent.command))
+        .unwrap_or_else(|| unknown_label(&parent.command))
 }
 
 fn is_supervised_daemon_leader(command: &str) -> bool {
@@ -859,32 +874,40 @@ pub fn audit_mcp_with_processes(
     };
     let canon_home = fs::canonicalize(&ctx.home_dir).unwrap_or_else(|_| ctx.home_dir.clone());
     let default_discovery = opts.config_dirs.is_empty();
-    let files = if default_discovery {
-        default_mcp_config_files(&ctx.home_dir)
-    } else {
-        collect_config_files_in_dirs(&opts.config_dirs)
-    };
-
     let mut scanned_files = Vec::new();
     let mut configured_servers = Vec::new();
     let mut secret_findings = Vec::new();
     let mut warnings = Vec::new();
 
+    let files = if default_discovery {
+        default_mcp_config_files(&ctx.home_dir)
+    } else {
+        collect_config_files_in_dirs(&opts.config_dirs, &ctx, &mut warnings)
+    };
+    // Default discovery stays inside the home; an explicit --config-dir may live elsewhere but
+    // is never a symlink and never a protected root. Files are opened once without following
+    // symlinks and read from the validated handle (no check-then-reopen window).
+    let policy = ReadPolicy {
+        ctx: &ctx,
+        canon_home: &canon_home,
+        require_in_home: default_discovery,
+    };
+
     for file in files {
         let file_str = file.to_string_lossy().into_owned();
         if check_path_protection(&file, &ctx).protected {
-            warnings.push(format!("protected config file not read: {file_str}"));
+            warnings.push(format!("protected_target: {file_str}"));
             continue;
         }
-        // Default discovery only reads files whose canonical path stays inside the home:
-        // a symlinked ancestor (`~/.cursor -> /elsewhere`) must not widen the audit.
-        if default_discovery && !fs::canonicalize(&file).is_ok_and(|c| c.starts_with(&canon_home)) {
-            warnings.push(format!("config file outside home not read: {file_str}"));
-            continue;
-        }
-        let Ok(raw) = fs::read_to_string(&file) else {
-            warnings.push(format!("unreadable config file: {file_str}"));
-            continue;
+        let raw = match read_config_file(&file, &policy) {
+            Ok(r) => r,
+            Err(refusal) => {
+                warnings.push(format!(
+                    "config file not read ({}): {file_str}",
+                    refusal.code()
+                ));
+                continue;
+            }
         };
         scanned_files.push(file_str.clone());
         let is_toml = file
@@ -922,7 +945,7 @@ pub fn audit_mcp_with_processes(
         running_processes.push(RunningMcpProcess {
             pid: proc_item.pid,
             ppid: proc_item.ppid,
-            server_name: safe_label(&server_name),
+            server_name,
             owning_client,
             is_orphan,
             command: clean_cmd,

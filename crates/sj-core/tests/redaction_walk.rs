@@ -66,7 +66,7 @@ fn mcp_audit_sample_server_shows_only_basename_package_flag_names_and_counts() {
         s.args,
         vec![
             "-y",
-            "@scope/pkg@1.2.3",
+            "@modelcontextprotocol/server-github@1.2.3",
             "--port",
             "<REDACTED>",
             "--token",
@@ -77,14 +77,16 @@ fn mcp_audit_sample_server_shows_only_basename_package_flag_names_and_counts() {
     let p = r
         .configured_servers
         .iter()
-        .find(|s| s.server_name == "probe-shapes")
+        .find(|s| s.server_name == "fx-shapes")
         .unwrap();
     assert_eq!(p.url.as_deref(), Some("https://example.com"));
     assert!(p
         .header_keys
         .iter()
         .all(|k| !k.to_lowercase().contains("probe")));
-    assert_eq!(p.env_keys.len(), 3);
+    // only catalog env names are listed; every other key is counted, never named
+    assert_eq!(p.env_keys, vec!["API_TOKEN".to_string()]);
+    assert_eq!(p.env_key_count, 3);
 }
 
 #[test]

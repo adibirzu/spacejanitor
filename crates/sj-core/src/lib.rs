@@ -10,6 +10,7 @@ pub mod plan;
 pub mod protect;
 pub mod reap;
 pub mod redact;
+pub(crate) mod safe_read;
 pub(crate) mod safe_remove;
 pub mod scan;
 pub mod trash;
@@ -127,18 +128,6 @@ pub fn is_sensitive_flag_name(flag_low: &str, has_equals: bool) -> bool {
         || flag_low.contains("dsn")
 }
 
-pub(crate) fn has_known_secret_prefix(tok: &str) -> bool {
-    tok.starts_with("sk-")
-        || tok.starts_with("sk_")
-        || tok.starts_with("ghp_")
-        || tok.starts_with("github_pat_")
-        || tok.starts_with("glpat-")
-        || tok.starts_with("xoxb-")
-        || tok.starts_with("xoxp-")
-        || tok.starts_with("AKIA")
-        || tok.starts_with("AIza")
-}
-
 /// Redacts a command line for audit output using an allowlist: only clearly non-secret
 /// tokens are shown, everything else (and anything after an auth-ish marker) is `<REDACTED>`.
 pub fn redact_secrets(input: &str) -> String {
@@ -166,8 +155,8 @@ mod tests {
             assert!(!out.contains("PROBE"), "leak in {c:?} -> {out:?}");
         }
         // structural redaction: URL shows scheme+host only, boolean flag names stay readable
-        let keep = redact_secrets("curl https://h/x?page=2&sort=asc --verbose");
-        assert_eq!(keep, "curl https://h --verbose");
+        let keep = redact_secrets("curl https://h.example/x?page=2&sort=asc --verbose");
+        assert_eq!(keep, "curl https://h.example --verbose");
     }
 
     const TEST_HOME: &str = "/home/developer";

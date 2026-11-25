@@ -8,6 +8,7 @@
 
 use crate::mcp_audit::{audit_mcp_with_processes, McpAuditOptions};
 use crate::protect::{check_path_protection, ProtectionContext};
+use crate::safe_read::{read_config_file, ReadPolicy};
 use crate::SjError;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -353,6 +354,7 @@ impl<'a> Guard<'a> {
         if !self.allow(client, dir) {
             return Vec::new();
         }
+        let before = fs::canonicalize(dir).ok();
         let mut v: Vec<String> = fs::read_dir(dir)
             .map(|rd| {
                 rd.flatten()
@@ -362,6 +364,11 @@ impl<'a> Guard<'a> {
                     .collect()
             })
             .unwrap_or_default();
+        // the directory must still resolve to the path that was validated; if it was swapped
+        // while it was being listed, nothing from the listing is used
+        if before.is_none() || fs::canonicalize(dir).ok() != before {
+            return Vec::new();
+        }
         v.sort();
         v
     }
@@ -383,7 +390,8 @@ fn newest_mtime_secs(dir: &Path) -> u64 {
         for e in rd.flatten().take(40) {
             let p = e.path();
             *newest = (*newest).max(mt(&p));
-            if p.is_dir() && !e.file_type().is_ok_and(|t| t.is_symlink()) {
+            // non-following: a symlinked directory is never descended into
+            if e.file_type().is_ok_and(|t| t.is_dir()) {
                 walk(&p, depth + 1, newest);
             }
         }
@@ -553,12 +561,20 @@ pub fn audit_llm_with_processes(
     let mut states = BTreeMap::new();
     let mut guard = Guard::new(&ctx);
     if guard.allow("codex", &home.join(".codex"))
-        && codex_toml.is_file()
         && !check_path_protection(&codex_toml, &ctx).protected
+        && fs::symlink_metadata(&codex_toml).is_ok()
     {
-        match fs::read_to_string(&codex_toml) {
+        // opened once without following symlinks; the handle is validated (regular file,
+        // canonical path inside the canonical home and outside every protected root) and
+        // the content is read from that handle, never by re-opening the path
+        let policy = ReadPolicy {
+            ctx: &ctx,
+            canon_home: &guard.canon_home,
+            require_in_home: true,
+        };
+        match read_config_file(&codex_toml, &policy) {
             Ok(raw) => states = parse_codex_plugin_states(&raw),
-            Err(e) => warnings.push(format!("unreadable codex config: {e}")),
+            Err(refusal) => warnings.push(format!("codex config not read ({})", refusal.code())),
         }
     }
     for (id, enabled) in &states {

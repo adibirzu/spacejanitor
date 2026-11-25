@@ -1231,7 +1231,7 @@ fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
         .unwrap();
     fs::write(
         h.join(".codex/config.toml"),
-        "[plugins.\"extra@mkt\"]\nenabled = true\n[mcp_servers.sjfixtureunused]\ncommand = \"npx\"\nargs = [\"sjfixture-unused-mcp-x\", \"--token\", \"CLI_TOK_SECRET\"]\n",
+        "[plugins.\"extra@mkt\"]\nenabled = true\n[mcp_servers.sj-fixture-unused]\ncommand = \"npx\"\nargs = [\"sjfixture-unused-mcp-x\", \"--token\", \"CLI_TOK_SECRET\"]\n",
     )
     .unwrap();
     fs::write(
@@ -1260,7 +1260,7 @@ fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
     assert_eq!(v["stale_skills"][0]["name"], "stale-skill");
     assert_eq!(v["broken_skill_symlinks"][0]["name"], "dead");
     assert_eq!(
-        v["unused_mcp_servers"][0]["server_name"], "sjfixtureunused",
+        v["unused_mcp_servers"][0]["server_name"], "sj-fixture-unused",
         "{text}"
     );
     assert!(v["plugins"]
@@ -1633,4 +1633,73 @@ fn r5_cli_serve_stdio_mcp_and_llm_audit_walk_every_string() {
         assert!(v.get("result").is_some(), "{line}");
         probe::assert_no_needles(&format!("serve-stdio[{i}]"), &v);
     }
+}
+
+#[test]
+fn r5_serve_stdio_unknown_method_never_echoes_the_method() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":1,"method":"PROBE_UNKNOWN_METHOD","params":{{"k":"PROBE_PARAM"}}}}"#
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], -32601);
+    assert_eq!(v["error"]["message"], "method not found");
+    assert!(!text.to_ascii_lowercase().contains("probe"), "{text}");
+}
+
+#[test]
+fn r5_doctor_lists_the_llm_audit_schema() {
+    let out = Command::new(sj_bin())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let schemas = v["schemas"].as_array().unwrap();
+    assert!(
+        schemas.iter().any(|s| s == "spacejanitor.llm_audit.v1"),
+        "{schemas:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r5_mcp_audit_config_dir_on_dot_claude_emits_only_protected_target() {
+    let tmp = tempdir().unwrap();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".claude/projects/SecretClaudeProj")).unwrap();
+    fs::write(
+        h.join(".claude/projects/SecretClaudeProj/SecretSession.json"),
+        "{}",
+    )
+    .unwrap();
+    let out = Command::new(sj_bin())
+        .env("HOME", &h)
+        .args(["mcp-audit", "--config-dir"])
+        .arg(h.join(".claude"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !text.contains("SecretSession") && !text.contains("SecretClaudeProj"),
+        "{text}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let warnings = v["warnings"].as_array().unwrap();
+    let ours: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.as_str().unwrap_or("").starts_with("protected_target"))
+        .collect();
+    assert_eq!(ours.len(), 1, "{warnings:?}");
 }

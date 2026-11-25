@@ -1,3 +1,4 @@
+use crate::redact::redact_process_name;
 use crate::{redact_secrets, SjError, SCHEMA_MEMORY_V1};
 use serde::Serialize;
 use std::process::Command;
@@ -231,7 +232,7 @@ pub fn parse_macos_top(top_out: &str) -> Vec<ProcessMemoryEntry> {
         entries.push(ProcessMemoryEntry {
             pid,
             ppid,
-            command: redact_secrets(&command_raw),
+            command: redact_process_name(&command_raw),
             resident_bytes,
             compressed_bytes,
             swap_bytes: 0,
@@ -784,7 +785,12 @@ PID    PPID  COMMAND          MEM      CMPRS    PORTS
         assert_eq!(procs[0].pid, 1234);
         assert_eq!(procs[0].ppid, 1);
         assert!(!procs[0].command.contains("abc"));
-        assert!(procs[0].command.contains("--token=<REDACTED>"));
+        // `top` prints a process *name*: first word kept, anything else hashed
+        assert!(
+            procs[0].command.starts_with("node <w:"),
+            "{}",
+            procs[0].command
+        );
         assert_eq!(procs[0].resident_bytes, 512 * 1024 * 1024);
         assert_eq!(procs[0].compressed_bytes, 256 * 1024 * 1024);
         assert_eq!(procs[0].true_footprint_bytes, 512 * 1024 * 1024);

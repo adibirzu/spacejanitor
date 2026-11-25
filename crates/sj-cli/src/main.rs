@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use sj_core::{
     blockers::collect_blockers_report,
-    llm_audit::{audit_llm_fleet, AuditPolicy, LlmAuditOptions},
+    llm_audit::{audit_llm_fleet, AuditPolicy, LlmAuditOptions, SCHEMA_LLM_AUDIT_V1},
     mcp_audit::{audit_mcp_fleet, McpAuditOptions},
     memory::{collect_memory_report, MemoryOptions},
     orphans::{inspect_orphans, OrphanOptions},
@@ -270,6 +270,7 @@ fn build_doctor_json() -> serde_json::Value {
         SCHEMA_PROPOSAL_V1,
         SCHEMA_MCP_AUDIT_V1,
         SCHEMA_REAP_V1,
+        SCHEMA_LLM_AUDIT_V1,
     ];
 
     serde_json::json!({
@@ -564,7 +565,7 @@ fn dispatch_rpc_method(
                 "executed_item": removed,
             }))
         }
-        _ => Err((-32601, format!("method not found: {method}"))),
+        _ => Err((-32601, "method not found".to_string())),
     }
 }
 
