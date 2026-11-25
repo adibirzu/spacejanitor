@@ -137,3 +137,39 @@ test("R8-B26: a protected entry that appears after the pre-check but before the 
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("R9-B31: a directory swapped for a symlink to an outside folder mid-walk is never followed", { skip: process.platform === "win32" }, async () => {
+  const { base, home, trash, gate } = setup();
+  try {
+    const victim = makeTree(base, "victim", ["v1.txt", "v2.txt", "v3.txt", "v4.txt", "v5.txt"]);
+    const d = makeTree(trash, "proj", ["sub/f1.txt", "sub/f2.txt", "sub/f3.txt", "keep.txt"]);
+    const cands: RemediationCandidate[] = [{ id: "p", path: d, bytes: 1, kind: "dir" }];
+    gate.registerApprovedCandidates(cands);
+    const plan = gate.createDryRunPlan(cands);
+    const auth = gate.authorizeExecute({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
+    assert.equal(auth.allowed, true);
+    let swapped = false;
+    const res = await executePlanItems(
+      auth.plan!,
+      auth.identities!,
+      deps(home, {
+        // fires right after `sub` has been listed, before any child of it is touched
+        afterReaddir: (dir: string) => {
+          if (!swapped && dir.endsWith(`${path.sep}sub`)) {
+            swapped = true;
+            fs.renameSync(dir, `${dir}.moved`);
+            fs.symlinkSync(victim, dir);
+          }
+        },
+      })
+    );
+    assert.equal(swapped, true, "test seam must have fired");
+    for (const f of ["v1.txt", "v2.txt", "v3.txt", "v4.txt", "v5.txt"]) {
+      assert.equal(fs.existsSync(path.join(victim, f)), true, `outside file ${f} must survive`);
+    }
+    assert.equal(res.executed, false);
+    assert.match(res.failed[0].error, /directory_swapped|symlink_refused/);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

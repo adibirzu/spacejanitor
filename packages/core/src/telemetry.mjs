@@ -176,13 +176,60 @@ export async function collectTrash({ homeDir = os.homedir() } = {}) {
   };
 }
 
-async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000 } = {}) {
+async function safeExecResult(cmd, args, cwd, { maxBuffer = 1024 * 1024, timeout = 3000, env } = {}) {
   try {
-    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout, maxBuffer });
+    const { stdout } = await execFileAsync(cmd, args, { cwd, timeout, maxBuffer, ...(env ? { env } : {}) });
     return { ok: true, stdout: stdout.trim() };
   } catch {
     return { ok: false, stdout: "" };
   }
+}
+
+
+// Repo-controlled git config can EXECUTE commands (core.fsmonitor, hooks) or LIE about the working
+// tree (fsmonitor answering "nothing changed"), so every proof call neutralises it.
+const GIT_SAFE_ARGS = [
+  "-c", "core.fsmonitor=false",
+  "-c", "core.untrackedCache=false",
+  "-c", `core.hooksPath=${os.devNull}`,
+  "-c", "protocol.ext.allow=never",
+  "--no-optional-locks",
+];
+
+function gitSafeEnv() {
+  const env = { ...process.env, GIT_TERMINAL_PROMPT: "0", GIT_OPTIONAL_LOCKS: "0" };
+  for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_NAMESPACE"]) {
+    delete env[k];
+  }
+  return env;
+}
+
+function resolveWorktreeGitDir(wtPath) {
+  try {
+    const dotGit = path.join(wtPath, ".git");
+    const st = fs.lstatSync(dotGit);
+    if (st.isDirectory()) return dotGit;
+    if (!st.isFile()) return null;
+    const m = fs.readFileSync(dotGit, "utf8").match(/^gitdir:\s*(.+)\s*$/m);
+    if (!m) return null;
+    return path.resolve(wtPath, m[1].trim());
+  } catch {
+    return null;
+  }
+}
+
+/** git call with an explicit --git-dir/--work-tree (config.worktree decoys and inherited GIT_DIR cannot redirect it). */
+function gitProof(wtPath, gitDir, args, opts = {}) {
+  return safeExecResult(
+    "git",
+    [...GIT_SAFE_ARGS, "--git-dir", gitDir, "--work-tree", wtPath, ...args],
+    wtPath,
+    { ...opts, env: gitSafeEnv() }
+  );
+}
+
+function gitSafeIn(cwd, args, opts = {}) {
+  return safeExecResult("git", [...GIT_SAFE_ARGS, ...args], cwd, { ...opts, env: gitSafeEnv() });
 }
 
 async function safeExec(cmd, args, cwd) {
@@ -195,7 +242,7 @@ async function safeExec(cmd, args, cwd) {
  * Mirrors the Rust core (crates/sj-core/src/orphans.rs): dirty, untracked, ignored files, stashes,
  * unpushed commits/branches, no remote and detached/unborn HEAD all block; any git failure blocks.
  */
-export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
+export async function inspectWorktree(wtPath, { maxAgeDays = 14, locked = false } = {}) {
   const base = {
     id: `wt-${path.basename(wtPath)}`,
     path: wtPath,
@@ -210,25 +257,43 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
     hasIgnored: false,
     hasStashes: false,
     hasIndexFlags: false,
+    locked,
     proofStatus: "unverified",
     safeToPrune: false,
     ...extra,
   });
   if (!wtPath || !fs.existsSync(wtPath)) return unverified();
+  const gitDir = resolveWorktreeGitDir(wtPath);
+  if (!gitDir) return unverified();
+  const G = (args, opts) => gitProof(wtPath, gitDir, args, opts);
 
-  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes, flagsRes] = await Promise.all([
-    safeExecResult("git", ["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"], wtPath),
-    safeExecResult("git", ["remote"], wtPath),
-    safeExecResult("git", ["rev-list", "--branches", "--not", "--remotes", "--count"], wtPath),
-    safeExecResult("git", ["rev-list", "HEAD", "--not", "--remotes", "--count"], wtPath),
-    safeExecResult("git", ["stash", "list"], wtPath),
-    safeExecResult("git", ["symbolic-ref", "-q", "HEAD"], wtPath),
-    safeExecResult("git", ["rev-parse", "--verify", "-q", "HEAD"], wtPath),
+  const [statusRes, remotesRes, branchesRes, headRes, stashRes, symRes, headOkRes, flagsRes, extraRefsRes, reflogRes] = await Promise.all([
+    G(["status", "--porcelain=v1", "--untracked-files=all", "--ignored=traditional", "--ignore-submodules=none"]),
+    G(["remote"]),
+    // branches AND tags: a tag-only commit is lost when the worktree goes
+    G(["rev-list", "--branches", "--tags", "--not", "--remotes", "--count"]),
+    G(["rev-list", "HEAD", "--not", "--remotes", "--count"]),
+    G(["stash", "list"]),
+    G(["symbolic-ref", "-q", "HEAD"]),
+    G(["rev-parse", "--verify", "-q", "HEAD"]),
     // lowercase tags = assume-unchanged, "S" = skip-worktree: git status stays clean while edits exist
-    safeExecResult("git", ["ls-files", "-v", "-z"], wtPath, { maxBuffer: 64 * 1024 * 1024, timeout: 15000 }),
+    G(["ls-files", "-v", "-z"], { maxBuffer: 64 * 1024 * 1024, timeout: 15000 }),
+    G(["for-each-ref", "--format=%(objectname)", "refs/worktree", "refs/bisect", "refs/rewritten"]),
+    // commits made on a detached HEAD and then left behind live only in this worktree's HEAD reflog
+    G(["reflog", "show", "--format=%H", "HEAD"], { maxBuffer: 8 * 1024 * 1024 }),
   ]);
-  if (![statusRes, remotesRes, branchesRes, headRes, stashRes, flagsRes].every((r) => r.ok)) {
+  if (![statusRes, remotesRes, branchesRes, headRes, stashRes, flagsRes, extraRefsRes, reflogRes].every((r) => r.ok)) {
     return unverified({ hasRemote: remotesRes.ok ? remotesRes.stdout.length > 0 : false });
+  }
+  const extraShas = [
+    ...new Set([...extraRefsRes.stdout.split(/\s+/), ...reflogRes.stdout.split(/\s+/)].filter(Boolean)),
+  ];
+  let extraUnpushed = false;
+  if (extraShas.length > 3000 || extraShas.some((x) => !/^[0-9a-f]{7,64}$/i.test(x))) {
+    extraUnpushed = true; // cannot verify: fail closed
+  } else if (extraShas.length > 0) {
+    const r = await G(["rev-list", "--count", ...extraShas, "--not", "--remotes"]);
+    extraUnpushed = !r.ok || !Number.isFinite(Number(r.stdout)) || Number(r.stdout) > 0;
   }
   const lines = statusRes.stdout.split(/\r?\n/).filter(Boolean);
   const hasIgnored = lines.some((l) => l.startsWith("!!"));
@@ -239,7 +304,7 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
   const branchCount = Number(branchesRes.stdout);
   const headCount = Number(headRes.stdout);
   const countsValid = Number.isFinite(branchCount) && Number.isFinite(headCount);
-  const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0;
+  const hasUnpushed = !countsValid || branchCount > 0 || headCount > 0 || extraUnpushed;
   const onBranch = symRes.ok && symRes.stdout.length > 0 && headOkRes.ok;
   const proofStatus = countsValid ? "verified" : "unverified";
   return {
@@ -250,10 +315,11 @@ export async function inspectWorktree(wtPath, { maxAgeDays = 14 } = {}) {
     hasIgnored,
     hasStashes,
     hasIndexFlags,
+    locked,
     detachedHead: !onBranch,
     proofStatus,
     safeToPrune:
-      !hasDirty && !hasIgnored && !hasIndexFlags && hasRemote && !hasUnpushed && !hasStashes && onBranch && proofStatus === "verified",
+      !hasDirty && !hasIgnored && !hasIndexFlags && hasRemote && !hasUnpushed && !hasStashes && onBranch && !locked && proofStatus === "verified",
   };
 }
 
@@ -261,21 +327,21 @@ export async function collectOrphans({ targetPath = process.cwd(), maxAgeDays = 
   const resolved = path.resolve(targetPath);
   const candidates = [];
 
-  const insideGit = await safeExecResult("git", ["rev-parse", "--is-inside-work-tree"], resolved);
+  const insideGit = await gitSafeIn(resolved, ["rev-parse", "--is-inside-work-tree"]);
   if (insideGit.ok && insideGit.stdout === "true") {
-    const wtOut = await safeExecResult("git", ["worktree", "list", "--porcelain"], resolved);
+    const wtOut = await gitSafeIn(resolved, ["worktree", "list", "--porcelain"]);
     if (wtOut.ok) {
-      let seenMain = false;
-      for (const line of wtOut.stdout.split(/\r?\n/)) {
-        if (!line.startsWith("worktree ")) continue;
-        const wtPath = line.slice("worktree ".length).trim();
-        // git lists the main working tree first: it is never an orphan, however the target is spelled.
-        if (!seenMain) {
-          seenMain = true;
-          continue;
-        }
+      // git lists the main working tree first: it is never an orphan, however the target is spelled.
+      const blocks = wtOut.stdout.split(/\r?\n\r?\n/).filter(Boolean);
+      for (const [idx, block] of blocks.entries()) {
+        if (idx === 0) continue;
+        const lines = block.split(/\r?\n/);
+        const first = lines.find((l) => l.startsWith("worktree "));
+        if (!first) continue;
+        const wtPath = first.slice("worktree ".length).trim();
         if (!wtPath || wtPath === resolved) continue;
-        candidates.push(await inspectWorktree(wtPath, { maxAgeDays }));
+        const locked = lines.some((l) => l === "locked" || l.startsWith("locked "));
+        candidates.push(await inspectWorktree(wtPath, { maxAgeDays, locked }));
       }
     }
   }

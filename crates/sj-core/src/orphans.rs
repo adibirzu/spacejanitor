@@ -122,7 +122,25 @@ where
     S: AsRef<OsStr>,
 {
     let mut cmd = Command::new("git");
+    // Neutralise repo-controlled config that can EXECUTE commands or LIE about the working tree:
+    // core.fsmonitor (hook that can claim "nothing changed"), untracked cache, hooks path.
+    let null_dev = if cfg!(windows) { "NUL" } else { "/dev/null" };
     cmd.current_dir(&git_ctx.work_tree)
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            &format!("core.hooksPath={null_dev}"),
+            "-c",
+            "protocol.ext.allow=never",
+            "--no-optional-locks",
+        ])
+        .env_remove("GIT_DIR")
+        .env_remove("GIT_WORK_TREE")
+        .env_remove("GIT_INDEX_FILE")
+        .env_remove("GIT_COMMON_DIR")
         .arg("--git-dir")
         .arg(&git_ctx.git_dir)
         .arg("--work-tree")
@@ -157,6 +175,62 @@ fn sha256_hex_str(input: &str) -> String {
         let _ = write!(&mut out, "{b:02x}");
     }
     out
+}
+
+/// Every commit-ish that removing the repo/worktree could orphan besides refs/heads: tags and the
+/// per-worktree ref namespaces (refs/worktree, refs/bisect, refs/rewritten) plus this checkout's HEAD
+/// reflog (commits made on a detached HEAD and then left behind). Err = could not enumerate.
+fn collect_extra_local_commits(git_ctx: &GitExecContext) -> Result<Vec<String>, String> {
+    let mut shas: BTreeSet<String> = BTreeSet::new();
+    let (ok, out) = run_git_raw_ctx(
+        git_ctx,
+        [
+            "for-each-ref",
+            "--format=%(objectname)",
+            "refs/tags",
+            "refs/worktree",
+            "refs/bisect",
+            "refs/rewritten",
+        ],
+    )
+    .map_err(|_| "git_for_each_ref_failed".to_string())?;
+    if !ok {
+        return Err("git_for_each_ref_failed".to_string());
+    }
+    shas.extend(out.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string));
+    let (rok, rout) = run_git_raw_ctx(git_ctx, ["reflog", "show", "--format=%H", "HEAD"])
+        .map_err(|_| "git_reflog_failed".to_string())?;
+    if !rok {
+        return Err("git_reflog_failed".to_string());
+    }
+    shas.extend(rout.lines().map(str::trim).filter(|l| !l.is_empty()).map(str::to_string));
+    if shas.len() > 3000 {
+        return Err("too_many_local_commits_to_verify".to_string());
+    }
+    if shas.iter().any(|s| !s.chars().all(|c| c.is_ascii_hexdigit())) {
+        return Err("malformed_ref_listing".to_string());
+    }
+    Ok(shas.into_iter().collect())
+}
+
+/// Linked worktrees of this repository as (path, locked) from `git worktree list --porcelain`.
+fn list_worktrees(git_ctx: &GitExecContext) -> Result<Vec<(String, bool)>, String> {
+    let (ok, out) = run_git_raw_ctx(git_ctx, ["worktree", "list", "--porcelain"])
+        .map_err(|_| "git_worktree_list_failed".to_string())?;
+    if !ok {
+        return Err("git_worktree_list_failed".to_string());
+    }
+    let mut entries: Vec<(String, bool)> = Vec::new();
+    for line in out.lines() {
+        if let Some(p) = line.strip_prefix("worktree ") {
+            entries.push((p.to_string(), false));
+        } else if line == "locked" || line.starts_with("locked ") {
+            if let Some(last) = entries.last_mut() {
+                last.1 = true;
+            }
+        }
+    }
+    Ok(entries)
 }
 
 fn snapshot_local_branches(git_ctx: &GitExecContext) -> Result<Vec<(String, String)>, String> {
@@ -539,6 +613,24 @@ fn validate_single_repo_at(
         reasons.push("no_remote".to_string());
     }
 
+    match list_worktrees(&git_ctx) {
+        Ok(entries) => {
+            if is_worktree {
+                let me = std::fs::canonicalize(actual_repo).ok();
+                let locked = entries.iter().any(|(p, locked)| {
+                    *locked && std::fs::canonicalize(p).ok().is_some() && std::fs::canonicalize(p).ok() == me
+                });
+                if locked {
+                    reasons.push("worktree_locked".to_string());
+                }
+            } else if entries.len() > 1 {
+                // deleting the main repo would destroy every linked worktree's git metadata
+                reasons.push("has_linked_worktrees".to_string());
+            }
+        }
+        Err(_) => reasons.push("worktree_list_unverified".to_string()),
+    }
+
     let (stash_ok, stash_out) =
         run_git_ctx(&git_ctx, ["stash", "list"]).unwrap_or((false, String::new()));
     if !stash_ok || !stash_out.is_empty() {
@@ -546,6 +638,7 @@ fn validate_single_repo_at(
     }
 
     let refs_before = snapshot_local_branches(&git_ctx);
+    let extra_commits = collect_extra_local_commits(&git_ctx);
     let mut all_branches_verified = false;
     if let Ok(ref local_branches) = refs_before {
         if !remotes.is_empty() {
@@ -576,7 +669,6 @@ fn validate_single_repo_at(
                     &git_ctx,
                     [
                         OsStr::new("ls-remote"),
-                        OsStr::new("--heads"),
                         OsStr::new("--"),
                         ls_target,
                     ],
@@ -607,6 +699,19 @@ fn validate_single_repo_at(
                             .unwrap_or(false)
                     })
                 };
+
+                // tags, per-worktree refs and the HEAD reflog must also be contained in some remote ref
+                let extra_ok = match &extra_commits {
+                    Ok(list) => list.iter().all(|sha| {
+                        remote_heads
+                            .values()
+                            .any(|tips| is_pushed_to_tips(sha, tips))
+                    }),
+                    Err(_) => false,
+                };
+                if !extra_ok {
+                    reasons.push("unpushed_tag_worktree_ref_or_reflog_commit".to_string());
+                }
 
                 all_branches_verified = local_branches.iter().all(|(refname, local_sha)| {
                     let short_branch = refname.strip_prefix("refs/heads/").unwrap_or(refname);

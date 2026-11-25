@@ -15,6 +15,8 @@ export interface ExecutorDeps {
   afterItem?: (item: { path: string }) => void | Promise<void>;
   /** test seam: runs immediately before every unlink/rmdir */
   beforeUnlink?: (p: string) => void;
+  /** test seam: runs right after a directory has been listed, before its children are touched */
+  afterReaddir?: (dir: string) => void;
 }
 
 export interface ReapResult {
@@ -31,18 +33,48 @@ function judge(p: string, homeDir: string): void {
   if (v.protected) throw new Error(`protected_descendant:${v.reason}:${p}`);
 }
 
+function sameDir(p: string, id: { dev: bigint; ino: bigint }): void {
+  let st: fs.BigIntStats;
+  try {
+    st = fs.lstatSync(p, { bigint: true });
+  } catch {
+    throw new Error(`directory_swapped:${p}`);
+  }
+  if (st.isSymbolicLink() || !st.isDirectory() || st.dev !== id.dev || st.ino !== id.ino) {
+    throw new Error(`directory_swapped:${p}`);
+  }
+}
+
 /**
  * Remove a tree entry by entry with no-follow semantics. Every entry is re-judged immediately before
  * it is touched; symlinks are refused (never followed, never unlinked); directories are removed with a
  * NON-recursive rmdir, so an entry that appears after the listing makes the removal fail instead of
- * being swept away.
+ * being swept away. Each directory's device/inode is recorded when it is listed and re-checked before
+ * every child operation, so a parent swapped for a symlink mid-walk is detected instead of followed.
+ * Residual: Node has no openat(), so a swap in the instant between that re-check and the syscall
+ * cannot be excluded; the fd-relative Rust safe_remove is the complete fix (see PR notes).
  */
-function removeTreeNoFollow(full: string, deps: ExecutorDeps, top: boolean): void {
-  const st = fs.lstatSync(full);
+function removeTreeNoFollow(full: string, deps: ExecutorDeps, top: boolean, expected?: { dev: bigint; ino: bigint }): void {
+  const st = fs.lstatSync(full, { bigint: true });
   if (st.isSymbolicLink()) throw new Error(`symlink_refused:${full}`);
+  if (expected && (st.dev !== expected.dev || st.ino !== expected.ino)) throw new Error(`directory_swapped:${full}`);
   if (!top) judge(full, deps.homeDir);
+  const id = { dev: st.dev, ino: st.ino };
   if (st.isDirectory()) {
-    for (const name of fs.readdirSync(full)) removeTreeNoFollow(path.join(full, name), deps, false);
+    const names = fs.readdirSync(full);
+    deps.afterReaddir?.(full);
+    for (const name of names) {
+      sameDir(full, id);
+      const child = path.join(full, name);
+      const cst = fs.lstatSync(child, { bigint: true });
+      if (cst.isDirectory() && !cst.isSymbolicLink()) {
+        removeTreeNoFollow(child, deps, false, { dev: cst.dev, ino: cst.ino });
+      } else {
+        sameDir(full, id);
+        removeTreeNoFollow(child, deps, false);
+      }
+    }
+    sameDir(full, id);
     deps.beforeUnlink?.(full);
     fs.rmdirSync(full);
   } else {

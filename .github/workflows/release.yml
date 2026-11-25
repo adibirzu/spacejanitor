@@ -45,6 +45,9 @@ jobs:
           tar -xzf /tmp/gitleaks.tar.gz -C /tmp gitleaks
           /tmp/gitleaks git --no-banner -v
 
+  # Platform note: this gate runs on ubuntu only. The per-OS Node/Rust matrix and the desktop suite on
+  # ubuntu+macOS run in ci.yml on every PR and push to main, so a tagged commit has already passed
+  # them; add windows desktop tests here once that suite is green on windows.
   verify-tests:
     name: Test gate (Node, Rust, Desktop)
     runs-on: ubuntu-latest

@@ -699,3 +699,217 @@ test("R8-B25: whole-element redaction covers -u user:pass, -p=, --x= and JSON/ke
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+test("R9-B30: 32-shape credential argv probe (+TOML, +candidate field) never leaks through the report, the summary or the SLM body", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r9-"));
+  const homeDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r9h-"));
+  const cases = {
+    mysql_short_cluster_p: ["-h", "db", "-uroot", "-pLEAK01xyzSecret"],
+    short_cluster_t: ["-tLEAK02tokenvalue"],
+    user_cluster_u_colon: ["-uadmin:LEAK03pw"],
+    curl_user_space: ["-u", "admin:LEAK04pw"],
+    long_flag_eq: ["--api-key=LEAK05abc"],
+    long_flag_space: ["--client-secret", "LEAK06abc"],
+    flag_value_starting_dashdash: ["--token", "--LEAK07weird"],
+    url_userinfo_arg: ["--db", "postgres://app:LEAK08pw@db.internal:5432/x"],
+    url_userinfo_at_in_pw: ["--db", "postgres://app:p@LEAK09ss@db.internal/x"],
+    env_assign: ["env", "OPENAI_API_KEY=LEAK10sk"],
+    env_assign_unrecognized_name: ["DATABASE_URL=mysql://u:LEAK11@h/db"],
+    env_assign_dsn: ["SENTRY_DSN=https://LEAK12public@o1.ingest.sentry.io/1"],
+    json_fragment: ["--config", "{\"apiKey\":\"LEAK13\"}"],
+    json_fragment_nonsecret_name: ["--config", "{\"dsn\":\"https://LEAK14@sentry.io/1\"}"],
+    yaml_fragment: ["--inline", "client_secret: LEAK15"],
+    base64_blob: ["--config-b64", Buffer.from("{\"password\":\"LEAK16\"}").toString("base64")],
+    heredoc_style: ["--script", "cat <<EOF\nexport GITHUB_TOKEN=LEAK17\nEOF"],
+    long_flag_name_over_64: [`--${"x".repeat(70)}-token`, "LEAK18"],
+    unicode_nbsp: ["--token LEAK19"],
+    unicode_ideographic_space_header: ["Authorization:　Bearer　LEAK20abcdefgh"],
+    connection_string: ["--conn", "Server=x;User Id=sa;Password=LEAK21;"],
+    conn_no_space_value: ["--conn=Server=x;Pwd=LEAK22"],
+    slack_webhook_positional: ["https://hooks.slack.com/services/T0/B0/LEAK23XXXXXXXXXXXXXXXX"],
+    docker_env_cluster: ["-eAWS_SECRET_ACCESS_KEY=LEAK24"],
+    docker_env_long_eq: ["--env=GITHUB_PAT=LEAK25"],
+    password_stdin_like: ["--password", "LEAK26", "--next"],
+    header_twoarg_x_api: ["--header", "X-Api-Key", "LEAK27"],
+    header_eq_form: ["--header=X-Goog-Api-Key:LEAK28"],
+    bearer_in_single_arg: ["Authorization: Bearer LEAK29abcdefgh"],
+    dashed_secret_value: ["--secret", "-LEAK30"],
+    kv_colon_form: ["token:LEAK31"],
+    very_long_arg: ["--note", "a".repeat(200000) + " password=LEAK32"],
+  };
+  const leaks = (text) => [...new Set(String(text).match(/LEAK\d\d/g) || [])];
+  try {
+    const mcpServers = {};
+    for (const [name, args] of Object.entries(cases)) mcpServers[name] = { command: "tool", args };
+    fs.writeFileSync(path.join(tmpDir, "mcp.json"), JSON.stringify({ mcpServers }));
+    fs.writeFileSync(
+      path.join(tmpDir, "config.toml"),
+      ["[mcp_servers.toml_mysql]", 'command = "mysql"', 'args = ["-uroot", "-pLEAK40toml"]', "[mcp_servers.toml_env]", 'command = "x"', 'env = { API_TOKEN = "LEAK41inline" }', ""].join("\n")
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const bad = audit.servers.map((s) => [s.name, leaks(JSON.stringify(s))]).filter(([, l]) => l.length);
+    assert.deepEqual(bad, [], "report leaks");
+    for (const s of audit.servers) {
+      if (s.name.startsWith("toml_mysql") || ["mysql_short_cluster_p", "short_cluster_t", "user_cluster_u_colon"].includes(s.name)) {
+        assert.equal(s.hasSecretRisk, true, `${s.name} must be flagged`);
+      }
+    }
+    const summary = await collectSummary({ configDirs: [tmpDir], homeDir, targetPath: homeDir });
+    assert.deepEqual(leaks(JSON.stringify(summary)), [], "summary leaks");
+    let body = "";
+    await adviseWithLocalSlm({
+      enabled: true,
+      url: "http://127.0.0.1:11434/v1/chat/completions",
+      summary,
+      candidates: [{ path: "/tmp/x", note: "-pLEAK50direct" }],
+      memoryReport: { freeBytes: 64 * 1024 ** 3 },
+      fetchImpl: async (_u, init) => {
+        body = String(init.body);
+        return { ok: true, status: 200, json: async () => ({ choices: [{ message: { content: "{}" } }] }) };
+      },
+    });
+    assert.ok(body.length > 0);
+    assert.deepEqual(leaks(body), [], "SLM body leaks");
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+    fs.rmSync(homeDir, { recursive: true, force: true });
+  }
+});
+
+function lyingFsmonitorFixture(base) {
+  const origin = path.join(base, "origin.git");
+  const repo = path.join(base, "repo");
+  fs.mkdirSync(repo);
+  git(base, "init", "--bare", "-b", "main", origin);
+  git(repo, "init", "-b", "main");
+  fs.writeFileSync(path.join(repo, "a.txt"), "a");
+  git(repo, "add", ".");
+  git(repo, "commit", "-m", "init");
+  git(repo, "remote", "add", "origin", origin);
+  git(repo, "push", "-u", "origin", "main");
+  const wt = path.join(base, "wt");
+  git(repo, "worktree", "add", "-b", "feat", wt);
+  git(wt, "push", "-u", "origin", "feat");
+  const marker = path.join(base, "HOOK_RAN");
+  const hook = path.join(base, "hook.sh");
+  fs.writeFileSync(hook, `#!/bin/sh\ntouch "${marker}"\nprintf 'token-1\\0'\n`, { mode: 0o755 });
+  git(wt, "config", "core.fsmonitor", hook);
+  git(wt, "config", "core.fsmonitorHookVersion", "2");
+  git(wt, "status");
+  git(wt, "status");
+  fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
+  fs.rmSync(marker, { force: true });
+  return { repo, wt, marker };
+}
+
+test("R9-B27: a lying core.fsmonitor hook cannot hide edits and is never executed by the proof", { skip: process.platform === "win32" }, async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9b27-")));
+  try {
+    const { repo, wt, marker } = lyingFsmonitorFixture(base);
+    const proof = await inspectWorktree(wt);
+    assert.equal(fs.existsSync(marker), false, "the repo's fsmonitor hook must not run during the proof");
+    assert.equal(proof.safeToPrune, false, "modified tracked file must block the prune");
+    const report = await collectOrphans({ targetPath: repo });
+    assert.equal(fs.existsSync(marker), false, "hook must not run during collectOrphans either");
+    assert.equal(report.candidates.find((c) => c.path === wt)?.safeToPrune, false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R9-B28/B29: commits held only by tags, per-worktree refs, bisect refs or the HEAD reflog make a worktree NOT safe; locked worktrees too", async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9b28-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const mk = (name) => {
+      const p = path.join(base, name);
+      git(repo, "worktree", "add", "-b", `b-${name}`, p);
+      git(p, "push", "-u", "origin", `b-${name}`);
+      return p;
+    };
+    const control = mk("control");
+    const light = mk("tag-light");
+    const ann = mk("tag-ann");
+    const wref = mk("ref-worktree");
+    const bis = mk("ref-bisect");
+    const rlog = mk("head-reflog");
+    const locked = mk("locked");
+    assert.equal((await inspectWorktree(control)).safeToPrune, true, "control must be safe before siblings add local commits");
+    const commit = (p, name) => {
+      fs.writeFileSync(path.join(p, name), "x");
+      git(p, "add", name);
+      git(p, "commit", "-m", name);
+    };
+    const reset = (p, b) => git(p, "reset", "--hard", `origin/${b}`);
+    commit(light, "l.txt");
+    git(light, "tag", "keep-light");
+    reset(light, "b-tag-light");
+    commit(ann, "n.txt");
+    git(ann, "tag", "-a", "keep-ann", "-m", "m");
+    reset(ann, "b-tag-ann");
+    commit(wref, "w.txt");
+    git(wref, "update-ref", "refs/worktree/keep", "HEAD");
+    reset(wref, "b-ref-worktree");
+    commit(bis, "b.txt");
+    git(bis, "update-ref", "refs/bisect/bad", "HEAD");
+    reset(bis, "b-ref-bisect");
+    git(rlog, "checkout", "--detach");
+    commit(rlog, "r.txt");
+    git(rlog, "checkout", "b-head-reflog");
+    git(repo, "worktree", "lock", locked);
+
+    // control must still be safe? other worktrees now hold local-only objects, so only per-worktree
+    // proofs are asserted here: each of these holds something no branch or remote has.
+    for (const [name, p] of Object.entries({ light, ann, wref, bis, rlog })) {
+      assert.equal((await inspectWorktree(p)).safeToPrune, false, `${name} must not be safe`);
+    }
+    const report = await collectOrphans({ targetPath: repo });
+    const byBase = Object.fromEntries(report.candidates.map((c) => [path.basename(c.path), c]));
+    assert.equal(byBase.locked.safeToPrune, false, "locked worktree must not be safe");
+    assert.equal(byBase.locked.locked, true);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});
+
+test("R9-note: a config.worktree core.worktree decoy and an inherited GIT_DIR cannot redirect the proof", { skip: process.platform === "win32" }, async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r9decoy-")));
+  const savedGitDir = process.env.GIT_DIR;
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const wt = path.join(base, "wt");
+    git(repo, "worktree", "add", "-b", "feat", wt);
+    git(wt, "push", "-u", "origin", "feat");
+    const decoy = path.join(base, "decoy");
+    git(repo, "worktree", "add", "-b", "decoy", decoy, "origin/main");
+    git(wt, "config", "extensions.worktreeConfig", "true");
+    git(wt, "config", "--worktree", "core.worktree", decoy);
+    fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
+    fs.writeFileSync(path.join(wt, "untracked_work.txt"), "work");
+    process.env.GIT_DIR = path.join(repo, ".git");
+    const proof = await inspectWorktree(wt);
+    assert.equal(proof.safeToPrune, false);
+  } finally {
+    if (savedGitDir === undefined) delete process.env.GIT_DIR;
+    else process.env.GIT_DIR = savedGitDir;
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

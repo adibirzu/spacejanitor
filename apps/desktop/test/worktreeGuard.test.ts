@@ -86,3 +86,35 @@ test("R7-B23: guard blocks a worktree whose edits hide behind assume-unchanged /
     fs.rmSync(base, { recursive: true, force: true });
   }
 });
+
+test("R9-B27: guard is not fooled by a lying core.fsmonitor and never runs the hook", { skip: process.platform === "win32" }, async () => {
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-guard-fsm-")));
+  try {
+    const origin = path.join(base, "origin.git");
+    const repo = path.join(base, "repo");
+    fs.mkdirSync(repo);
+    git(base, "init", "--bare", "-b", "main", origin);
+    git(repo, "init", "-b", "main");
+    fs.writeFileSync(path.join(repo, "a.txt"), "a");
+    git(repo, "add", ".");
+    git(repo, "commit", "-m", "init");
+    git(repo, "remote", "add", "origin", origin);
+    git(repo, "push", "-u", "origin", "main");
+    const wt = path.join(base, "wt");
+    git(repo, "worktree", "add", "-b", "feat", wt);
+    git(wt, "push", "-u", "origin", "feat");
+    const marker = path.join(base, "HOOK_RAN");
+    const hook = path.join(base, "hook.sh");
+    fs.writeFileSync(hook, `#!/bin/sh\ntouch "${marker}"\nprintf 'token-1\\0'\n`, { mode: 0o755 });
+    git(wt, "config", "core.fsmonitor", hook);
+    git(wt, "config", "core.fsmonitorHookVersion", "2");
+    git(wt, "status");
+    git(wt, "status");
+    fs.writeFileSync(path.join(wt, "a.txt"), "UNCOMMITTED EDIT");
+    fs.rmSync(marker, { force: true });
+    assert.notEqual(await worktreePruneBlockReason(wt), null);
+    assert.equal(fs.existsSync(marker), false);
+  } finally {
+    fs.rmSync(base, { recursive: true, force: true });
+  }
+});

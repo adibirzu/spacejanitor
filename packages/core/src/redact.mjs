@@ -32,7 +32,8 @@ function buildSecretMatchers() {
   const pemEnd = ["-----END", " [A-Z ]*PRIVATE", " KEY-----"].join("");
   return {
     pemRe: new RegExp(`${pemBegin}[\\s\\S]*?(?:${pemEnd}|$)`, "g"),
-    urlCredsRe: /([a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/)[^\s/@?#"']+@/g,
+    // userinfo runs to the LAST "@" of the authority (a password may itself contain "@")
+    urlCredsRe: /([a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/)[^\s/?#"']*@/g,
     urlQueryRe: new RegExp(`([?&;][A-Za-z0-9_.-]{0,64}(?:${NAME_WORDS}|code)=)[^&\\s'"]+`, "gi"),
     flagRe: new RegExp(
       `(-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS})|-(?:t|p))(?:\\s+|=)(?:"[^"]*"|'[^']*'|[^\\s'"]+)`,
@@ -61,6 +62,8 @@ const M = buildSecretMatchers();
  */
 export function redactSecrets(input) {
   if (typeof input !== "string" || !input) return "";
+  // a lone attached short-flag credential ("-pSECRET", "-uadmin:SECRET", "-tTOKEN")
+  if (/^-[ptu][^\s=-]\S*$/i.test(input)) return `${input.slice(0, 2)}<REDACTED>`;
   return input
     .replace(M.pemRe, "<REDACTED>")
     .replace(M.urlCredsRe, "$1<REDACTED>@")
@@ -75,6 +78,9 @@ export function redactSecrets(input) {
 
 const USER_FLAG_RE = /^(?:-u|--user|--proxy-user)$/i;
 const CRED_FLAG_RE = new RegExp(`^(?:-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS})|-t|-p)$`, "i");
+// single-dash long flags (-token, -api-key, -Password): the credential word must start the flag or follow
+// a delimiter, otherwise "-pSecretValue" (mysql attached password) would look like a flag name
+const SINGLE_DASH_CRED_FLAG_RE = new RegExp(`^-(?:[a-z0-9]{1,32}[-_]){0,8}(?:${NAME_WORDS})$`, "i");
 const CRED_FLAG_EQ_RE = new RegExp(
   `^(-(?:t|p|u)|--user|--proxy-user|-{1,2}[a-z0-9_-]{0,64}?(?:${NAME_WORDS}))=[\\s\\S]*$`,
   "i"
@@ -96,7 +102,16 @@ export function redactArgv(args) {
   const list = Array.isArray(args) ? args.map(String) : [];
   for (let i = 0; i < list.length; i++) {
     const a = list[i];
-    if (CRED_FLAG_RE.test(a) || USER_FLAG_RE.test(a)) {
+    // attached short-flag credentials: -pSECRET (mysql), -tTOKEN, -uadmin:SECRET. Treated as
+    // credential-bearing on purpose; false positives such as -p8080 are acceptable.
+    if (/^-[ptu][^\s=-]/i.test(a) && !SINGLE_DASH_CRED_FLAG_RE.test(a)) {
+      out.push(`${a.slice(0, 2)}<REDACTED>`);
+      continue;
+    }
+    if (
+      (a.startsWith("--") ? CRED_FLAG_RE.test(a) : a === "-t" || a === "-p" || SINGLE_DASH_CRED_FLAG_RE.test(a)) ||
+      USER_FLAG_RE.test(a)
+    ) {
       out.push(a);
       if (i + 1 < list.length && !list[i + 1].startsWith("--")) {
         out.push("<REDACTED>");
