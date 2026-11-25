@@ -14,11 +14,13 @@ test("enforces 2-step SHA-256 plan and execute gate in main process", () => {
   });
   assert.equal(noPlan.allowed, false);
 
-  // Step 1: create dry-run plan filtering protected paths
-  const plan = gate.createDryRunPlan([
-    { id: "p1", path: "/home/developer/.ssh/id_ed25519", bytes: 1024, kind: "file" },
-    { id: "c1", path: "/home/developer/.cache/vite", bytes: 4096, kind: "dir" },
-  ]);
+  // Step 1: create dry-run plan filtering protected paths (candidates must be server-registered)
+  const cands = [
+    { id: "p1", path: "/home/developer/.ssh/id_ed25519", bytes: 1024, kind: "file" as const },
+    { id: "c1", path: "/home/developer/.cache/vite", bytes: 4096, kind: "dir" as const },
+  ];
+  gate.registerApprovedCandidates(cands);
+  const plan = gate.createDryRunPlan(cands);
   assert.equal(plan.items.length, 1);
   assert.equal(plan.blockedItems.length, 1);
 
@@ -63,4 +65,40 @@ test("B3 & #5: gate binds planId to server-approved candidates and includes cryp
   const p1 = gate.createDryRunPlan(approved);
   const p2 = gate.createDryRunPlan(approved);
   assert.notEqual(p1.planSha256, p2.planSha256);
+});
+
+test("R2-B3: gate fails closed with no registered candidates, uses server-side candidate data, and denies protected home-root paths", () => {
+  const gate = new RemediationGate({ homeDir: SYNTHETIC_HOME });
+  // Fail closed: nothing registered => any plan request is rejected
+  assert.throws(
+    () => gate.createDryRunPlan([{ id: "c1", path: "/home/developer/.cache/vite", bytes: 1, kind: "dir" }]),
+    /unapproved_candidate/
+  );
+
+  const approved = [{ id: "c1", path: "/home/developer/.cache/vite", bytes: 4096, kind: "dir" as const }];
+  gate.registerApprovedCandidates(approved);
+  // Renderer cannot inflate bytes or change kind of an approved path
+  const plan = gate.createDryRunPlan([{ id: "c1", path: "/home/developer/.cache/vite", bytes: 1, kind: "file" }]);
+  assert.equal(plan.items[0].bytes, 4096);
+  assert.equal(plan.items[0].kind, "dir");
+
+  // Approved-but-protected candidates (case variant, home root, foreign home) never reach items
+  gate.registerApprovedCandidates([
+    { id: "a", path: "/home/developer/.SSH/id_ed25519", bytes: 1, kind: "file" },
+    { id: "b", path: "/home/developer", bytes: 1, kind: "dir" },
+    { id: "c", path: "/home/alice/.cache/x", bytes: 1, kind: "dir" },
+    { id: "d", path: "/home", bytes: 1, kind: "dir" },
+  ]);
+  const blocked = gate.createDryRunPlan([
+    { id: "a", path: "/home/developer/.SSH/id_ed25519", bytes: 1, kind: "file" },
+    { id: "b", path: "/home/developer", bytes: 1, kind: "dir" },
+    { id: "c", path: "/home/alice/.cache/x", bytes: 1, kind: "dir" },
+    { id: "d", path: "/home", bytes: 1, kind: "dir" },
+  ]);
+  assert.equal(blocked.items.length, 0);
+  assert.equal(blocked.blockedItems.length, 4);
+  assert.equal(
+    gate.authorizeExecute({ planSha256: blocked.planSha256, phrase: blocked.confirmationPhrase }).allowed,
+    false
+  );
 });

@@ -1,4 +1,16 @@
+import { isProtectedPath } from "./protect.mjs";
 import crypto from "node:crypto";
+
+// Fail closed: a throwing or non-conforming protection check counts as protected.
+function safeProtected(fn, p, opts) {
+  try {
+    const r = fn(p, opts);
+    if (r && typeof r === "object" && r.protected === false) return r;
+    return { protected: true, reason: (r && r.reason) || "protection_check_failed" };
+  } catch {
+    return { protected: true, reason: "protection_check_error" };
+  }
+}
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
@@ -7,13 +19,13 @@ const DEFAULT_TTL_MS = 5 * 60 * 1000;
  * Protected paths are filtered out and recorded in blockedItems.
  */
 export function createRemediationPlan(candidates = [], options = {}) {
-  const { homeDir, nowMs = Date.now(), ttlMs = DEFAULT_TTL_MS, isProtectedFn } = options;
+  const { homeDir, nowMs = Date.now(), ttlMs = DEFAULT_TTL_MS, isProtectedFn = isProtectedPath } = options;
   const items = [];
   const blockedItems = [];
 
   for (const cand of candidates) {
     if (!cand || !cand.path) continue;
-    const prot = isProtectedFn ? isProtectedFn(cand.path, { homeDir }) : { protected: false, reason: "" };
+    const prot = safeProtected(isProtectedFn, cand.path, { homeDir });
     if (prot.protected) {
       blockedItems.push({
         id: cand.id || cand.path,
@@ -58,7 +70,7 @@ export function createRemediationPlan(candidates = [], options = {}) {
 /**
  * Verify two-step remediation gate before any destructive execution.
  */
-export function verifyRemediationGate({ plan, planSha256, phrase, nowMs = Date.now(), homeDir, isProtectedFn }) {
+export function verifyRemediationGate({ plan, planSha256, phrase, nowMs = Date.now(), homeDir, isProtectedFn = isProtectedPath }) {
   if (!plan || !Array.isArray(plan.items) || plan.items.length === 0) {
     return { allowed: false, reason: "empty_or_missing_plan" };
   }
@@ -73,7 +85,7 @@ export function verifyRemediationGate({ plan, planSha256, phrase, nowMs = Date.n
   }
 
   for (const item of plan.items) {
-    const prot = isProtectedFn ? isProtectedFn(item.path, { homeDir }) : { protected: false, reason: "" };
+    const prot = safeProtected(isProtectedFn, item.path, { homeDir });
     if (prot.protected) {
       return { allowed: false, reason: `protected_target_detected:${prot.reason}` };
     }

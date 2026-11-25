@@ -249,6 +249,48 @@ args = ["server.js", "--api-key=tomlSecretVal123"]
   }
 });
 
+test("R2-B7: collectMcpAudit redacts custom header tokens, URL signatures, bare keys and secret-bearing server names", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-r2-"));
+  try {
+    const secretNameToken = ["gh", "s_", "abcdefghijklmnop123456"].join("");
+    const mcpJson = {
+      mcpServers: {
+        custom: {
+          url: "https://mcp.example.com/sse?sig=sigSecretVal99&access_key=akSecretVal99",
+          headers: { "X-Custom-Token": "hdrSecretVal99", "x-goog-api-key": "googSecretVal99" },
+          args: ["--auth", "authSecretVal99", "--passwd", "pwSecretVal99", "-u", "bob:basicSecretVal99"],
+        },
+        [`srv-${secretNameToken}`]: { command: "node", args: ["apiKey=bareSecretVal99"] },
+      },
+    };
+    fs.writeFileSync(path.join(tmpDir, "mcp.json"), JSON.stringify(mcpJson));
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    const serialized = JSON.stringify(audit);
+    for (const secret of ["sigSecretVal99", "akSecretVal99", "hdrSecretVal99", "googSecretVal99", "authSecretVal99", "pwSecretVal99", "basicSecretVal99", "bareSecretVal99", secretNameToken]) {
+      assert.equal(serialized.includes(secret), false, `secret leaked in mcpAudit: ${secret}`);
+    }
+    assert.equal(audit.secretRiskCount, 2);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
+test("R2-B7: collectMcpAudit fails closed on secrets even when called without a redactFn (raw telemetry module)", async () => {
+  const { collectMcpAudit: rawAudit } = await import("../src/telemetry.mjs");
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-raw-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({ mcpServers: { a: { command: "node", args: ["--token", "rawSecretVal99"] } } })
+    );
+    const audit = await rawAudit({ configDirs: [tmpDir] });
+    assert.equal(JSON.stringify(audit).includes("rawSecretVal99"), false);
+    assert.equal(audit.secretRiskCount, 1);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});
+
 test("#6: adviseWithLocalSlm enforces redirect: error and AbortSignal timeout", async () => {
   let seenInit = null;
   const res = await adviseWithLocalSlm({

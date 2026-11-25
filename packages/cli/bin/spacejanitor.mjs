@@ -77,6 +77,8 @@ function findRustSjBinary() {
 }
 
 function tryRustSj(subArgs) {
+  // SPACEJANITOR_NO_SJ=1 forces the Node collectors (hermetic tests, locked-down hosts).
+  if (process.env.SPACEJANITOR_NO_SJ === "1") return null;
   const bin = findRustSjBinary();
   try {
     const out = execFileSync(bin, [...subArgs, "--json"], {

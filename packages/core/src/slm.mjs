@@ -1,3 +1,5 @@
+import { redactSecrets } from "./redact.mjs";
+import { isProtectedPath } from "./protect.mjs";
 const GIB = 1024 ** 3;
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 
@@ -73,8 +75,8 @@ export async function adviseWithLocalSlm({
   candidates = [],
   memoryReport,
   fetchImpl = globalThis.fetch,
-  redactFn = (s) => s,
-  isProtectedFn,
+  redactFn = redactSecrets,
+  isProtectedFn = isProtectedPath,
 } = {}) {
   if (!enabled) {
     return {
@@ -156,7 +158,7 @@ export async function adviseWithLocalSlm({
   const proposals = Array.isArray(parsed.proposals)
     ? parsed.proposals.map((p) => {
         const target = String(p?.target || "");
-        const prot = isProtectedFn ? isProtectedFn(target) : { protected: false };
+        const prot = isProtectedFn(target);
         return {
           target,
           category: String(p?.category || "unknown"),

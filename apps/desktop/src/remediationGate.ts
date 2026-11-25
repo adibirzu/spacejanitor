@@ -24,8 +24,7 @@ export interface RemediationPlan {
 export class RemediationGate {
   private readonly homeDir?: string;
   private activePlan: RemediationPlan | null = null;
-  private readonly approvedPaths = new Set<string>();
-  private hasRegisteredCandidates = false;
+  private readonly approved = new Map<string, RemediationCandidate>();
   private readonly usedDigests = new Set<string>();
   private executing = false;
 
@@ -34,24 +33,31 @@ export class RemediationGate {
   }
 
   registerApprovedCandidates(candidates: RemediationCandidate[]): void {
-    this.approvedPaths.clear();
-    this.hasRegisteredCandidates = true;
+    this.approved.clear();
     for (const c of candidates) {
       if (c && typeof c.path === "string" && c.path.trim()) {
-        this.approvedPaths.add(c.path);
+        this.approved.set(c.path, {
+          id: String(c.id ?? c.path),
+          path: c.path,
+          bytes: Number(c.bytes) || 0,
+          kind: c.kind === "dir" || c.kind === "git-worktree" ? c.kind : "file",
+        });
       }
     }
   }
 
   createDryRunPlan(candidates: RemediationCandidate[], nowMs = Date.now()): RemediationPlan {
-    if (this.hasRegisteredCandidates) {
-      for (const cand of candidates) {
-        if (!cand || !this.approvedPaths.has(cand.path)) {
-          throw new Error(`unapproved_candidate: ${cand?.path || "unknown"}`);
-        }
+    // Fail closed: only paths the main process itself reported may be planned, and the
+    // size/kind come from that server-side record, never from the renderer.
+    const trusted: RemediationCandidate[] = [];
+    for (const cand of candidates) {
+      const known = cand && typeof cand.path === "string" ? this.approved.get(cand.path) : undefined;
+      if (!known) {
+        throw new Error(`unapproved_candidate: ${cand?.path || "unknown"}`);
       }
+      trusted.push({ ...known });
     }
-    const plan: RemediationPlan = core.createRemediationPlan(candidates, {
+    const plan: RemediationPlan = core.createRemediationPlan(trusted, {
       homeDir: this.homeDir,
       nowMs,
     });
@@ -74,13 +80,18 @@ export class RemediationGate {
       return { allowed: false, reason: "confirmation_token_already_used" };
     }
 
-    const check = core.verifyRemediationGate({
-      plan: this.activePlan,
-      planSha256: params.planSha256,
-      phrase: params.phrase,
-      nowMs: params.nowMs ?? Date.now(),
-      homeDir: this.homeDir,
-    });
+    let check: { allowed: boolean; reason: string };
+    try {
+      check = core.verifyRemediationGate({
+        plan: this.activePlan,
+        planSha256: params.planSha256,
+        phrase: params.phrase,
+        nowMs: params.nowMs ?? Date.now(),
+        homeDir: this.homeDir,
+      });
+    } catch {
+      return { allowed: false, reason: "gate_verification_error" };
+    }
 
     if (!check.allowed) {
       return { allowed: false, reason: check.reason };

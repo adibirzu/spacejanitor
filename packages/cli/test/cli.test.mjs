@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import test from "node:test";
 import { fileURLToPath } from "node:url";
@@ -7,12 +9,19 @@ import { fileURLToPath } from "node:url";
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const CLI_BIN = path.resolve(__dirname, "../bin/spacejanitor.mjs");
 
-function runCli(args) {
+function runCli(args, env = {}) {
   return execFileSync(process.execPath, [CLI_BIN, ...args], {
     encoding: "utf8",
     timeout: 15000,
+    env: { ...process.env, ...env },
   });
 }
+
+// Rust `sj` emits storage.v1 for disk scans; the Node fallback emits disk.v1.
+// Accept either contract so the suite is green with or without a built sj.
+const SCHEMA_ALIASES = {
+  "spacejanitor.disk.v1": ["spacejanitor.disk.v1", "spacejanitor.storage.v1"],
+};
 
 test("AXI CLI emits compact TOON by default and valid v1 JSON with --json", () => {
   const commands = [
@@ -34,7 +43,8 @@ test("AXI CLI emits compact TOON by default and valid v1 JSON with --json", () =
 
     const jsonOut = runCli([cmd, "--json"]);
     const parsed = JSON.parse(jsonOut);
-    assert.equal(parsed.schema, expectedSchema, `expected schema ${expectedSchema} for ${cmd}`);
+    const accepted = SCHEMA_ALIASES[expectedSchema] || [expectedSchema];
+    assert.ok(accepted.includes(parsed.schema), `expected schema ${expectedSchema} for ${cmd}, got ${parsed.schema}`);
   }
 });
 
@@ -62,4 +72,19 @@ test("AXI CLI supports --path before subcommand and never fakes --execute succes
       return true;
     }
   );
+});
+
+test("R2-B8: SPACEJANITOR_NO_SJ=1 forces the Node fallback even when a Rust sj binary exists (hermetic)", () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-fake-bin-"));
+  try {
+    const fake = path.join(dir, "sj");
+    fs.writeFileSync(fake, '#!/bin/sh\necho \'{"schema":"spacejanitor.storage.v1","status":"OK"}\'\n', { mode: 0o755 });
+    const viaSj = JSON.parse(runCli(["disk", "--json"], { SPACEJANITOR_SJ_BIN: fake }));
+    assert.equal(viaSj.schema, "spacejanitor.storage.v1");
+    const hermetic = JSON.parse(runCli(["disk", "--json"], { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_NO_SJ: "1" }));
+    assert.equal(hermetic.schema, "spacejanitor.disk.v1");
+    assert.equal(hermetic.source, "node-fallback");
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });

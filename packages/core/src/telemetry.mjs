@@ -1,3 +1,5 @@
+import { isProtectedPath } from "./protect.mjs";
+import { redactSecrets } from "./redact.mjs";
 import { execFile } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -74,7 +76,7 @@ export function collectDoctor({ version = "0.1.0", schemas = SCHEMA_VERSIONS_EXT
   };
 }
 
-export async function collectDisk({ targetPath = os.homedir(), isProtectedFn } = {}) {
+export async function collectDisk({ targetPath = os.homedir(), isProtectedFn = isProtectedPath } = {}) {
   const resolved = path.resolve(targetPath);
   let freeBytes = 0;
   let totalBytes = 0;
@@ -94,7 +96,7 @@ export async function collectDisk({ targetPath = os.homedir(), isProtectedFn } =
       if (ent.isSymbolicLink() || !ent.isDirectory()) continue;
       const full = path.join(resolved, ent.name);
       const bytes = dirSizeBounded(full, 1);
-      const prot = isProtectedFn ? isProtectedFn(full) : { protected: false, reason: "" };
+      const prot = isProtectedFn(full);
       topConsumers.push({
         id: `dir-${ent.name}`,
         path: full,
@@ -289,7 +291,7 @@ export function parseMacOsVmStat(vmStatOutput, swapOutput = "", totalBytes = os.
   return { availableBytes: boundedAvail, swapTotalBytes, swapUsedBytes };
 }
 
-export async function collectMemory({ top = 15, redactFn = (s) => s } = {}) {
+export async function collectMemory({ top = 15, redactFn = redactSecrets } = {}) {
   const totalBytes = os.totalmem();
   let freeBytes = os.freemem();
   let swapUsedBytes = 0;
@@ -444,7 +446,7 @@ function parseTomlMcpServers(tomlText) {
   return servers;
 }
 
-export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), redactFn = (s) => s } = {}) {
+export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), redactFn = redactSecrets } = {}) {
   const dirs = Array.isArray(configDirs) ? configDirs : defaultMcpConfigDirs(homeDir);
   const servers = [];
   const seenNames = new Map();
@@ -471,17 +473,19 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
     const hasSecretRisk =
       redactedArgs !== combinedRaw ||
       redactedCommand !== rawCommand ||
+      safeName !== String(name) ||
       redactedArgs.includes("<REDACTED>") ||
       redactedCommand.includes("<REDACTED>") ||
       envHasSecret;
 
+    const safeName = redactFn(String(name));
     servers.push({
-      name,
+      name: safeName,
       command: redactedCommand,
       argsRedacted: redactedArgs,
       duplicateCount: count,
       hasSecretRisk,
-      sourceFile,
+      sourceFile: redactFn(String(sourceFile)),
     });
   };
 
@@ -531,7 +535,7 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
   };
 }
 
-export async function collectCleanableCaches({ homeDir = os.homedir(), isProtectedFn } = {}) {
+export async function collectCleanableCaches({ homeDir = os.homedir(), isProtectedFn = isProtectedPath } = {}) {
   const knownCaches = [
     path.join(homeDir, ".cache", "npm"),
     path.join(homeDir, ".npm", "_cacache"),
@@ -547,7 +551,7 @@ export async function collectCleanableCaches({ homeDir = os.homedir(), isProtect
   const candidates = [];
   for (const cachePath of knownCaches) {
     if (!fs.existsSync(cachePath)) continue;
-    const prot = isProtectedFn ? isProtectedFn(cachePath, { homeDir }) : { protected: false };
+    const prot = isProtectedFn(cachePath, { homeDir });
     if (prot.protected) continue;
     const bytes = dirSizeBounded(cachePath, 2);
     candidates.push({

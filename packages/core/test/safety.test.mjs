@@ -172,3 +172,62 @@ test("redacts all 10 credential shapes without leaking raw secret characters", (
   }
   assert.ok(redacted.includes("<REDACTED>"));
 });
+
+test("R2-B3: denylist covers foreign homes, OS roots, extra credential stores and home ancestors; case-insensitive on every platform", () => {
+  const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-r2b3-")));
+  try {
+    for (const sub of [".SSH/id", ".AZURE", ".oci/config", ".npmrc", ".git-credentials", ".local/share/keyrings", ".password-store", ".1password", ".Aws/credentials"]) {
+      assert.equal(
+        isProtectedPath(path.join(home, sub), { homeDir: home, caseInsensitive: false }).protected,
+        true,
+        `expected ${sub} protected even when caller says case-sensitive`
+      );
+    }
+    for (const abs of ["/Users", "/home", "/root", "/var", "/private", "/System", "/Volumes", "/boot", "/dev", "/proc", "/sys", "/lib", "/Users/alice/Documents/x", "/home/alice/.cache/x", "/ETC/passwd"]) {
+      assert.equal(isProtectedPath(abs, { homeDir: home }).protected, true, `expected ${abs} protected`);
+    }
+    // ancestors of home (beyond immediate parent) are home-root candidates
+    assert.equal(isProtectedPath(path.dirname(path.dirname(home)), { homeDir: home }).protected, true);
+    // normal cache under home stays removable
+    fs.mkdirSync(path.join(home, ".cache", "vite"), { recursive: true });
+    assert.equal(isProtectedPath(path.join(home, ".cache", "vite"), { homeDir: home }).protected, false);
+    // symlink pointing at a credential store is denied, and a symlink aliased protected root is denied lexically
+    fs.mkdirSync(path.join(home, ".ssh"));
+    fs.symlinkSync(path.join(home, ".ssh"), path.join(home, ".cache", "alias"));
+    assert.equal(isProtectedPath(path.join(home, ".cache", "alias", "id"), { homeDir: home }).protected, true);
+    const elsewhere = fs.mkdtempSync(path.join(os.tmpdir(), "sj-r2b3-ext-"));
+    fs.rmSync(path.join(home, ".ssh"), { recursive: true });
+    fs.symlinkSync(elsewhere, path.join(home, ".ssh"));
+    assert.equal(isProtectedPath(path.join(home, ".ssh", "id"), { homeDir: home }).protected, true, "lexical ~/.ssh stays protected when it is a symlink elsewhere");
+    assert.equal(isProtectedPath(path.join(elsewhere, "id"), { homeDir: home }).protected, true, "real target of ~/.ssh stays protected");
+    fs.rmSync(elsewhere, { recursive: true, force: true });
+  } finally {
+    fs.rmSync(home, { recursive: true, force: true });
+  }
+});
+
+test("R2-B7: redactSecrets covers extended flag names, custom headers, URL userinfo/query signatures, bare env keys, PEM and vendor tokens", () => {
+  const j = (...p) => p.join("");
+  const V = "abc123secretvalue";
+  const cases = [
+    `--authorization ${V}`, `--credentials ${V}`, `--auth ${V}`, `--pat ${V}`, `--passwd ${V}`,
+    `X-Custom-Token: ${V}`, `x-goog-api-key: ${V}`, `apikey: ${V}`, `client_secret: ${V}`, `Authorization: token ${V}`,
+    `https://${V}@host/x`, `https://host/x?sig=${V}`, `https://host/x?access_key=${V}&client_secret=${V}`,
+    `https://host/?auth=${V}`, `https://host/?X-Amz-Signature=${V}`,
+    `apiKey=${V}`, `password=${V}`, `export token=${V}`,
+    `-u user:${V}`, `--user user:${V}`,
+    j("gh", "s_", "abcdefghijklmnop123456"), j("gh", "o_", "abcdefghijklmnop123456"), j("gh", "u_", "abcdefghijklmnop123456"),
+    j("np", "m_", "abcdefghijklmnopqrstuvwxyz0123456789"), j("AI", "zaSy", "A1234567890abcdefghijklmnopqrstuvw"),
+    j("hf", "_", "abcdefghijklmnopqrstuvwxyz1234"), j("SG", ".", "abcdefghijklmnop", ".", "qrstuvwxyz0123456789"),
+    j("ey", "JhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.", "abc123SIGNATURE_xyz"),
+    j("-----BEGIN ", "PRIVATE KEY-----\nMIIabcDEF123\n-----END ", "PRIVATE KEY-----"),
+  ];
+  for (const input of cases) {
+    const out = redactSecrets(input);
+    assert.ok(!/abc123secretvalue|abcdefghijkl|abc123SIGNATURE|MIIabcDEF123/.test(out), `leak: ${JSON.stringify(input)} => ${JSON.stringify(out)}`);
+    assert.ok(out.includes("<REDACTED>"), `no marker: ${JSON.stringify(out)}`);
+  }
+  // non-secret text is untouched
+  assert.equal(redactSecrets("node server.js --port 3000 --verbose"), "node server.js --port 3000 --verbose");
+  assert.equal(redactSecrets("https://example.com/path?page=2"), "https://example.com/path?page=2");
+});

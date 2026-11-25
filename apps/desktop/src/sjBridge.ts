@@ -7,6 +7,15 @@ import { promisify } from "node:util";
 const core = require("@spacejanitor/core");
 const execFileAsync = promisify(execFile);
 
+// Reports that may carry command lines / config values get a second redaction pass in the
+// main process, regardless of what the sidecar already did.
+const REDACTED_METHODS = new Set(["mcp-audit", "memory", "blockers", "summary"]);
+
+function finalizeSidecarReport(method: string, report: Record<string, unknown>): Record<string, unknown> {
+  const normalized = core.normalizeReportEnvelope({ ...report, source: "sj-core" });
+  return REDACTED_METHODS.has(method) ? core.redactSlmPayload(normalized) : normalized;
+}
+
 export interface ResolveBinaryOptions {
   resourcesPath?: string;
   cwd?: string;
@@ -54,6 +63,7 @@ export function resolveSjBinary(options: ResolveBinaryOptions = {}): string | nu
 }
 
 interface PendingRpc {
+  method: string;
   resolve: (value: Record<string, unknown>) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
@@ -119,7 +129,7 @@ export class SjBridge {
             if (msg.error) {
               req.reject(new Error(String(msg.error.message || "rpc_error")));
             } else {
-              req.resolve(core.normalizeReportEnvelope({ ...(msg.result || {}), source: "sj-core" }));
+              req.resolve(finalizeSidecarReport(req.method, msg.result || {}));
             }
           }
         } catch {
@@ -141,7 +151,7 @@ export class SjBridge {
         this.pending.delete(id);
         reject(new Error("sidecar_timeout"));
       }, 6000);
-      this.pending.set(id, { resolve, reject, timer });
+      this.pending.set(id, { method, resolve, reject, timer });
       const payload = JSON.stringify({ jsonrpc: "2.0", id, method, params }) + "\n";
       this.proc.stdin.write(payload);
     });
@@ -167,7 +177,7 @@ export class SjBridge {
       });
       const parsed = JSON.parse(stdout);
       if (parsed && typeof parsed === "object" && parsed.schema) {
-        return core.normalizeReportEnvelope({ ...parsed, source: "sj-core" });
+        return finalizeSidecarReport(method, parsed);
       }
     } catch {
       return null;
