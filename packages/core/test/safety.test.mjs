@@ -282,7 +282,10 @@ test("R3-B11: macOS /System/Volumes/Data alias cannot bypass the denylist", () =
   for (const p of [`${D}${home}`, `${D}${home}/Documents/x`, `${D}${home}/.aws/credentials`, `${D}/Users`, `${D}/Applications`, `${D}/Library`, `${D}/private/etc`, `${D}/usr/local`, `${D.toLowerCase()}${home}/.ssh/id`, D]) {
     assert.equal(isProtectedPath(p, { homeDir: home }).protected, true, `expected protected: ${p}`);
   }
-  assert.equal(isProtectedPath(`${D}${home}/.cache/vite`, { homeDir: home }).protected, false);
+  // the Data volume only exists on macOS; on Windows "/System" is a plain (protected) directory name
+  if (process.platform !== "win32") {
+    assert.equal(isProtectedPath(`${D}${home}/.cache/vite`, { homeDir: home }).protected, false);
+  }
 });
 
 test("R3-B12: redactSecrets covers underscore and single-dash credential flags, more token shapes, and stays linear on dashes", () => {
