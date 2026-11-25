@@ -8,9 +8,8 @@ import {
   ORPHAN_SCAN_WARNING,
   collectOrphans,
   collectSummary,
-  inspectWorktree,
+  activeSjBinary,
   redactSecrets,
-  removeLinkedWorktree,
 } from "../src/index.mjs";
 import { up, urlWith } from "./_fixtures.mjs";
 
@@ -45,10 +44,16 @@ test("orphan scanning is OFF by default: collectOrphans reports 'not scanned' an
   assert.deepEqual(report.candidates, []);
   assert.ok(String(report.message).includes("disabled by default"));
   assert.equal(fs.existsSync(marker), false, "git must not be spawned");
-  // opt-in really reaches git, with a warning available to show
+  // opt-in goes to the Rust gate only (Node never spawns git): scanned when sj exists, fail-closed error otherwise
   const on = await collectOrphans({ targetPath: repo, includeOrphans: true });
-  assert.equal(on.scanned, true);
-  assert.equal(fs.existsSync(marker), true);
+  if (activeSjBinary()) {
+    assert.equal(on.scanned, true);
+  } else {
+    assert.equal(on.scanned, false);
+    assert.equal(on.error, "sj_unavailable");
+    assert.deepEqual(on.candidates, []);
+    assert.equal(fs.existsSync(marker), false, "no sj means no git anywhere");
+  }
   assert.match(ORPHAN_SCAN_WARNING, /runs git inside repositories found on disk/);
   assert.match(ORPHAN_SCAN_WARNING, /experimental/);
 }));
@@ -58,19 +63,6 @@ test("collectSummary spawns no git by default and marks orphans as not scanned",
   assert.equal(summary.orphans.scanned, false);
   assert.equal(summary.orphans.notScannedReason, "orphan_scan_disabled_by_default");
   assert.equal(fs.existsSync(marker), false, `git was spawned: ${fs.existsSync(marker) ? fs.readFileSync(marker, "utf8") : ""}`);
-}));
-
-test("inspectWorktree and removeLinkedWorktree refuse to run git unless opted in", skipWin, withGitShim(async ({ dir, marker }) => {
-  const wt = path.join(dir, "wt");
-  fs.mkdirSync(wt);
-  fs.writeFileSync(path.join(wt, ".git"), `gitdir: ${path.join(dir, "g")}\n`);
-  const proof = await inspectWorktree(wt);
-  assert.equal(proof.safeToPrune, false);
-  assert.equal(proof.proofStatus, "not_scanned");
-  const rm = await removeLinkedWorktree(wt);
-  assert.equal(rm.ok, false);
-  assert.equal(rm.error, "orphan_scanning_disabled");
-  assert.equal(fs.existsSync(marker), false);
 }));
 
 test("CLI: summary and orphans spawn no git by default; --include-orphans opts in and warns", skipWin, withGitShim(async ({ dir, marker, shimPath }) => {
@@ -92,7 +84,11 @@ test("CLI: summary and orphans spawn no git by default; --include-orphans opts i
   assert.equal(fs.existsSync(marker), false, "git was spawned by default CLI usage");
   const on = run(["orphans", "--path", dir, "--include-orphans", "--json"]);
   assert.match(on.stderr, /runs git inside repositories found on disk/);
-  assert.equal(fs.existsSync(marker), true);
+  // SPACEJANITOR_NO_SJ=1: the opt-in finds no Rust gate, so the report fails closed and Node spawns no git itself
+  const onj = JSON.parse(on.stdout);
+  assert.equal(onj.error, "sj_unavailable");
+  assert.deepEqual(onj.candidates, []);
+  assert.equal(fs.existsSync(marker), false, "Node must never spawn git for orphan proofs");
 }));
 
 test("R11/R12: an attached short-flag credential after NAME= (any quoting/separator) is redacted", () => {

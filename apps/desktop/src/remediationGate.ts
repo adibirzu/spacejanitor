@@ -91,11 +91,16 @@ function parseSjPlan(raw: Record<string, unknown>): SjPlan {
   return { planSha256: sha, items, exclusions };
 }
 
+function planArgs(root: string, orphans: boolean): string[] {
+  return ["plan", root, "--json", ...(orphans ? ["--include-orphans"] : [])];
+}
+
 function uiKind(sjKind: string): RemediationCandidate["kind"] {
   return sjKind === "orphan_worktree" ? "git-worktree" : "file";
 }
 
 interface ActivePlan {
+  orphans: boolean;
   plan: RemediationPlan;
   sha: string;
   root: string;
@@ -105,12 +110,14 @@ interface ActivePlan {
 export class RemediationGate {
   private readonly homeDir?: string;
   private readonly runSj: RunSj;
+  private readonly orphanScanEnabled: () => boolean;
   private planRoot: string;
   private active: ActivePlan | null = null;
   private readonly approved = new Map<string, RemediationCandidate>();
   private executing = false;
 
-  constructor(options: { homeDir?: string; runSj?: RunSj; planRoot?: string } = {}) {
+  constructor(options: { homeDir?: string; runSj?: RunSj; planRoot?: string; orphanScanEnabled?: () => boolean } = {}) {
+    this.orphanScanEnabled = options.orphanScanEnabled ?? (() => false);
     this.homeDir = options.homeDir;
     this.runSj = options.runSj ?? ((args, opts) => core.runSj(args, { homeDir: this.homeDir, ...opts }));
     this.planRoot = options.planRoot ?? process.cwd();
@@ -151,7 +158,9 @@ export class RemediationGate {
     }
 
     const root = this.planRoot;
-    const sjPlan = parseSjPlan(await this.runSj(["plan", root, "--json"], { timeoutMs: PLAN_TIMEOUT_MS }));
+    // Orphan worktrees are planned only when the main-process opt-in is on (default OFF: trash only).
+    const orphans = this.orphanScanEnabled() === true;
+    const sjPlan = parseSjPlan(await this.runSj(planArgs(root, orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
     const selected = sjPlan.items.filter((i) => wanted.has(i.path));
     const plannedPaths = new Set(selected.map((i) => i.path));
     const blockedItems: RemediationPlan["blockedItems"] = [];
@@ -178,7 +187,7 @@ export class RemediationGate {
       createdAtMs: nowMs,
       expiresAtMs: nowMs + PLAN_TTL_MS,
     };
-    this.active = { plan, sha: sjPlan.planSha256, root, items: selected };
+    this.active = { plan, sha: sjPlan.planSha256, root, items: selected, orphans };
     return plan;
   }
 
@@ -217,7 +226,7 @@ export class RemediationGate {
       // The user confirmed one digest. If sj no longer reports it, nothing runs.
       let planError: string | null = null;
       try {
-        const current = parseSjPlan(await this.runSj(["plan", active.root, "--json"], { timeoutMs: PLAN_TIMEOUT_MS }));
+        const current = parseSjPlan(await this.runSj(planArgs(active.root, active.orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
         if (current.planSha256 !== active.sha) planError = "plan_changed_since_confirmation";
       } catch (err) {
         planError = reasonOf(err);
@@ -251,13 +260,13 @@ export class RemediationGate {
     // sj rebuilds and re-proves the plan at execution. Removing an item changes the digest of the
     // rest, so later items are bound to a freshly planned digest, but only when sj still reports
     // the exact item the user confirmed.
-    const fresh = parseSjPlan(await this.runSj(["plan", active.root, "--json"], { timeoutMs: PLAN_TIMEOUT_MS }));
+    const fresh = parseSjPlan(await this.runSj(planArgs(active.root, active.orphans), { timeoutMs: PLAN_TIMEOUT_MS }));
     const current = fresh.items.find((i) => i.id === item.id);
     if (!current || JSON.stringify(current) !== JSON.stringify(item)) {
       throw new Error("item_changed_since_plan");
     }
     const out = await this.runSj(
-      ["plan", active.root, "--execute", "--confirm", "--plan-sha256", fresh.planSha256, "--item", item.id, "--json"],
+      [...planArgs(active.root, active.orphans), "--execute", "--confirm", "--plan-sha256", fresh.planSha256, "--item", item.id],
       { timeoutMs: EXECUTE_TIMEOUT_MS }
     );
     const done = out.executed_item as { id?: unknown } | undefined;

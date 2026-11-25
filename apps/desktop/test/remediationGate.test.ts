@@ -295,3 +295,20 @@ test("integration: the real sj plans and removes an OS-Trash item; a protected-d
     fs.rmSync(home, { recursive: true, force: true });
   }
 });
+
+test("orphan worktrees are planned and executed only with the main-process opt-in (default OFF: no --include-orphans)", async () => {
+  for (const enabled of [false, true]) {
+    const a = item("/h/.Trash/a", "item_a");
+    const sj = fakeSj((args) =>
+      args.includes("--execute")
+        ? { schema: "spacejanitor.proposal.v1", mode: "executed", mutated: true, plan_sha256: SHA, executed_item: a }
+        : sjPlan([a])
+    );
+    const gate = new RemediationGate({ runSj: sj.run, planRoot: "/h", orphanScanEnabled: () => enabled });
+    gate.registerApprovedCandidates([cand(a.path)]);
+    const plan = await gate.createDryRunPlan([cand(a.path)]);
+    await gate.run({ planSha256: plan.planSha256, phrase: plan.confirmationPhrase });
+    assert.ok(sj.calls.length >= 3);
+    for (const c of sj.calls) assert.equal(c.includes("--include-orphans"), enabled, c.join(" "));
+  }
+});

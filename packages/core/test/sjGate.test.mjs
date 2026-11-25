@@ -157,7 +157,7 @@ test("gate: empty or non-string candidates are protected without spawning sj", (
 test("gate: no sj means orphan/worktree proofs are unavailable and nothing is offered as safe", async () => {
   configureSjBinary(null);
   try {
-    const r = await collectOrphans({ targetPath: os.tmpdir() });
+    const r = await collectOrphans({ targetPath: os.tmpdir(), includeOrphans: true });
     assert.equal(r.schema, "spacejanitor.orphans.v1");
     assert.equal(r.error, "sj_unavailable");
     assert.deepEqual(r.candidates, []);

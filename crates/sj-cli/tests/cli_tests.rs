@@ -687,6 +687,7 @@ fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
         .unwrap();
     assert!(String::from_utf8_lossy(&on.stderr).contains("experimental"), "opt-in must warn");
     assert!(marker.exists(), "opt-in scan should reach git");
+}
 
 fn run_protect(home: &str, args: &[&str]) -> std::process::Output {
     Command::new(sj_bin())
