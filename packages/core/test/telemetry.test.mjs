@@ -344,3 +344,18 @@ test("B8: formatToon handles Rust snake_case storage.v1, doctor.v1, and orphans.
   assert.equal(orphansToon.includes("undefined"), false);
   assert.ok(orphansToon.includes("/tmp/work/wt1"));
 });
+
+test("R2-B7: collectMcpAudit keeps clean servers (no TDZ drop) and counts them", async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "sj-mcp-clean-"));
+  try {
+    fs.writeFileSync(
+      path.join(tmpDir, "mcp.json"),
+      JSON.stringify({ mcpServers: { clean: { command: "npx", args: ["-y", "pkg"] } } })
+    );
+    const audit = await collectMcpAudit({ configDirs: [tmpDir] });
+    assert.equal(audit.totalServers, 1);
+    assert.equal(audit.secretRiskCount, 0);
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

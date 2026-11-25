@@ -231,3 +231,13 @@ test("R2-B7: redactSecrets covers extended flag names, custom headers, URL useri
   assert.equal(redactSecrets("node server.js --port 3000 --verbose"), "node server.js --port 3000 --verbose");
   assert.equal(redactSecrets("https://example.com/path?page=2"), "https://example.com/path?page=2");
 });
+
+test("R2-B7: redactSecrets handles JSON-quoted keys and stays linear on long inputs", () => {
+  assert.ok(!redactSecrets('{"api_key": "abcdef123456"}').includes("abcdef123456"));
+  assert.ok(!redactSecrets('{"password":"hunter2hunter2"}').includes("hunter2hunter2"));
+  for (const tail of [" ", "=", ":"]) {
+    const t0 = Date.now();
+    redactSecrets("a".repeat(200000) + tail);
+    assert.ok(Date.now() - t0 < 1000, `redactSecrets too slow on long input (tail ${JSON.stringify(tail)})`);
+  }
+});

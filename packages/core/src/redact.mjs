@@ -29,7 +29,7 @@ function buildSecretMatchers() {
   const pemEnd = ["-----END", " [A-Z ]*PRIVATE", " KEY-----"].join("");
   return {
     pemRe: new RegExp(`${pemBegin}[\\s\\S]*?(?:${pemEnd}|$)`, "g"),
-    urlCredsRe: /([a-zA-Z][a-zA-Z0-9+.-]*:\/\/)[^\s/@?#"']+@/g,
+    urlCredsRe: /([a-zA-Z][a-zA-Z0-9+.-]{0,31}:\/\/)[^\s/@?#"']+@/g,
     urlQueryRe: new RegExp(`([?&;][A-Za-z0-9_.-]*(?:${NAME_WORDS})=)[^&\\s'"]+`, "gi"),
     flagRe: new RegExp(
       `(--[a-z0-9-]*?(?:${NAME_WORDS})|-(?:t|p))(?:\\s+|=)(?:"[^"]*"|'[^']*'|[^\\s'"]+)`,
@@ -38,12 +38,12 @@ function buildSecretMatchers() {
     userFlagRe: /(^|\s)(-u|--user|--proxy-user)(?:\s+|=)(?:"[^"]*"|'[^']*'|\S*:\S+)/g,
     // "Name: value" (HTTP header / YAML) consumes the rest of the line, so "Bearer x" and "token x" are covered.
     headerRe: new RegExp(
-      `\\b([A-Za-z0-9_-]*(?:${NAME_WORDS})s?)(\\s*:\\s*)(?!<REDACTED>)[^\\n\\r"']+`,
+      `\\b([A-Za-z0-9_-]{0,64}(?:${NAME_WORDS})s?)(["']?\\s*:\\s*)(?!<REDACTED>)(?:"[^"]*"|'[^']*'|[^\\n\\r"']+)`,
       "gi"
     ),
     bearerRe: /\b(Bearer|Basic)\s+[A-Za-z0-9._~+/=-]{8,}/gi,
     assignRe: new RegExp(
-      `\\b([A-Za-z0-9_.-]*(?:${NAME_WORDS})s?)(\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s'"&;]+)`,
+      `\\b([A-Za-z0-9_.-]{0,64}(?:${NAME_WORDS})s?)(["']?\\s*=\\s*)(?:"[^"]*"|'[^']*'|[^\\s'"&;]+)`,
       "gi"
     ),
     vendorRe: new RegExp(`(?:${vendorPrefixes.join("|")})`, "g"),

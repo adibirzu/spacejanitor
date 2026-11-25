@@ -462,6 +462,7 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
     const combinedRaw = [cfg?.url ? String(cfg.url) : "", ...argsList, ...headerList]
       .filter(Boolean)
       .join(" ");
+    const safeName = redactFn(String(name));
     const redactedArgs = redactFn(combinedRaw);
     const rawCommand = String(cfg?.command || "");
     const redactedCommand = redactFn(rawCommand);
@@ -478,7 +479,6 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
       redactedCommand.includes("<REDACTED>") ||
       envHasSecret;
 
-    const safeName = redactFn(String(name));
     servers.push({
       name: safeName,
       command: redactedCommand,
