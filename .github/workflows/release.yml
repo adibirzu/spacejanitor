@@ -2,8 +2,10 @@ name: SpaceJanitor Multi-OS Release
 
 on:
   push:
+    # Strict: final vX.Y.Z and release candidates vX.Y.Z-rc.N only (scripts/release-tag.mjs re-validates).
     tags:
-      - "v*.*.*"
+      - "v[0-9]+.[0-9]+.[0-9]+"
+      - "v[0-9]+.[0-9]+.[0-9]+-rc.[0-9]+"
   workflow_dispatch:
     inputs:
       dry_run:
@@ -29,13 +31,9 @@ jobs:
       - name: Validate tag matches package.json version (on tag push)
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          TAG_VER="${GITHUB_REF_NAME#v}"
           PKG_VER="$(node -p "require('./apps/desktop/package.json').version")"
-          echo "Tag version: $TAG_VER | Desktop package.json version: $PKG_VER"
-          if [ "$TAG_VER" != "$PKG_VER" ]; then
-            echo "ERROR: Tag $GITHUB_REF_NAME does not match apps/desktop/package.json ($PKG_VER)"
-            exit 1
-          fi
+          echo "Tag: $GITHUB_REF_NAME | Desktop package.json version: $PKG_VER"
+          node scripts/release-tag.mjs "$GITHUB_REF_NAME" --package-version "$PKG_VER"
       - name: Run SpaceJanitor OSS hygiene gate
         run: node scripts/check-oss-hygiene.mjs
       - name: Install and run gitleaks over git history
@@ -278,4 +276,5 @@ jobs:
         uses: softprops/action-gh-release@v2 # v2.1.0
         with:
           generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-rc.') }}
           files: release-assets/*
