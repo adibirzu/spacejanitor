@@ -209,6 +209,16 @@ pub fn executable_config_key(key: &str) -> Option<String> {
     hit.then_some(k)
 }
 
+fn empty_home_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let dir = std::env::temp_dir().join(format!("sj-git-home-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        dir
+    })
+    .clone()
+}
+
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 /// A `git` command with a SCRUBBED environment and config: nothing is inherited except the few
@@ -219,9 +229,13 @@ const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 fn scrubbed_git() -> Command {
     let mut cmd = Command::new("git");
     cmd.env_clear();
+    // HOME/USERPROFILE point at an EMPTY directory: curl would otherwise read ~/.netrc and send those
+    // credentials to whatever host a hostile repo names. ssh resolves `~` through the passwd entry,
+    // so its keys and known_hosts are unaffected.
+    let empty_home = empty_home_dir();
+    cmd.env("HOME", &empty_home).env("USERPROFILE", &empty_home);
     for key in [
-        "PATH", "HOME", "USERPROFILE", "SSH_AUTH_SOCK", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP",
-        "TMPDIR",
+        "PATH", "SSH_AUTH_SOCK", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR",
     ] {
         if let Some(v) = std::env::var_os(key) {
             cmd.env(key, v);
@@ -245,6 +259,22 @@ fn scrubbed_git() -> Command {
             &format!("core.hooksPath={NULL_DEVICE}"),
             "-c",
             "protocol.ext.allow=never",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "protocol.http.allow=always",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "protocol.git.allow=always",
+            "-c",
+            &format!("core.attributesFile={NULL_DEVICE}"),
+            "-c",
+            &format!("core.excludesFile={NULL_DEVICE}"),
             "-c",
             "credential.helper=",
             "-c",
@@ -303,6 +333,18 @@ fn executable_config_risk(git_ctx: &GitExecContext) -> Option<String> {
         let rel = rel.trim();
         if !rel.is_empty() {
             common = resolve_relative_from_dir(&git_ctx.git_dir, Path::new(rel));
+        }
+    }
+    for name in ["info/attributes", "info/exclude"] {
+        let f = common.join(name);
+        match std::fs::symlink_metadata(&f) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Some(UNREADABLE.to_string()),
+            Ok(_) => {
+                if read_regular_text(&f).is_err() {
+                    return Some(UNREADABLE.to_string());
+                }
+            }
         }
     }
     let mut files = vec![common.join("config")];
@@ -386,10 +428,11 @@ fn run_with_timeout(
         .stdout
         .take()
         .ok_or_else(|| SjError::Git("git_stdout_unavailable".to_string()))?;
-    let reader = std::thread::spawn(move || {
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = so.read_to_end(&mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
     let deadline = Instant::now() + timeout;
     loop {
@@ -397,7 +440,11 @@ fn run_with_timeout(
             Some(status) => {
                 // git is gone; reap anything it left holding our pipes so the join cannot block
                 kill_process_group(pgid);
-                let out = reader.join().unwrap_or_default();
+                // bounded: a descendant that escaped the group (setsid) may still hold the pipe
+                let left = deadline.saturating_duration_since(Instant::now());
+                let out = out_rx
+                    .recv_timeout(left.max(Duration::from_millis(250)))
+                    .map_err(|_| SjError::Git("git_timeout".to_string()))?;
                 return Ok((status.success(), String::from_utf8_lossy(&out).into_owned()));
             }
             None => {
@@ -572,7 +619,7 @@ fn collect_extra_local_commits(
 /// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
 /// survive the worktree being removed). None for a standalone repo.
 fn shared_git_ctx(git_ctx: &GitExecContext) -> Option<GitExecContext> {
-    let rel = std::fs::read_to_string(git_ctx.git_dir.join("commondir")).ok()?;
+    let rel = read_regular_text(&git_ctx.git_dir.join("commondir")).ok()?;
     let rel = rel.trim();
     if rel.is_empty() {
         return None;
@@ -706,7 +753,7 @@ fn validate_gitdir_pointer(
     ctx: &ProtectionContext,
 ) -> Result<PathBuf, String> {
     let raw =
-        std::fs::read_to_string(dot_git_file).map_err(|_| "unreadable_dot_git_file".to_string())?;
+        read_regular_text(dot_git_file).map_err(|_| "unreadable_dot_git_file".to_string())?;
     let line = raw
         .lines()
         .find(|l| l.trim_start().starts_with("gitdir:"))
@@ -1385,6 +1432,9 @@ pub fn discover_nested_repos_exhaustive(
         });
 
     for entry_res in walker {
+        if scan_deadline_passed() {
+            return Err("scan_budget_exceeded".to_string());
+        }
         let entry = entry_res.map_err(|e| format!("nested_scan_error:{e}"))?;
         if entry.read_children_error.is_some() {
             return Err(format!("nested_scan_unreadable:{}", entry.path().display()));
