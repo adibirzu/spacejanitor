@@ -392,6 +392,18 @@ fn dispatch_rpc_method(
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."));
             let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            if params.get("include_orphans").and_then(|v| v.as_bool()) != Some(true) {
+                return Ok(serde_json::json!({
+                    "schema": SCHEMA_ORPHANS_V1,
+                    "root": path.to_string_lossy(),
+                    "scanned": false,
+                    "not_scanned_reason": "orphan_scan_disabled_by_default",
+                    "message": ORPHAN_SCAN_DISABLED_MESSAGE,
+                    "candidates_scanned": 0,
+                    "safe_to_prune": [],
+                    "blocked": [],
+                }));
+            }
             let report = inspect_orphans(&path, ctx, &OrphanOptions { max_depth: depth })
                 .map_err(|e| (-32000, e.to_string()))?;
             serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
@@ -499,10 +511,11 @@ fn dispatch_rpc_method(
                 .get("include_trash")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // Orphan scanning runs git inside repos found on disk: off unless explicitly requested.
             let include_orphans = params
                 .get("include_orphans")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .unwrap_or(false);
             let trash_path_override = params
                 .get("trash_path")
                 .and_then(|v| v.as_str())
@@ -532,10 +545,11 @@ fn dispatch_rpc_method(
                 .get("include_trash")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // Orphan scanning runs git inside repos found on disk: off unless explicitly requested.
             let include_orphans = params
                 .get("include_orphans")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true);
+                .unwrap_or(false);
             let orphan_max_depth =
                 params.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
             let confirm = params

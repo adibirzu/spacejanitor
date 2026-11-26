@@ -1700,6 +1700,62 @@ fn serve_stdio_llm_audit_honours_keep_and_threshold_params() {
     assert_eq!(flag(&rows[1]), Some(true), "keep_plugin param ignored: {text}");
 }
 
+#[cfg(unix)]
+fn serve_stdio_with_spy_git(requests: &[serde_json::Value]) -> (String, bool) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let tmp = safe_tempdir();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("work/repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let bin = root.join("spybin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = root.join("git-was-spawned");
+    let spy = bin.join("git");
+    fs::write(&spy, format!("#!/bin/sh\necho spawned >> '{}'\nexit 1\n", marker.display())).unwrap();
+    fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("PATH", path)
+        .env("HOME", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for r in requests {
+        let mut r = r.clone();
+        r["params"]["path"] = serde_json::json!(root.join("work").to_str().unwrap());
+        writeln!(child.stdin.as_mut().unwrap(), "{r}").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into_owned(), marker.exists())
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_stdio_never_spawns_git_by_default() {
+    let (text, spawned) = serve_stdio_with_spy_git(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"plan_cleanup","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"execute_cleanup","params":{"item":"x"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"orphans","params":{}}),
+    ]);
+    assert!(!spawned, "git was spawned over serve-stdio without opt-in: {text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_stdio_include_orphans_true_is_the_explicit_opt_in() {
+    let (text, spawned) = serve_stdio_with_spy_git(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"plan_cleanup","params":{"include_orphans":true}}),
+    ]);
+    assert!(spawned, "explicit opt-in should still scan: {text}");
+}
+
 #[test]
 fn r5_serve_stdio_unknown_method_never_echoes_the_method() {
     use std::io::Write;
