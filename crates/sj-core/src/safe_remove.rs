@@ -1,3 +1,4 @@
+use crate::linux::{allowed_linux_cache_roots, allowed_tmp_roots, is_active_mountpoint};
 use crate::orphans::capture_git_snapshot_identity_staged;
 use crate::plan::{PlanItem, TargetSnapshot};
 use crate::protect::{check_path_protection_anchored, is_symlink_path, ProtectionContext};
@@ -1279,6 +1280,7 @@ pub(crate) mod unix_impl {
         item: &PlanItem,
         ctx: &ProtectionContext,
         allowed_trash_roots: &[PathBuf],
+        allowed_tmp: &[PathBuf],
     ) -> Result<(), SjError> {
         let target = Path::new(&item.path);
         let prot = check_path_protection_anchored(target, ctx);
@@ -1292,92 +1294,123 @@ pub(crate) mod unix_impl {
             )));
         }
 
-        let (parent_fd, leaf_c, canon_target, canon_parent, is_orphan) = match item.kind.as_str() {
-            "trash_item" => {
-                let canon_target = std::fs::canonicalize(target)?;
-                let mut matched_root: Option<PathBuf> = None;
-                for root in allowed_trash_roots {
-                    if !root.exists() || is_symlink_path(root).unwrap_or(true) {
-                        continue;
-                    }
-                    if let Ok(canon_root) = std::fs::canonicalize(root) {
-                        if canon_target.starts_with(&canon_root) && canon_target != canon_root {
-                            matched_root = Some(canon_root);
-                            break;
-                        }
+        let resolve_contained = |allowed_roots: &[PathBuf],
+                                 allow_exact_root: bool,
+                                 label: &str|
+         -> Result<(OwnedFd, CString, PathBuf, PathBuf), SjError> {
+            let canon_target = std::fs::canonicalize(target)?;
+            let mut matched_root: Option<PathBuf> = None;
+            for root in allowed_roots {
+                if !root.exists() || is_symlink_path(root).unwrap_or(true) {
+                    continue;
+                }
+                if let Ok(canon_root) = std::fs::canonicalize(root) {
+                    let is_child = canon_target.starts_with(&canon_root) && canon_target != canon_root;
+                    let is_exact = allow_exact_root && canon_target == canon_root;
+                    if is_child || is_exact {
+                        matched_root = Some(canon_root);
+                        break;
                     }
                 }
-                let Some(canon_root) = matched_root else {
-                    return Err(SjError::ExecutionGate(format!(
-                        "refusing trash_item outside verified OS Trash roots: {}",
-                        target.display()
-                    )));
-                };
-                let prot_canon = check_path_protection_anchored(&canon_target, ctx);
-                if prot_canon.protected {
-                    return Err(SjError::ProtectedPath(prot_canon.reason));
-                }
-                let canon_parent = canon_target
-                    .parent()
-                    .ok_or_else(|| {
-                        SjError::ExecutionGate("trash target has no parent".to_string())
-                    })?
-                    .to_path_buf();
-                let rel = canon_target.strip_prefix(&canon_root).map_err(|_| {
-                    SjError::ExecutionGate("failed to strip canonical trash root".to_string())
-                })?;
-                let rel_parent = rel.parent().unwrap_or_else(|| Path::new(""));
-                let leaf = rel
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .ok_or_else(|| SjError::ExecutionGate("invalid trash item leaf".to_string()))?;
-                let root_fd = open_dir_nofollow_from_root(&canon_root)?;
-                let parent_fd = open_rel_dir_nofollow(root_fd, rel_parent)?;
-                (
-                    parent_fd,
-                    to_cstring(leaf)?,
-                    canon_target,
-                    canon_parent,
-                    false,
-                )
             }
-            "orphan_worktree" => {
-                let canon_target = std::fs::canonicalize(target)?;
-                let prot_canon = check_path_protection_anchored(&canon_target, ctx);
-                if prot_canon.protected {
-                    return Err(SjError::ProtectedPath(prot_canon.reason));
-                }
-                if is_symlink_path(&canon_target)? {
-                    return Err(SjError::ProtectedPath(format!(
-                        "refusing symlink target: {}",
-                        canon_target.display()
-                    )));
-                }
-                let canon_parent = canon_target
-                    .parent()
-                    .ok_or_else(|| {
-                        SjError::ExecutionGate("orphan target has no parent".to_string())
-                    })?
-                    .to_path_buf();
+            let Some(canon_root) = matched_root else {
+                return Err(SjError::ExecutionGate(format!(
+                    "refusing {label} outside verified allowlisted roots: {}",
+                    target.display()
+                )));
+            };
+            let prot_canon = check_path_protection_anchored(&canon_target, ctx);
+            if prot_canon.protected {
+                return Err(SjError::ProtectedPath(prot_canon.reason));
+            }
+            let canon_parent = canon_target
+                .parent()
+                .ok_or_else(|| {
+                    SjError::ExecutionGate(format!("{label} target has no parent"))
+                })?
+                .to_path_buf();
+            if canon_target == canon_root {
                 let leaf = canon_target
                     .file_name()
                     .and_then(|n| n.to_str())
-                    .ok_or_else(|| SjError::ExecutionGate("invalid orphan leaf".to_string()))?;
+                    .ok_or_else(|| SjError::ExecutionGate(format!("invalid {label} leaf")))?;
                 let parent_fd = open_dir_nofollow_from_root(&canon_parent)?;
-                (
-                    parent_fd,
-                    to_cstring(leaf)?,
-                    canon_target,
-                    canon_parent,
-                    true,
-                )
+                return Ok((parent_fd, to_cstring(leaf)?, canon_target, canon_parent));
             }
-            other => {
-                return Err(SjError::ExecutionGate(format!(
-                    "unsupported plan item kind: {other}"
-                )));
-            }
+            let rel = canon_target.strip_prefix(&canon_root).map_err(|_| {
+                SjError::ExecutionGate(format!("failed to strip canonical {label} root"))
+            })?;
+            let rel_parent = rel.parent().unwrap_or_else(|| Path::new(""));
+            let leaf = rel
+                .file_name()
+                .and_then(|n| n.to_str())
+                .ok_or_else(|| SjError::ExecutionGate(format!("invalid {label} leaf")))?;
+            let root_fd = open_dir_nofollow_from_root(&canon_root)?;
+            let parent_fd = open_rel_dir_nofollow(root_fd, rel_parent)?;
+            Ok((parent_fd, to_cstring(leaf)?, canon_target, canon_parent))
         };
+
+        let (parent_fd, leaf_c, canon_target, canon_parent, is_orphan, check_mount_dev) =
+            match item.kind.as_str() {
+                "trash_item" => {
+                    let (pfd, lc, ct, cp) =
+                        resolve_contained(allowed_trash_roots, false, "trash_item")?;
+                    (pfd, lc, ct, cp, false, false)
+                }
+                "linux_user_cache" => {
+                    let cache_roots = allowed_linux_cache_roots(&ctx.home_dir);
+                    let (pfd, lc, ct, cp) =
+                        resolve_contained(&cache_roots, true, "linux_user_cache")?;
+                    (pfd, lc, ct, cp, false, false)
+                }
+                "stale_tmp_entry" => {
+                    if is_active_mountpoint(target) {
+                        return Err(SjError::ExecutionGate(format!(
+                            "refusing active mountpoint: {}",
+                            target.display()
+                        )));
+                    }
+                    let (pfd, lc, ct, cp) =
+                        resolve_contained(allowed_tmp, false, "stale_tmp_entry")?;
+                    if is_active_mountpoint(&ct) {
+                        return Err(SjError::ExecutionGate(format!(
+                            "refusing active mountpoint: {}",
+                            ct.display()
+                        )));
+                    }
+                    (pfd, lc, ct, cp, false, true)
+                }
+                "orphan_worktree" => {
+                    let canon_target = std::fs::canonicalize(target)?;
+                    let prot_canon = check_path_protection_anchored(&canon_target, ctx);
+                    if prot_canon.protected {
+                        return Err(SjError::ProtectedPath(prot_canon.reason));
+                    }
+                    if is_symlink_path(&canon_target)? {
+                        return Err(SjError::ProtectedPath(format!(
+                            "refusing symlink target: {}",
+                            canon_target.display()
+                        )));
+                    }
+                    let canon_parent = canon_target
+                        .parent()
+                        .ok_or_else(|| {
+                            SjError::ExecutionGate("orphan target has no parent".to_string())
+                        })?
+                        .to_path_buf();
+                    let leaf = canon_target
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .ok_or_else(|| SjError::ExecutionGate("invalid orphan leaf".to_string()))?;
+                    let parent_fd = open_dir_nofollow_from_root(&canon_parent)?;
+                    (parent_fd, to_cstring(leaf)?, canon_target, canon_parent, true, false)
+                }
+                other => {
+                    return Err(SjError::ExecutionGate(format!(
+                        "unsupported plan item kind: {other}"
+                    )));
+                }
+            };
 
         let st_leaf = fstatat_nofollow(&parent_fd, &leaf_c)?;
         let mode = st_leaf.st_mode & libc::S_IFMT;
@@ -1391,6 +1424,12 @@ pub(crate) mod unix_impl {
 
         let target_c = c"target";
         let st_parent = fstat_fd(&parent_fd)?;
+        if check_mount_dev && st_leaf.st_dev != st_parent.st_dev {
+            return Err(SjError::ExecutionGate(format!(
+                "refusing active mountpoint (device boundary): {}",
+                target.display()
+            )));
+        }
 
         if !is_orphan && mode == libc::S_IFREG {
             if item.snapshot.entry_type != "file" {
@@ -1978,10 +2017,11 @@ pub(crate) fn capture_target_snapshot(
     }
 }
 
-pub(crate) fn safe_remove_plan_item(
+pub(crate) fn safe_remove_plan_item_with_roots(
     item: &PlanItem,
     ctx: &ProtectionContext,
     allowed_trash_roots: &[PathBuf],
+    allowed_tmp: &[PathBuf],
 ) -> Result<(), SjError> {
     let prot = check_path_protection_anchored(Path::new(&item.path), ctx);
     if prot.protected {
@@ -1990,16 +2030,24 @@ pub(crate) fn safe_remove_plan_item(
 
     #[cfg(unix)]
     {
-        unix_impl::safe_remove_plan_item_unix(item, ctx, allowed_trash_roots)
+        unix_impl::safe_remove_plan_item_unix(item, ctx, allowed_trash_roots, allowed_tmp)
     }
     #[cfg(not(unix))]
     {
-        let _ = allowed_trash_roots;
+        let _ = (allowed_trash_roots, allowed_tmp);
         Err(SjError::ExecutionGate(
             "safe handle-anchored execution is not supported on this platform; dry-run planning only"
                 .to_string(),
         ))
     }
+}
+
+pub(crate) fn safe_remove_plan_item(
+    item: &PlanItem,
+    ctx: &ProtectionContext,
+    allowed_trash_roots: &[PathBuf],
+) -> Result<(), SjError> {
+    safe_remove_plan_item_with_roots(item, ctx, allowed_trash_roots, &allowed_tmp_roots())
 }
 
 #[cfg(test)]

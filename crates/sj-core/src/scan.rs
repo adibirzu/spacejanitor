@@ -1,10 +1,9 @@
+use crate::linux::{live_proc_mounts, statvfs_bytes, MountInfo, MountKind};
 use crate::protect::{check_path_protection_anchored, ProtectionContext};
 use crate::{SjError, SCHEMA_STORAGE_V1};
 use jwalk::WalkDir;
 use serde::Serialize;
-use std::collections::BTreeMap;
-#[cfg(unix)]
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
@@ -94,12 +93,37 @@ pub struct ScanReport {
     pub status: ScanStatus,
     pub entries: Vec<ScanEntry>,
     pub skipped_protected: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_mounts: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_total_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_free_bytes: Option<u64>,
 }
 
 pub fn scan_directory(
     root: &Path,
     ctx: &ProtectionContext,
     opts: &ScanOptions,
+) -> Result<ScanReport, SjError> {
+    scan_directory_with_mounts(root, ctx, opts, live_proc_mounts())
+}
+
+/// Map a walked path (prefixed with the scan root exactly as the caller spelled it, possibly
+/// relative) onto the canonical root so it compares like-for-like with absolute mountpoints.
+fn canonical_walk_path(root: &Path, root_canon: &Path, p: &Path) -> std::path::PathBuf {
+    match p.strip_prefix(root) {
+        Ok(rel) => root_canon.join(rel),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+/// `scan_directory` with an explicit mount table (tests inject one; production uses /proc/mounts).
+pub fn scan_directory_with_mounts(
+    root: &Path,
+    ctx: &ProtectionContext,
+    opts: &ScanOptions,
+    mounts: Vec<MountInfo>,
 ) -> Result<ScanReport, SjError> {
     if opts.max_depth == 0 {
         return Err(SjError::ExecutionGate("max_depth must be >= 1".to_string()));
@@ -128,9 +152,30 @@ pub fn scan_directory(
     #[cfg(unix)]
     let root_dev = root_meta.dev();
 
+    let fs_caps = statvfs_bytes(&root_canon);
+    let root_canon_str = root_canon.to_string_lossy().into_owned();
+    let skip_mount_set: Arc<HashSet<String>> = Arc::new(
+        mounts
+            .into_iter()
+            .filter(|m| {
+                m.mountpoint != root_canon_str
+                    && matches!(
+                        m.kind,
+                        MountKind::Overlay | MountKind::AppImage | MountKind::Virtual | MountKind::Tmpfs
+                    )
+            })
+            .map(|m| m.mountpoint)
+            .collect(),
+    );
+
     let skipped_protected: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let skipped_clone = Arc::clone(&skipped_protected);
+    let skipped_mounts: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let skipped_mounts_clone = Arc::clone(&skipped_mounts);
+    let skip_mount_set_clone = Arc::clone(&skip_mount_set);
     let ctx_clone = ctx.clone();
+    let walk_root = root.to_path_buf();
+    let walk_root_canon = root_canon.clone();
     let same_fs = opts.same_filesystem;
 
     let mut top_agg: BTreeMap<String, (u64, u64, String)> = BTreeMap::new();
@@ -156,6 +201,14 @@ pub fn scan_directory(
                     return false;
                 }
                 let p = entry.path();
+                let p_str = p.to_string_lossy();
+                let canon_key = canonical_walk_path(&walk_root, &walk_root_canon, &p);
+                if skip_mount_set_clone.contains(canon_key.to_string_lossy().as_ref()) {
+                    if let Ok(mut guard) = skipped_mounts_clone.lock() {
+                        guard.push(p_str.into_owned());
+                    }
+                    return false;
+                }
                 let verdict = check_path_protection_anchored(&p, &ctx_clone);
                 if verdict.protected {
                     if let Ok(mut guard) = skipped_clone.lock() {
@@ -167,6 +220,9 @@ pub fn scan_directory(
                 if same_fs {
                     if let Ok(m) = entry.metadata() {
                         if m.dev() != root_dev {
+                            if let Ok(mut guard) = skipped_mounts_clone.lock() {
+                                guard.push(p.to_string_lossy().into_owned());
+                            }
                             return false;
                         }
                     }
@@ -240,6 +296,13 @@ pub fn scan_directory(
     skipped.sort();
     skipped.dedup();
 
+    let mut skipped_mnt = skipped_mounts
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    skipped_mnt.sort();
+    skipped_mnt.dedup();
+
     Ok(ScanReport {
         schema: SCHEMA_STORAGE_V1.to_string(),
         root: root.to_string_lossy().into_owned(),
@@ -249,5 +312,8 @@ pub fn scan_directory(
         status: opts.thresholds.classify(total_bytes),
         entries,
         skipped_protected: skipped,
+        skipped_mounts: skipped_mnt,
+        fs_total_bytes: fs_caps.map(|c| c.0),
+        fs_free_bytes: fs_caps.map(|c| c.1),
     })
 }

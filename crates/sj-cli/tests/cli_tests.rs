@@ -1051,6 +1051,127 @@ fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it
 }
 
 #[test]
+fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
+    let tmp = safe_tempdir();
+    let home = fs::canonicalize(tmp.path()).unwrap().join("home");
+    let cache = home.join(".cache").join("pip");
+    fs::create_dir_all(&cache).unwrap();
+    fs::write(cache.join("a.whl"), vec![0u8; 512]).unwrap();
+
+    let audit = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .args(["linux-audit", "--path", home.to_str().unwrap(), "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(audit.status.code(), Some(0), "{}", String::from_utf8_lossy(&audit.stderr));
+    let aj: serde_json::Value = serde_json::from_slice(&audit.stdout).unwrap();
+    assert_eq!(aj["schema"], "spacejanitor.linux_audit.v1");
+
+    let blockers = Command::new(sj_bin())
+        .env("HOME", &home)
+        .args(["blockers", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(blockers.status.code(), Some(0), "{}", String::from_utf8_lossy(&blockers.stderr));
+    let bj: serde_json::Value = serde_json::from_slice(&blockers.stdout).unwrap();
+    assert_eq!(bj["schema"], "spacejanitor.blockers.v1");
+
+    let mem = Command::new(sj_bin())
+        .env("HOME", &home)
+        .args(["memory", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(mem.status.code(), Some(0), "{}", String::from_utf8_lossy(&mem.stderr));
+    let mj: serde_json::Value = serde_json::from_slice(&mem.stdout).unwrap();
+    assert_eq!(mj["schema"], "spacejanitor.memory.v1");
+
+    let plan = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .args(["plan", home.to_str().unwrap(), "--include-linux", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(plan.status.code(), Some(0), "{}", String::from_utf8_lossy(&plan.stderr));
+    let pj: serde_json::Value = serde_json::from_slice(&plan.stdout).unwrap();
+    assert_eq!(pj["mode"], "dry-run");
+    assert_eq!(pj["mutated"], false);
+    assert!(pj["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|i| i["kind"] == "linux_user_cache" && i["path"] == cache.to_string_lossy().as_ref()));
+    assert!(cache.join("a.whl").exists());
+
+    let item_id = pj["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "linux_user_cache" && i["path"] == cache.to_string_lossy().as_ref())
+        .unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let plan_sha = pj["plan_sha256"].as_str().unwrap().to_string();
+
+    // Missing --confirm must fail closed with exit 2
+    let unconfirmed = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .args([
+            "plan",
+            home.to_str().unwrap(),
+            "--include-linux",
+            "--execute",
+            "--plan-sha256",
+            &plan_sha,
+            "--item",
+            &item_id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(unconfirmed.status.code(), Some(2));
+    assert!(cache.join("a.whl").exists());
+
+    let exec = Command::new(sj_bin())
+        .env("HOME", &home)
+        .env("USERPROFILE", &home)
+        .env_remove("XDG_DATA_HOME")
+        .args([
+            "plan",
+            home.to_str().unwrap(),
+            "--include-linux",
+            "--execute",
+            "--confirm",
+            "--plan-sha256",
+            &plan_sha,
+            "--item",
+            &item_id,
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    #[cfg(unix)]
+    {
+        assert_eq!(exec.status.code(), Some(0), "{}", String::from_utf8_lossy(&exec.stderr));
+        let ej: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
+        assert_eq!(ej["mutated"], true);
+        assert!(!cache.exists());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let stderr = String::from_utf8_lossy(&exec.stderr);
+        assert_eq!(exec.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("dry-run planning only"), "{stderr}");
+        assert!(cache.join("a.whl").exists());
+    }
+}
+
+#[test]
 fn cli_memory_blockers_mcp_audit_and_reap_end_to_end() {
     let tmp = safe_tempdir();
     let cfg_dir = tmp.path().join("mcp-configs");

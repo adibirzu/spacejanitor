@@ -29,7 +29,8 @@ node packages/cli/bin/spacejanitor.mjs blockers [--json]    # kernel vnodes / in
 node packages/cli/bin/spacejanitor.mjs mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
 node packages/cli/bin/spacejanitor.mjs orphans --include-orphans [--json]  # EXPERIMENTAL, opt-in: runs git inside repos found on disk; without the flag reports "not scanned"
 node packages/cli/bin/spacejanitor.mjs trash [--json]       # OS Trash / Recycle Bin audit
-node packages/cli/bin/spacejanitor.mjs remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
+node packages/cli/bin/spacejanitor.mjs linux-audit [--json] # Linux mounts, Docker/Podman, journald, apt/user caches, AppImages, models & systemd audit
+node packages/cli/bin/spacejanitor.mjs remediate [--include-linux] [--json] # dry-run SHA-256 plan preview only (zero deletions)
 node packages/cli/bin/spacejanitor.mjs advise --slm-url <loopback url>  # optional local SLM advisor; off without a loopback endpoint
 ```
 

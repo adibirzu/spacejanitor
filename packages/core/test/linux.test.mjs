@@ -1,0 +1,489 @@
+import assert from "node:assert/strict";
+import fs from "node:fs";
+import os from "node:os";
+import path from "node:path";
+import test from "node:test";
+import {
+  SCHEMA_VERSIONS,
+  activeSjBinary,
+  collectBlockers,
+  collectDisk,
+  collectLinuxAudit,
+  collectMemory,
+  formatToon,
+  parseLinuxMeminfo,
+  parseLinuxProcessStates,
+  parseProcMounts,
+  parseProcStatusVmSwap,
+  parseSystemctlUnits,
+} from "../src/index.mjs";
+import { collectLinuxAudit as collectLinuxAuditWithGate } from "../src/telemetry.mjs";
+
+test("parseProcMounts handles overlay, tmpfs, and AppImage mounts cleanly without false alerts", () => {
+  const raw = [
+    "/dev/nvme0n1p2 / ext4 rw,relatime 0 0",
+    "tmpfs /dev/shm tmpfs rw,nosuid,nodev 0 0",
+    "overlay /var/lib/docker/overlay2/layer1/merged overlay rw,relatime 0 0",
+    "Orca-1.2.3.AppImage /tmp/.mount_Orca-aaaaaa fuse.Orca-1.2.3.AppImage ro,nosuid,nodev 0 0",
+    "Orca-1.2.4.AppImage /tmp/.mount_Orca-bbbbbb fuse.AppImage ro,nosuid,nodev 0 0",
+    "proc /proc proc rw,nosuid,nodev 0 0",
+  ].join("\n");
+
+  const mounts = parseProcMounts(raw);
+  assert.equal(mounts.length, 6);
+  assert.equal(mounts[0].kind, "physical");
+  assert.equal(mounts[0].alertEligible, true);
+  assert.equal(mounts[1].kind, "tmpfs");
+  assert.equal(mounts[1].alertEligible, false);
+  assert.equal(mounts[2].kind, "overlay");
+  assert.equal(mounts[2].alertEligible, false);
+  assert.equal(mounts[3].kind, "appimage");
+  assert.equal(mounts[3].alertEligible, false);
+  assert.equal(mounts[5].kind, "virtual");
+  assert.equal(mounts[5].alertEligible, false);
+});
+
+test("parseLinuxMeminfo computes MemAvailable and swap accurately", () => {
+  const meminfo = [
+    "MemTotal:       131072000 kB",
+    "MemFree:         2000000 kB",
+    "MemAvailable:   64000000 kB",
+    "SwapTotal:       8388608 kB",
+    "SwapFree:        4194304 kB",
+  ].join("\n");
+  const parsed = parseLinuxMeminfo(meminfo);
+  assert.equal(parsed.totalBytes, 131072000 * 1024);
+  assert.equal(parsed.availableBytes, 64000000 * 1024);
+  assert.equal(parsed.swapTotalBytes, 8388608 * 1024);
+  assert.equal(parsed.swapUsedBytes, 4194304 * 1024);
+
+  assert.equal(parseProcStatusVmSwap("Name:\tnode\nVmRSS:\t1000 kB\nVmSwap:\t512 kB\n"), 512 * 1024);
+});
+
+test("collectBlockers detects Linux systemd failed units, broken user services, podman healthcheck units, and D/Z processes", async () => {
+  const sysOut = "project-status.service loaded failed failed Project status updater\npaperclip-backup.service loaded failed failed Backup service\n";
+  const userOut = "no-mistakes-daemon.service loaded failed failed Daemon\npodman-999-healthcheck.service loaded failed failed Podman healthcheck\n";
+  const psStat = "S 100 bash\nD 201 sync-io\nZ 202 defunct-child\nD 203 nvme-flush\nD 204 dockerd\n";
+
+  const sysUnits = parseSystemctlUnits(sysOut, "system");
+  assert.equal(sysUnits.length, 2);
+  const userUnits = parseSystemctlUnits(userOut, "user");
+  assert.equal(userUnits.length, 2);
+  assert.equal(userUnits[1].isPodmanHealthcheck, true);
+
+  const states = parseLinuxProcessStates(psStat);
+  assert.equal(states.dStateCount, 3);
+  assert.equal(states.zombieCount, 1);
+
+  const report = await collectBlockers({
+    platformOverride: "linux",
+    procFiles: {
+      "/proc/sys/fs/file-nr": "4096\t0\t1048576\n",
+      "/proc/sys/fs/inotify/max_user_watches": "524288\n",
+      "/proc/sys/fs/inotify/max_user_instances": "1024\n",
+    },
+    execFn: async (cmd, args) => {
+      if (cmd === "ps") return { ok: true, stdout: psStat };
+      if (cmd === "systemctl" && args.includes("--user") && args.includes("--failed")) return { ok: true, stdout: userOut };
+      if (cmd === "systemctl" && args.includes("--user") && args.includes("--all")) return { ok: true, stdout: userOut };
+      if (cmd === "systemctl" && args.includes("--failed")) return { ok: true, stdout: sysOut };
+      return { ok: false, stdout: "" };
+    },
+  });
+
+  assert.equal(report.schema, SCHEMA_VERSIONS.blockers);
+  assert.ok(report.status === "WARN" || report.status === "CRITICAL");
+  assert.equal(report.systemd.systemFailed.length, 2);
+  assert.equal(report.systemd.userFailed.length, 2);
+  assert.equal(report.systemd.podmanHealthcheckIssues.length, 1);
+  assert.ok(report.counters.some((c) => c.name === "systemd.system_failed" && c.current === 2));
+  assert.ok(report.counters.some((c) => c.name === "podman.healthcheck_failed" && c.current === 1));
+
+  const toon = formatToon(report);
+  assert.ok(toon.includes("project-status.service"));
+  assert.ok(toon.includes("podman-999-healthcheck.service"));
+});
+
+test("collectLinuxAudit probes Docker, Podman, journald, apt, AppImage mounts, HF caches, and old backups in dry-run", async () => {
+  // Windows runner temp files live under the protected user profile.
+  const fixtureRoot = process.platform === "win32" ? process.cwd() : os.tmpdir();
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(fixtureRoot, "sj-linux-audit-")));
+  try {
+    const home = path.join(tmp, "home");
+    const tmpDir = path.join(tmp, "tmp");
+    const aptDir = path.join(tmp, "apt-archives");
+    const hfDir = path.join(home, ".cache", "huggingface", "hub");
+    const pipDir = path.join(home, ".cache", "pip");
+    const backupDir = path.join(home, "backups");
+    const staleMount = path.join(tmpDir, ".mount_Orca-old");
+
+    for (const d of [hfDir, pipDir, backupDir, staleMount, aptDir]) {
+      fs.mkdirSync(d, { recursive: true });
+    }
+    fs.writeFileSync(path.join(hfDir, "model.safetensors"), "weights");
+    fs.writeFileSync(path.join(pipDir, "pkg.whl"), "wheel");
+    fs.writeFileSync(path.join(backupDir, "snap-old.tar.gz"), "backup");
+    fs.writeFileSync(path.join(staleMount, "AppRun"), "old");
+    fs.writeFileSync(path.join(aptDir, "pkg_1.0_amd64.deb"), "debpkg");
+
+    const audit = await collectLinuxAudit({
+      platformOverride: "linux",
+      homeDir: home,
+      tmpDir,
+      aptArchivesDir: aptDir,
+      staleAgeMs: 0,
+      mountsRaw: [
+        "/dev/nvme0n1p1 / ext4 rw 0 0",
+        "overlay /var/lib/docker/overlay2/x/merged overlay rw 0 0",
+        "Orca-1.0.AppImage /tmp/.mount_Orca-live1 fuse.AppImage ro 0 0",
+        "Orca-1.1.AppImage /tmp/.mount_Orca-live2 fuse.AppImage ro 0 0",
+      ].join("\n"),
+      execFn: async (cmd, args) => {
+        if (cmd === "docker" && args[0] === "system") {
+          return {
+            ok: true,
+            stdout: [
+              JSON.stringify({ Type: "Images", TotalCount: "10", Active: "2", Size: "94GB", Reclaimable: "80GB (85%)" }),
+              JSON.stringify({ Type: "Build Cache", TotalCount: "20", Active: "0", Size: "22.8GB", Reclaimable: "22.8GB" }),
+            ].join("\n"),
+          };
+        }
+        if (cmd === "docker" && args[0] === "ps") {
+          return {
+            ok: true,
+            stdout: [
+              JSON.stringify({ ID: "c1", Names: "exited-vllm", Image: "vllm:latest", Status: "Exited (0) 2d ago", State: "exited", Size: "1GB" }),
+              JSON.stringify({ ID: "c2", Names: "cadvisor", Image: "cadvisor:latest", Status: "Up 2d (unhealthy)", State: "running", Size: "0B" }),
+            ].join("\n"),
+          };
+        }
+        if (cmd === "docker" && args[0] === "images") {
+          return { ok: true, stdout: JSON.stringify({ ID: "sha256:abcd1234", Repository: "<none>", Tag: "<none>", Size: "2.5GB" }) };
+        }
+        if (cmd === "podman" && args[0] === "ps") {
+          return { ok: true, stdout: JSON.stringify([{ Id: "p1", Names: ["old-pod"], State: "exited", Status: "Exited (0) 5d ago" }]) };
+        }
+        if (cmd === "podman" && args[0] === "system") {
+          return { ok: true, stdout: JSON.stringify([{ Type: "Images", Reclaimable: "1.2GB" }]) };
+        }
+        if (cmd === "journalctl") {
+          return { ok: true, stdout: "Archived and active journals take up 1.5G in the file system." };
+        }
+        return { ok: false, stdout: "" };
+      },
+    });
+
+    assert.equal(audit.schema, SCHEMA_VERSIONS.linuxAudit);
+    assert.equal(audit.docker.exitedContainers.length, 1);
+    assert.equal(audit.docker.unhealthyContainers.length, 1);
+    assert.equal(audit.docker.danglingImages.length, 1);
+    assert.ok(audit.docker.buildCacheReclaimableBytes > 20e9);
+    assert.equal(audit.podman.exitedContainers.length, 1);
+    assert.ok(audit.journald.bytes > 1e9);
+    assert.ok(audit.packageCaches.aptArchivesBytes > 0);
+    assert.equal(audit.appimageMounts.length, 2);
+    if (activeSjBinary()) {
+      assert.equal(audit.staleTmpEntries.length, 1);
+    } else {
+      assert.equal(audit.staleTmpEntries.length, 0);
+    }
+    if (activeSjBinary()) {
+      assert.ok(audit.modelCaches.some((m) => m.path.includes("huggingface") && m.manualReviewOnly === true));
+      assert.ok(audit.oldBackups.some((b) => b.path.includes("backups") && b.manualReviewOnly === true));
+    } else {
+      // No sj gate available: model caches and backups fail closed (nothing listed unjudged).
+      assert.equal(audit.modelCaches.length, 0);
+      assert.equal(audit.oldBackups.length, 0);
+    }
+
+    const toon = formatToon(audit);
+    assert.ok(toon.includes("spacejanitor.linux_audit.v1"));
+    assert.ok(toon.includes("docker_build_cache"));
+    assert.ok(toon.includes("docker: exited=1 unhealthy=1 dangling_imgs=1"));
+    assert.ok(!toon.includes("docker_build_cache_gib=0.00"));
+    assert.ok(toon.includes("podman: exited=1 unhealthy=0"));
+    assert.ok(toon.includes("appimage_mounts: 2"));
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("formatToon and normalizeReportEnvelope preserve Docker/Podman stats across double normalization of Rust snake_case JSON", async () => {
+  const { normalizeReportEnvelope } = await import("../src/index.mjs");
+  const rustJson = {
+    schema: SCHEMA_VERSIONS.linuxAudit,
+    os: "linux",
+    arch: "aarch64",
+    mounts: [],
+    appimage_mounts: [{ mount_point: "/tmp/.mount_Orca-1", source: "Orca.AppImage" }],
+    docker: {
+      available: true,
+      df: {
+        available: true,
+        images_reclaimable_bytes: 2 * 1024 ** 3,
+        build_cache_reclaimable_bytes: 1024 ** 3,
+      },
+      exited_containers: [{ id: "abc123", name: "old-vllm" }],
+      unhealthy_containers: [{ id: "def456", name: "cadvisor" }],
+      dangling_images: [{ id: "sha256:999" }],
+    },
+    podman: {
+      available: true,
+      df: {
+        available: true,
+        images_reclaimable_bytes: 512 * 1024 ** 2,
+        volumes_reclaimable_bytes: 0,
+      },
+      exited_containers: [{ id: "pod1", name: "stale-pod" }],
+      unhealthy_containers: [],
+      dangling_images: [],
+    },
+    journald: { bytes: 100 * 1024 ** 2 },
+    package_caches: {
+      apt_archives_path: "/var/cache/apt/archives",
+      apt_archives_bytes: 50 * 1024 ** 2,
+      user_caches: [],
+    },
+    stale_tmp_entries: [],
+    model_caches: [],
+    old_backups: [],
+  };
+
+  const norm1 = normalizeReportEnvelope(rustJson);
+  const norm2 = normalizeReportEnvelope(norm1);
+  assert.deepEqual(norm2.docker, norm1.docker);
+  assert.deepEqual(norm2.podman, norm1.podman);
+
+  const toon = formatToon(norm1);
+  assert.ok(toon.includes("docker: exited=1 unhealthy=1 dangling_imgs=1 img_reclaim_gib=2.00 docker_build_cache_gib=1.00"), toon);
+  assert.ok(toon.includes("podman: exited=1 unhealthy=0"), toon);
+});
+
+test("collectDisk evaluates percentage thresholds cleanly for both 96 GiB and 3.7 TB disks", async () => {
+  const smallHealthy = await collectDisk({
+    targetPath: process.cwd(),
+    statfsOverride: { bavail: 60 * 1024 ** 2, bsize: 1024, blocks: 96 * 1024 ** 2 },
+  });
+  assert.equal(smallHealthy.status, "OK");
+
+  const smallCritical = await collectDisk({
+    targetPath: process.cwd(),
+    statfsOverride: { bavail: 1.6 * 1024 ** 2, bsize: 1024, blocks: 96 * 1024 ** 2 },
+  });
+  assert.equal(smallCritical.status, "CRITICAL");
+
+  const huge97Pct = await collectDisk({
+    targetPath: process.cwd(),
+    statfsOverride: { bavail: 123 * 1024 ** 2, bsize: 1024, blocks: 3700 * 1024 ** 2 },
+  });
+  assert.equal(huge97Pct.status, "CRITICAL");
+});
+
+test("collectLinuxAudit never flags a /tmp directory as stale when a descendant file was recently modified", async () => {
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-tmp-desc-")));
+  try {
+    const home = path.join(tmp, "home");
+    const tmpDir = path.join(tmp, "tmp");
+    const appDir = path.join(tmpDir, ".mount_App-old-parent");
+    const deepDir = path.join(appDir, "a", "b", "c", "d", "e", "f", "g");
+    fs.mkdirSync(home, { recursive: true });
+    fs.mkdirSync(deepDir, { recursive: true });
+    const activeChild = path.join(deepDir, "active.sock.log");
+    fs.writeFileSync(activeChild, "active");
+    const oldTime = new Date(Date.now() - 10 * 86_400_000);
+    let cur = appDir;
+    for (const seg of ["a", "b", "c", "d", "e", "f", "g"]) {
+      fs.utimesSync(cur, oldTime, oldTime);
+      cur = path.join(cur, seg);
+    }
+    fs.utimesSync(deepDir, oldTime, oldTime);
+
+    const audit = await collectLinuxAudit({
+      platformOverride: "linux",
+      homeDir: home,
+      tmpDir,
+      staleAgeMs: 24 * 3600 * 1000,
+      execFn: async () => ({ ok: false, stdout: "" }),
+    });
+    assert.deepEqual(audit.staleTmpEntries, []);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("collectLinuxAudit asks docker/podman for container sizes (Size is empty without --size)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-size-"));
+  const calls = [];
+  const audit = await collectLinuxAudit({
+    platformOverride: "linux",
+    homeDir: home,
+    tmpDir: path.join(home, "tmp"),
+    aptArchivesDir: path.join(home, "apt"),
+    mountsRaw: "/dev/sda1 / ext4 rw 0 0",
+    execFn: async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      const sized = args.includes("--size") || args.includes("-s");
+      if (cmd === "docker" && args[0] === "ps") {
+        return {
+          ok: true,
+          stdout: JSON.stringify({ ID: "c1", Names: "old", Image: "x", Status: "Exited (0) 2d ago", State: "exited", Size: sized ? "5MB (virtual 120MB)" : "" }),
+        };
+      }
+      if (cmd === "podman" && args[0] === "ps") {
+        return {
+          ok: true,
+          stdout: JSON.stringify([{ Id: "p1", Names: ["pold"], State: "exited", Status: "Exited (0) 5d ago", Size: sized ? { rootFsSize: 9e6, rwSize: 7e6 } : undefined }]),
+        };
+      }
+      return { ok: false, stdout: "" };
+    },
+  });
+  assert.ok(calls.some((c) => c[0] === "docker" && c[1] === "ps" && c.includes("--size")), JSON.stringify(calls));
+  assert.ok(calls.some((c) => c[0] === "podman" && c[1] === "ps" && c.includes("--size")), JSON.stringify(calls));
+  assert.equal(audit.docker.exitedContainers[0].sizeBytes, 5e6);
+  assert.equal(audit.podman.exitedContainers[0].sizeBytes, 7e6);
+});
+
+test("container and systemd free text never reaches JSON or TOON unredacted", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-redact-"));
+  const secrets = ["PROBE_NAME_SECRET", "PROBE_IMAGE_SECRET", "PROBE_STATUS_SECRET", "PROBE_UNIT_DESC_SECRET", "PROBE_UNIT_NAME_SECRET"];
+  const execFn = async (cmd, args) => {
+    if (cmd === "docker" && args[0] === "ps") {
+      return {
+        ok: true,
+        stdout: [
+          JSON.stringify({ ID: "abc123", Names: "w --token=PROBE_NAME_SECRET", Image: "x:PROBE_IMAGE_SECRET@h", Status: "Exited (0) 2 days ago PROBE_STATUS_SECRET", State: "exited" }),
+          JSON.stringify({ ID: "-f", Names: "flaglike", Image: "x", Status: "Exited (0) 1 day ago", State: "exited" }),
+          JSON.stringify({ ID: "ok1", Names: "plain_name-1", Image: "nginx:1.27", Status: "Exited (0) 3 days ago", State: "exited" }),
+        ].join("\n"),
+      };
+    }
+    if (cmd === "systemctl") {
+      return { ok: true, stdout: "PROBE_UNIT_NAME_SECRET=x.service loaded failed failed Backup --password=PROBE_UNIT_DESC_SECRET\nok.service loaded failed failed Plain description\n" };
+    }
+    return { ok: false, stdout: "" };
+  };
+  const audit = await collectLinuxAudit({ platformOverride: "linux", homeDir: home, tmpDir: path.join(home, "tmp"), aptArchivesDir: path.join(home, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", execFn });
+  const blockers = await collectBlockers({ platformOverride: "linux", execFn });
+  const text = JSON.stringify(audit) + JSON.stringify(blockers) + formatToon(blockers) + formatToon(audit);
+  for (const s of secrets) assert.ok(!text.includes(s), `leaked ${s}: ${text.slice(0, 400)}`);
+  assert.deepEqual(audit.docker.exitedContainers.map((c) => c.id).sort(), ["abc123", "ok1"]);
+  assert.ok(audit.docker.exitedContainers.some((c) => c.name === "plain_name-1" && c.image === "nginx:1.27"));
+  assert.ok(!audit.docker.exitedContainers.some((c) => c.id.startsWith("-")));
+});
+
+test("collectLinuxAudit sends model caches, backups, user caches and tmp through the protect gate (descendants)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-protect-"));
+  const tmpDir = path.join(home, "tmp");
+  for (const d of [".ssh", ".kube", "backups/nested", ".cache/pip", ".cache/huggingface/hub", "tmp/sj-stale"]) fs.mkdirSync(path.join(home, d), { recursive: true });
+  fs.writeFileSync(path.join(home, ".ssh/id_rsa"), "x");
+  fs.writeFileSync(path.join(home, "backups/.env"), "K=V");
+  fs.writeFileSync(path.join(home, "backups/db.tar"), "x");
+  fs.writeFileSync(path.join(home, "backups/nested/.env"), "K=V");
+  fs.writeFileSync(path.join(home, ".cache/pip/.env"), "K=V");
+  fs.writeFileSync(path.join(home, ".cache/huggingface/hub/m.bin"), "x");
+  fs.writeFileSync(path.join(tmpDir, "sj-stale/.env"), "K=V");
+  const calls = [];
+  // Stand-in for the sj gate: protects credential dirs and, when asked for descendants, any dir holding a .env.
+  const isProtectedFn = (p, options = {}) => {
+    calls.push({ p, descendants: Boolean(options.descendants) });
+    const bad = (q) => /(^|\/)(\.ssh|\.kube|\.env|id_rsa)$/.test(q.replace(/\\/g, "/"));
+    if (bad(p)) return { protected: true, reason: "credential" };
+    if (options.descendants && fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+      const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).some((e) => bad(e.name) || (e.isDirectory() && walk(path.join(d, e.name))));
+      if (walk(p)) return { protected: true, reason: "protected_descendant" };
+    }
+    return { protected: false, reason: "" };
+  };
+  const old = { HF_HOME: process.env.HF_HOME, OLLAMA_MODELS: process.env.OLLAMA_MODELS };
+  process.env.HF_HOME = path.join(home, ".ssh");
+  process.env.OLLAMA_MODELS = "../relative/escape";
+  let audit;
+  try {
+    audit = await collectLinuxAuditWithGate({
+      platformOverride: "linux", homeDir: home, tmpDir, aptArchivesDir: path.join(home, "apt"), staleAgeMs: 0,
+      mountsRaw: "/dev/sda1 / ext4 rw 0 0", isProtectedFn, execFn: async () => ({ ok: false, stdout: "" }),
+    });
+  } finally {
+    for (const [k, v] of Object.entries(old)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  const listed = [...audit.modelCaches, ...audit.oldBackups, ...audit.packageCaches.userCaches, ...audit.staleTmpEntries].map((a) => a.path.replace(/\\/g, "/")).join("\n");
+  for (const bad of [".ssh", ".kube", ".env", "id_rsa", "relative/escape", "nested", ".cache/pip", "sj-stale"]) {
+    assert.ok(!listed.includes(bad), `unsafe path listed (${bad}):\n${listed}`);
+  }
+  assert.ok(listed.includes("db.tar") && listed.includes("huggingface/hub"), listed);
+  const asked = (suffix) => calls.some((c) => c.p.replace(/\\/g, "/").endsWith(suffix));
+  assert.ok(asked("backups/db.tar") && asked("huggingface/hub"), JSON.stringify(calls));
+  assert.ok(calls.filter((c) => /(\.cache.pip|sj-stale)$/.test(c.p)).every((c) => c.descendants), "directories must be judged with descendants");
+});
+
+test("dangling images, userinfo-shaped names and legit statuses follow the closed vocabulary", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-vocab-"));
+  const secrets = ["PROBE_IMAGE_SECRET", "PROBE_TAG_SECRET", "PROBE_NAME_SECRET", "PROBE_UNIT_NAME_SECRET"];
+  const execFn = async (cmd, args) => {
+    if (cmd === "docker" && args[0] === "images") {
+      return {
+        ok: true,
+        stdout: [
+          JSON.stringify({ ID: "-f", Repository: "https://user:PROBE_IMAGE_SECRET@evil.example/app", Tag: "--token=PROBE_TAG_SECRET", Size: "15MB" }),
+          JSON.stringify({ ID: "sha256:deadbeef", Repository: "https://user:PROBE_IMAGE_SECRET@evil.example/app", Tag: "--token=PROBE_TAG_SECRET", Size: "15MB" }),
+          JSON.stringify({ ID: "sha256:cafe0123", Repository: "<none>", Tag: "<none>", Size: "2MB" }),
+        ].join("\n"),
+      };
+    }
+    if (cmd === "docker" && args[0] === "ps") {
+      return {
+        ok: true,
+        stdout: [
+          { ID: "c1", Names: "user:PROBE_NAME_SECRET@host", Image: "nginx:1.27", Status: "Exited (0) 1 day ago", State: "exited" },
+          { ID: "c2", Names: "my.app_v1-prod", Image: "ghcr.io/org/app:1.2@sha256:0123456789abcdef", Status: "Up 12 seconds (health: starting)", State: "running" },
+          { ID: "c3", Names: "n3", Image: "x", Status: "Exited (-1) 2 days ago", State: "exited" },
+          { ID: "c4", Names: "n4", Image: "x", Status: "Exited (0) 5d ago", State: "exited" },
+          { ID: "c5", Names: "n5", Image: "x", Status: "Removal In Progress", State: "removing" },
+          { ID: "c6", Names: "n6", Image: "repo@sha256:", Status: "Exited (137) About an hour ago", State: "exited" },
+        ].map((o) => JSON.stringify(o)).join("\n"),
+      };
+    }
+    if (cmd === "systemctl") {
+      return { ok: true, stdout: "-.mount loaded failed failed Root\nuser:PROBE_UNIT_NAME_SECRET@h.service loaded failed failed x\nuser@1000.service loaded failed failed U\n" };
+    }
+    return { ok: false, stdout: "" };
+  };
+  const audit = await collectLinuxAudit({ platformOverride: "linux", homeDir: home, tmpDir: path.join(home, "tmp"), aptArchivesDir: path.join(home, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", execFn });
+  const blockers = await collectBlockers({ platformOverride: "linux", execFn });
+  const text = JSON.stringify(audit) + JSON.stringify(blockers) + formatToon(blockers);
+  for (const s of secrets) assert.ok(!text.includes(s), `leaked ${s}`);
+  assert.ok(audit.docker.danglingImages.every((i) => !i.id.startsWith("-")));
+  assert.ok(audit.docker.danglingImages.some((i) => i.id === "sha256:cafe0123" && i.repository === "<none>" && i.tag === "<none>"));
+  const all = [...audit.docker.exitedContainers, ...audit.docker.unhealthyContainers, ...(audit.docker.runningContainers || [])];
+  const status = (id) => all.find((c) => c.id === id)?.status;
+  assert.equal(status("c3"), "Exited (-1) 2 days ago");
+  assert.equal(status("c4"), "Exited (0) 5d ago");
+  assert.equal(status("c6"), "Exited (137) About an hour ago");
+  assert.equal(all.find((c) => c.id === "c6").image.startsWith("image-"), true);
+  const units = (blockers.systemd?.systemFailed || []).map((u) => u.unit);
+  assert.ok(units.includes("-.mount") && units.includes("user@1000.service"), JSON.stringify(units));
+});
+
+test("a relative homeDir is resolved so protected home subpaths stay anchored", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "sj-relhome-"));
+  const myhome = path.join(base, "myhome");
+  fs.mkdirSync(path.join(myhome, "Documents"), { recursive: true });
+  fs.writeFileSync(path.join(myhome, "Documents", "secret.txt"), "secret!");
+  const seen = [];
+  const isProtectedFn = (p, o = {}) => {
+    seen.push(o.homeDir);
+    return { protected: false, reason: "" };
+  };
+  const cwd = process.cwd();
+  const oldHf = process.env.HF_HOME;
+  process.chdir(myhome);
+  process.env.HF_HOME = path.join(myhome, "Documents");
+  try {
+    await collectLinuxAuditWithGate({ platformOverride: "linux", homeDir: ".", tmpDir: path.join(base, "tmp"), aptArchivesDir: path.join(base, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", isProtectedFn, execFn: async () => ({ ok: false, stdout: "" }) });
+  } finally {
+    process.chdir(cwd);
+    if (oldHf === undefined) delete process.env.HF_HOME; else process.env.HF_HOME = oldHf;
+  }
+  assert.ok(seen.length > 0 && seen.every((h) => path.isAbsolute(h)), `gate saw relative homeDir: ${JSON.stringify(seen)}`);
+});

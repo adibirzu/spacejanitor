@@ -12,14 +12,15 @@
  *   false         true            --include-orphans
  *   false         false           null  (nothing was selected: there is nothing to ask sj about)
  */
-export function buildSjPlanArgs({ root, includeTrash = true, includeOrphans = false, ruleFlags = [], selects = [] } = {}) {
-  if (!includeTrash && !includeOrphans) return null;
+export function buildSjPlanArgs({ root, includeTrash = true, includeOrphans = false, includeLinux = false, ruleFlags = [], selects = [] } = {}) {
+  if (!includeTrash && !includeOrphans && !includeLinux) return null;
   return [
     "plan",
     root,
     "--json",
     ...(includeTrash ? ["--include-trash"] : []),
     ...(includeOrphans ? ["--include-orphans"] : []),
+    ...(includeLinux ? ["--include-linux"] : []),
     ...ruleFlags,
     ...selects.flatMap((p) => ["--select", p]),
   ];

@@ -1,3 +1,6 @@
+#[cfg(target_os = "linux")]
+use crate::linux::collect_systemd_audit;
+use crate::linux::SystemdAudit;
 use crate::{SjError, SCHEMA_BLOCKERS_V1};
 use serde::Serialize;
 use std::process::Command;
@@ -34,6 +37,8 @@ pub struct BlockersReport {
     pub metrics: BlockerMetrics,
     pub blockers: Vec<BlockerItem>,
     pub warnings: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd: Option<SystemdAudit>,
 }
 
 fn eval_ratio_blocker(
@@ -167,6 +172,7 @@ pub fn evaluate_macos_blockers(
         },
         blockers,
         warnings,
+        systemd: None,
     }
 }
 
@@ -243,6 +249,7 @@ pub fn evaluate_linux_blockers(
         },
         blockers,
         warnings,
+        systemd: None,
     }
 }
 
@@ -324,7 +331,76 @@ pub fn evaluate_windows_blockers(
         },
         blockers,
         warnings,
+        systemd: None,
     }
+}
+
+pub fn apply_systemd_audit(report: &mut BlockersReport, systemd: SystemdAudit) {
+    if !systemd.system_failed.is_empty() {
+        let units: Vec<String> = systemd
+            .system_failed
+            .iter()
+            .take(8)
+            .map(|u| u.unit.clone())
+            .collect();
+        report.blockers.push(BlockerItem {
+            id: "linux-systemd-system-failed".to_string(),
+            severity: if systemd.system_failed.len() >= 3 {
+                "CRITICAL".to_string()
+            } else {
+                "WARN".to_string()
+            },
+            title: "Failed systemd system unit(s)".to_string(),
+            detail: format!(
+                "{} failed unit(s): {}",
+                systemd.system_failed.len(),
+                units.join(", ")
+            ),
+            recommendation: "Inspect with `systemctl status <unit>` and `journalctl -xeu <unit>`"
+                .to_string(),
+        });
+    }
+    if !systemd.user_failed.is_empty() {
+        let units: Vec<String> = systemd
+            .user_failed
+            .iter()
+            .take(8)
+            .map(|u| u.unit.clone())
+            .collect();
+        report.blockers.push(BlockerItem {
+            id: "linux-systemd-user-failed".to_string(),
+            severity: "WARN".to_string(),
+            title: "Failed systemd user unit(s)".to_string(),
+            detail: format!(
+                "{} failed user unit(s): {}",
+                systemd.user_failed.len(),
+                units.join(", ")
+            ),
+            recommendation:
+                "Inspect with `systemctl --user status <unit>` and reset stale units".to_string(),
+        });
+    }
+    if !systemd.podman_healthcheck_issues.is_empty() {
+        let units: Vec<String> = systemd
+            .podman_healthcheck_issues
+            .iter()
+            .take(8)
+            .map(|u| u.unit.clone())
+            .collect();
+        report.blockers.push(BlockerItem {
+            id: "linux-podman-healthcheck-failed".to_string(),
+            severity: "WARN".to_string(),
+            title: "Broken/stale Podman healthcheck unit(s)".to_string(),
+            detail: format!(
+                "{} podman healthcheck unit(s): {}",
+                systemd.podman_healthcheck_issues.len(),
+                units.join(", ")
+            ),
+            recommendation: "Clean stale podman healthcheck timers/units or restart unhealthy containers".to_string(),
+        });
+    }
+    report.status = overall_status(&report.blockers);
+    report.systemd = Some(systemd);
 }
 
 pub fn parse_windows_blockers_json(raw_json: &str) -> Result<BlockersReport, SjError> {
@@ -466,14 +542,16 @@ fn collect_platform_blockers() -> Result<BlockersReport, SjError> {
         }
     }
 
-    Ok(evaluate_linux_blockers(
+    let mut report = evaluate_linux_blockers(
         files_used,
         files_max,
         Some(d_state),
         inotify_max.and_then(|_| count_inotify_watches(std::path::Path::new("/proc"))),
         inotify_max,
         warnings,
-    ))
+    );
+    apply_systemd_audit(&mut report, collect_systemd_audit());
+    Ok(report)
 }
 
 #[cfg(target_os = "windows")]

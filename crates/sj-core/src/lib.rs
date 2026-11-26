@@ -2,6 +2,7 @@
 //! orphan git validator, and deterministic dry-run remediation planner.
 
 pub mod blockers;
+pub mod linux;
 pub mod llm_audit;
 pub mod mcp_audit;
 pub mod memory;
@@ -25,6 +26,7 @@ pub const SCHEMA_ORPHANS_V1: &str = "spacejanitor.orphans.v1";
 pub const SCHEMA_TRASH_V1: &str = "spacejanitor.trash.v1";
 pub const SCHEMA_PROPOSAL_V1: &str = "spacejanitor.proposal.v1";
 pub const SCHEMA_PROTECT_V1: &str = "spacejanitor.protect.v1";
+pub const SCHEMA_LINUX_AUDIT_V1: &str = "spacejanitor.linux_audit.v1";
 pub const SCHEMA_MCP_AUDIT_V1: &str = "spacejanitor.mcp_audit.v1";
 pub const SCHEMA_REAP_V1: &str = "spacejanitor.reap.v1";
 

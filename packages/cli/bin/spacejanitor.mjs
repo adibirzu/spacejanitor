@@ -13,6 +13,7 @@ import {
   collectBlockers,
   collectDisk,
   collectDoctor,
+  collectLinuxAudit,
   collectMcpAudit,
   collectMemory,
   collectOrphans,
@@ -42,6 +43,7 @@ function printHelp() {
     "  blockers    Detect kernel vnode, inotify, handle, and VFS lock blockers",
     "  orphans     Inspect git worktrees/orphan work (OFF by default; needs --include-orphans)",
     "  trash       Inspect OS Trash / Recycle Bin reclamation candidates",
+    "  linux-audit Audit Linux mounts, Docker/Podman, journald, apt/user caches, AppImages & models",
     "  mcp-audit   Audit MCP server fan-out, duplicates, and redacted secret risks",
     "  remediate   Preview dry-run plan (--execute fails closed in Node fallback; use Desktop or Rust sj)",
     "  advise      Optional on-demand local SLM advisor (off by default; requires --slm-url)",
@@ -49,8 +51,9 @@ function printHelp() {
     "flags:",
     "  --json              Emit machine-readable versioned JSON contract",
     "  --fail-on-alert     Exit with code 2 if status is ALERT or CRITICAL",
-    "  --path <dir>        Target path for disk/orphans scan",
+    "  --path <dir>        Target path for disk/orphans/linux-audit scan",
     "  --include-orphans   Opt in to orphan scanning: runs git inside repositories found on disk (unreviewed, experimental)",
+    "  --include-linux     Include Linux cleanup candidates (caches, stale /tmp, docker/podman/journald/apt) in dry-run plan",
     "  --execute           Fail-closed execution guard (not implemented in Node AXI CLI)",
     "  --confirm <phrase>  Confirmation phrase from dry-run plan",
     "  --plan-sha256 <sha> SHA-256 digest from dry-run plan",
@@ -124,6 +127,7 @@ async function main(argv) {
   const targetPath = values.get("--path") || process.cwd();
 
   const includeOrphans = flags.has("--include-orphans");
+  const includeLinux = flags.has("--include-linux");
   if (includeOrphans) console.error(ORPHAN_SCAN_WARNING);
   let report = null;
 
@@ -142,6 +146,8 @@ async function main(argv) {
     report = await collectOrphans({ targetPath, includeOrphans });
   } else if (cmd === "trash") {
     report = tryRustSj(["trash"]) || (await collectTrash());
+  } else if (cmd === "linux-audit") {
+    report = tryRustSj(["linux-audit", "--path", targetPath]) || (await collectLinuxAudit({ homeDir: targetPath }));
   } else if (cmd === "mcp-audit") {
     report = tryRustSj(["mcp-audit"]) || (await collectMcpAudit());
   } else if (cmd === "remediate") {
@@ -159,7 +165,7 @@ async function main(argv) {
       return 1;
     }
     try {
-      report = runSjSync(buildSjPlanArgs({ root: targetPath, includeTrash: true, includeOrphans }), { timeoutMs: 60000 });
+      report = runSjSync(buildSjPlanArgs({ root: targetPath, includeTrash: true, includeOrphans, includeLinux }), { timeoutMs: 60000 });
       if (report.schema !== "spacejanitor.proposal.v1") throw Object.assign(new Error("sj_unparseable"), { reason: "sj_unparseable" });
     } catch (err) {
       const reason = (err && err.reason) || "sj_unavailable";
