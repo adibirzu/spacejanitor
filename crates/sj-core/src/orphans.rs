@@ -1187,13 +1187,20 @@ fn uses_lfs(git_ctx: &GitExecContext) -> bool {
             return true;
         }
     }
-    [git_ctx.work_tree.join(".gitattributes"), common.join("info").join("attributes")]
-        .iter()
-        .any(|f| match std::fs::symlink_metadata(f) {
-            Err(e) if e.kind() == ErrorKind::NotFound => false,
-            Err(_) => true, // cannot tell: fail closed
-            Ok(_) => read_regular_text(f).map(|t| t.contains("filter=lfs")).unwrap_or(true),
-        })
+    // every TRACKED .gitattributes (any depth), read from the work tree; an unlistable index or an
+    // unreadable file fails closed
+    let mut files = vec![common.join("info").join("attributes")];
+    match run_git_raw_ctx(git_ctx, ["ls-files", "-z", "--", ":(glob)**/.gitattributes"]) {
+        Ok((true, out)) => files.extend(
+            out.split('\0').filter(|p| !p.is_empty()).map(|p| git_ctx.work_tree.join(p)),
+        ),
+        _ => return true,
+    }
+    files.iter().any(|f| match std::fs::symlink_metadata(f) {
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(_) => read_regular_text(f).map(|t| t.contains("filter=lfs")).unwrap_or(true),
+    })
 }
 
 /// True when the repository has (or may have) submodules: a `.gitmodules`, a `.git/modules` dir,

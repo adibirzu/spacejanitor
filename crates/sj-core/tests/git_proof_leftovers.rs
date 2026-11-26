@@ -410,3 +410,19 @@ fn a_commit_shared_by_a_tag_and_the_reflog_counts_once_against_the_cap() {
     let r = scan_with(root, limits);
     assert!(is_safe(&r, "/shared"), "one distinct commit must fit a cap of 1: {:?}", reasons_for(&r, "/shared"));
 }
+
+#[test]
+fn lfs_declared_only_in_a_subdirectory_gitattributes_is_still_detected() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = clean_pushed_repo(root, "subattr");
+    fs::create_dir_all(repo.join("assets")).unwrap();
+    fs::write(repo.join("assets/.gitattributes"), "*.bin filter=lfs -text\n").unwrap();
+    git(&repo, &["add", "assets/.gitattributes"]);
+    git(&repo, &["commit", "-m", "sub attrs"]);
+    git(&repo, &["push", "origin", "HEAD"]);
+    let r = scan(root);
+    assert!(!is_safe(&r, "/subattr"), "subdirectory filter=lfs missed");
+    assert!(reasons_for(&r, "/subattr").unwrap().iter().any(|x| x == "lfs_objects_unverified"));
+}
