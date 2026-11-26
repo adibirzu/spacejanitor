@@ -431,8 +431,15 @@ fn run_with_timeout(
     }
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
+    let dbg_cmd = format!("{cmd:?}");
     let mut child = cmd.spawn()?;
+    let mut se = child.stderr.take();
+    let dbg_err = std::thread::spawn(move || {
+        let mut b = Vec::new();
+        if let Some(se) = se.as_mut() { let _ = se.read_to_end(&mut b); }
+        b
+    }); // TEMP-DEBUG
     let pgid = child.id();
     if let (Some(data), Some(mut si)) = (input, child.stdin.take()) {
         std::thread::spawn(move || {
@@ -455,6 +462,7 @@ fn run_with_timeout(
             Some(status) => {
                 // git is gone; reap anything it left holding our pipes so the join cannot block
                 kill_process_group(pgid);
+                if !status.success() { eprintln!("TEMPDBG {} => {}", dbg_cmd, String::from_utf8_lossy(&dbg_err.join().unwrap_or_default())); } // TEMP-DEBUG
                 // bounded: a descendant that escaped the group (setsid) may still hold the pipe
                 let left = deadline.saturating_duration_since(Instant::now());
                 let out = out_rx
