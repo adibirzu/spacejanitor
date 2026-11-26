@@ -1,7 +1,19 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use tempfile::tempdir;
+use tempfile::TempDir;
+
+/// Temp dir outside protected home subtrees. On Windows the default temp dir sits under
+/// `%USERPROFILE%\AppData`, which the protect list refuses, so audits would see nothing.
+fn safe_tempdir() -> TempDir {
+    if cfg!(windows) {
+        tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
 
 #[path = "../../sj-core/tests/common/probe.rs"]
 mod probe;
@@ -44,7 +56,7 @@ fn cli_help_and_invalid_usage_exit_codes() {
 
 #[test]
 fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = tmp.path();
     let trash_dir = root.join("Trash");
     fs::create_dir_all(&trash_dir).unwrap();
@@ -176,7 +188,7 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
 #[test]
 fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let remote = home.join("origin.git");
     let ws = home.join("ws");
@@ -304,7 +316,7 @@ fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
 #[cfg(unix)]
 #[test]
 fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let remote = home.join("origin.git");
     let real_dir = home.join("real");
@@ -426,7 +438,7 @@ fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
 #[cfg(unix)]
 #[test]
 fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let real_dir = home.join("real");
     let sub = real_dir.join("sub");
@@ -658,7 +670,7 @@ fn git_shim(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 #[cfg(unix)]
 #[test]
 fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = tmp.path();
     let home = root.join("home");
     let ws = root.join("ws");
@@ -751,7 +763,7 @@ fn cli_protect_reports_per_path_verdicts_from_the_rust_gate() {
 
 #[test]
 fn cli_protect_descendants_blocks_a_tree_holding_a_protected_entry() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     // the synthetic home contains the work dirs: on Windows the temp dir lives under C:\Users, which
     // is another account's home to the gate unless it is inside the home being judged
     let home = tmp.path().to_path_buf();
@@ -801,7 +813,7 @@ fn cli_plan_excludes_keepass_vaults_and_key_material_in_trash() {
     // (Credential-NAMED files inside ~/.Trash, e.g. ~/.Trash/.netrc, were never covered by the JS
     // denylist either: its home rules are anchored at ~/.netrc itself. The home-anchored cases are pinned
     // by the shared protect vectors.)
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -856,7 +868,7 @@ fn cli_protect_honours_custom_exact_dynamic_and_glob_rules() {
 #[cfg(unix)]
 #[test]
 fn cli_selection_token_for_one_item_cannot_execute_another_selection() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -916,7 +928,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
     let v: serde_json::Value = serde_json::from_str(include_str!("../../sj-core/tests/fixtures/protect_vectors.json")).unwrap();
     for case in v["fs_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+        let root = fs::canonicalize(safe_tempdir().keep()).unwrap();
         let abs = |rel: &str| -> std::path::PathBuf {
             if Path::new(rel).is_absolute() { Path::new(rel).to_path_buf() } else { root.join(rel) }
         };
@@ -964,7 +976,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
 fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_rules() {
     // cross-family review R3 blocker 1: both shapes were planned (and deletable) at 8f61e92
     use std::os::unix::fs::symlink;
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -1009,7 +1021,7 @@ fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_r
 #[test]
 fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it() {
     // cross-family review R3 blocker 2: callers must pass --include-trash next to --include-orphans
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -1040,7 +1052,7 @@ fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it
 
 #[test]
 fn cli_memory_blockers_mcp_audit_and_reap_end_to_end() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let cfg_dir = tmp.path().join("mcp-configs");
     fs::create_dir_all(&cfg_dir).unwrap();
     fs::write(
@@ -1217,7 +1229,7 @@ fn cli_serve_stdio_omits_notification_responses_and_handles_invalid_utf8() {
 #[cfg(unix)]
 #[test]
 fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path();
     fs::create_dir_all(h.join(".codex/skills")).unwrap();
     fs::create_dir_all(h.join(".agents/skills/stale-skill")).unwrap();
@@ -1303,7 +1315,7 @@ fn run_sj(args: &[&str], home: Option<&Path>) -> String {
 
 #[test]
 fn r3_b1_redaction_is_allowlist_based_and_leaks_no_probe() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     fs::write(
         tmp.path().join("mcp.json"),
         r#"{"mcpServers":{"probe":{
@@ -1328,7 +1340,7 @@ fn r3_b1_redaction_is_allowlist_based_and_leaks_no_probe() {
 
 #[test]
 fn r3_b2_split_bearer_and_authorization_args_leak_nothing() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     fs::write(
         tmp.path().join("mcp.json"),
         r#"{"mcpServers":{"split":{"command":"npx","args":[
@@ -1353,7 +1365,7 @@ fn r3_b2_split_bearer_and_authorization_args_leak_nothing() {
 #[test]
 fn r3_b3_symlinked_home_cannot_bypass_protection() {
     use std::os::unix::fs::symlink;
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let real = tmp.path().join("real");
     fs::create_dir_all(real.join(".cursor")).unwrap();
     fs::create_dir_all(real.join("Library/Application Support/Claude/Local Storage")).unwrap();
@@ -1384,7 +1396,7 @@ fn r3_b3_symlinked_home_cannot_bypass_protection() {
 #[test]
 fn r3_b4_llm_audit_never_descends_through_symlinked_roots() {
     use std::os::unix::fs::symlink;
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path().canonicalize().unwrap();
     fs::create_dir_all(h.join(".ssh/SecretSubDir")).unwrap();
     fs::create_dir_all(h.join(".gemini")).unwrap();
@@ -1409,7 +1421,7 @@ fn r3_b4_llm_audit_never_descends_through_symlinked_roots() {
 
 #[test]
 fn r3_b5_codex_toml_subtables_are_not_phantom_servers() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path();
     fs::create_dir_all(h.join(".codex")).unwrap();
     fs::write(
@@ -1429,7 +1441,7 @@ fn r3_b5_codex_toml_subtables_are_not_phantom_servers() {
 
 #[cfg(unix)]
 fn r4_home() -> (tempfile::TempDir, std::path::PathBuf) {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path().canonicalize().unwrap();
     fs::create_dir_all(h.join(".claude/plugins/SecretClaudePlugin")).unwrap();
     fs::create_dir_all(h.join(".claude/skills/SecretClaudeSkill")).unwrap();
@@ -1480,7 +1492,7 @@ fn r4_b3_symlinked_gemini_config_ancestor_into_claude_is_refused() {
     assert!(has_refused_root(&v, "protected_target"), "{out}");
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")] // `Library/Application Support/Claude` is a protected root on macOS only
 #[test]
 fn r4_b3_symlinked_codex_plugins_ancestor_into_claude_app_support_is_refused() {
     use std::os::unix::fs::symlink;
@@ -1520,7 +1532,7 @@ fn r4_b3_symlinked_cursor_ancestor_into_claude_is_refused() {
 fn r4_b3_ancestor_symlink_outside_home_is_refused_at_every_root() {
     use std::os::unix::fs::symlink;
     let (_t, h) = r4_home();
-    let outside = tempdir().unwrap();
+    let outside = safe_tempdir();
     let o = outside.path().canonicalize().unwrap();
     for d in [
         "skills/OutsideSkill",
@@ -1565,7 +1577,7 @@ fn r4_b3_safe_in_home_roots_still_listed() {
 
 #[test]
 fn r5_cli_mcp_audit_and_llm_audit_walk_every_string_against_probe_fixture() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path().canonicalize().unwrap();
     probe::write_fixture_home(&h);
     fs::create_dir_all(h.join(".cursor/skills/some-skill")).unwrap();
@@ -1605,7 +1617,7 @@ fn r5_cli_mcp_audit_and_llm_audit_walk_every_string_against_probe_fixture() {
 fn r5_cli_serve_stdio_mcp_and_llm_audit_walk_every_string() {
     use std::io::Write;
     use std::process::Stdio;
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path().canonicalize().unwrap();
     probe::write_fixture_home(&h);
     let mut child = Command::new(sj_bin())
@@ -1679,7 +1691,7 @@ fn r5_doctor_lists_the_llm_audit_schema() {
 #[cfg(unix)]
 #[test]
 fn r5_mcp_audit_config_dir_on_dot_claude_emits_only_protected_target() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let h = tmp.path().canonicalize().unwrap();
     fs::create_dir_all(h.join(".claude/projects/SecretClaudeProj")).unwrap();
     fs::write(
