@@ -1652,6 +1652,55 @@ fn r5_cli_serve_stdio_mcp_and_llm_audit_walk_every_string() {
 }
 
 #[test]
+fn serve_stdio_llm_audit_honours_keep_and_threshold_params() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"KeepMePlug@KeepMeMkt\"]\nenabled = true\n",
+    )
+    .unwrap();
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("HOME", &h)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let base = serde_json::json!({"home": h.to_str().unwrap()});
+    let mut kept = base.clone();
+    kept["keep_plugin"] = serde_json::json!(["KeepMePlug@KeepMeMkt"]);
+    kept["idle_hours"] = serde_json::json!(0.5);
+    kept["unused_skill_days"] = serde_json::json!(7);
+    for (id, p) in [(1, base), (2, kept)] {
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"llm_audit","params":p})
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let flag = |v: &serde_json::Value| {
+        v["result"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["plugin_id"] == "KeepMePlug@KeepMeMkt")
+            .map(|p| p["kept_by_policy"].as_bool().unwrap())
+    };
+    assert_eq!(flag(&rows[0]), Some(false), "{text}");
+    assert_eq!(flag(&rows[1]), Some(true), "keep_plugin param ignored: {text}");
+}
+
+#[test]
 fn r5_serve_stdio_unknown_method_never_echoes_the_method() {
     use std::io::Write;
     use std::process::Stdio;

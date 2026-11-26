@@ -429,9 +429,26 @@ fn dispatch_rpc_method(
                 .and_then(|v| v.as_str())
                 .map(PathBuf::from)
                 .unwrap_or_else(|| ctx.home_dir.clone());
+            let mut policy = AuditPolicy::default();
+            if let Some(h) = params.get("idle_hours").and_then(|v| v.as_f64()) {
+                policy.idle_session_hours = h;
+            }
+            if let Some(d) = params.get("unused_skill_days").and_then(|v| v.as_u64()) {
+                policy.unused_skill_days = d;
+            }
+            let names = |key: &str| -> Vec<String> {
+                params
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            policy.keep_enabled_plugins.extend(names("keep_plugin"));
+            policy.keep_enabled_skills.extend(names("keep_skill"));
+            policy.keep_enabled_mcps.extend(names("keep_mcp"));
             let report = audit_llm_fleet(&LlmAuditOptions {
                 home_dir,
-                policy: AuditPolicy::default(),
+                policy,
                 now_epoch_secs: None,
             })
             .map_err(|e| (-32000, e.to_string()))?;

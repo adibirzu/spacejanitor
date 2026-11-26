@@ -357,6 +357,26 @@ fn strip_toml_comment(line: &str) -> &str {
     line
 }
 
+/// Net `[`/`]` depth of a line, ignoring brackets inside quoted strings.
+fn toml_bracket_depth(line: &str) -> i32 {
+    let (mut depth, mut in_single, mut in_double, mut escaped) = (0, false, false, false);
+    for ch in line.chars() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match ch {
+            '\\' if in_double => escaped = true,
+            '"' if !in_single => in_double = !in_double,
+            '\'' if !in_double => in_single = !in_single,
+            '[' if !in_single && !in_double => depth += 1,
+            ']' if !in_single && !in_double => depth -= 1,
+            _ => {}
+        }
+    }
+    depth
+}
+
 fn unquote_toml_str(raw: &str) -> String {
     let t = raw.trim();
     if (t.starts_with('"') && t.ends_with('"') && t.len() >= 2)
@@ -452,8 +472,20 @@ fn parse_toml_mcp_config(
     let mut in_env_section = false;
     let mut in_header_section = false;
 
-    for raw_line in raw.lines() {
-        let line = strip_toml_comment(raw_line).trim();
+    let mut lines = raw.lines();
+    while let Some(raw_line) = lines.next() {
+        // A multi-line array (`args = [` ... `]`) is joined into one logical line first.
+        let mut joined = strip_toml_comment(raw_line).trim().to_string();
+        if !joined.starts_with('[') && toml_bracket_depth(&joined) > 0 {
+            for next in lines.by_ref() {
+                joined.push(' ');
+                joined.push_str(strip_toml_comment(next).trim());
+                if toml_bracket_depth(&joined) <= 0 {
+                    break;
+                }
+            }
+        }
+        let line = joined.as_str();
         if line.is_empty() {
             continue;
         }
@@ -1064,6 +1096,28 @@ mod tests {
         } else {
             tempfile::tempdir()
         }
+    }
+
+    #[test]
+    fn toml_multiline_args_array_is_parsed_and_its_secret_is_redacted() {
+        let tmp = tempdir().unwrap();
+        let secret = "dummy_multiline_secret_for_unit_test_1357";
+        fs::write(
+            tmp.path().join("config.toml"),
+            format!(
+                "[mcp_servers.ml-mcp]\ncommand = \"npx\"\nargs = [\n  \"-y\", # keep\n  \"ml-mcp-server\",\n  \"--token\",\n  \"{secret}\",\n]\nenabled = true\n"
+            ),
+        )
+        .unwrap();
+        let opts = McpAuditOptions {
+            config_dirs: vec![tmp.path().to_path_buf()],
+            home_dir: None,
+        };
+        let report = audit_mcp_with_processes(&opts, &[]).unwrap();
+        assert_eq!(report.configured_servers.len(), 1);
+        assert_eq!(report.configured_servers[0].args_count, 4);
+        assert!(!report.secret_findings.is_empty(), "token arg must be flagged");
+        assert!(!serde_json::to_string(&report).unwrap().contains(secret));
     }
 
     #[test]
