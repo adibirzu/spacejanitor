@@ -17,6 +17,63 @@ use std::time::{Duration, Instant};
 /// Hard per-git-call timeout and per-repo proof budget. A proof that cannot finish fails closed.
 const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 const REPO_PROOF_BUDGET: Duration = Duration::from_secs(90);
+/// Wall-clock cap for a whole scan (all repositories together).
+const SCAN_BUDGET: Duration = Duration::from_secs(300);
+
+/// Time limits for git proofs. Every git call is bounded, every repository is bounded, and the
+/// whole scan is bounded; anything that cannot finish in time fails closed (never "safe").
+#[derive(Debug, Clone, Copy)]
+pub struct ProofLimits {
+    pub call_timeout: Duration,
+    pub repo_budget: Duration,
+    pub scan_budget: Duration,
+}
+
+impl Default for ProofLimits {
+    fn default() -> Self {
+        Self {
+            call_timeout: GIT_CALL_TIMEOUT,
+            repo_budget: REPO_PROOF_BUDGET,
+            scan_budget: SCAN_BUDGET,
+        }
+    }
+}
+
+thread_local! {
+    static ACTIVE_LIMITS: std::cell::Cell<ProofLimits> = std::cell::Cell::new(ProofLimits::default());
+    static SCAN_DEADLINE: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+}
+
+fn active_limits() -> ProofLimits {
+    ACTIVE_LIMITS.with(|l| l.get())
+}
+
+fn scan_deadline_passed() -> bool {
+    SCAN_DEADLINE.with(|d| d.get()).is_some_and(|d| Instant::now() >= d)
+}
+
+/// Installs the limits and the scan-wide deadline for this thread and restores the previous state
+/// on drop, so nested or later calls (e.g. the pre-removal re-validation) are unaffected.
+struct ScanScope {
+    prev_limits: ProofLimits,
+    prev_deadline: Option<Instant>,
+}
+
+impl ScanScope {
+    fn enter(limits: ProofLimits) -> Self {
+        let prev_limits = ACTIVE_LIMITS.with(|l| l.replace(limits));
+        let prev_deadline =
+            SCAN_DEADLINE.with(|d| d.replace(Some(Instant::now() + limits.scan_budget)));
+        Self { prev_limits, prev_deadline }
+    }
+}
+
+impl Drop for ScanScope {
+    fn drop(&mut self) {
+        ACTIVE_LIMITS.with(|l| l.set(self.prev_limits));
+        SCAN_DEADLINE.with(|d| d.set(self.prev_deadline));
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrphanOptions {
@@ -136,6 +193,14 @@ pub fn executable_config_key(key: &str) -> Option<String> {
                 | "core.alternaterefscommand" | "diff.external" | "gpg.program"
                 | "http.proxy" | "http.sslcertpasswordprotected"
         )
+        // URL-scoped http.<url>.* (proxy, sslVerify, sslCAInfo, extraHeader, ...) is MORE specific than
+        // anything we pass with -c, so it would win; block every http.* key except the plain
+        // `http.sslverify`, which our own `-c http.sslVerify=true` overrides.
+        || (k.starts_with("http.") && k != "http.sslverify")
+        || k.starts_with("https.")
+        // protocol.<scheme>.allow is more specific than our `-c protocol.allow=never` and would
+        // re-enable any git-remote-<scheme> helper (or fd::); only protocol.version is harmless
+        || (k.starts_with("protocol.") && k != "protocol.version")
         || k.starts_with("credential.")
         || (k.starts_with("url.") && ends(&["insteadof", "pushinsteadof"]))
         || k.starts_with("include.")
@@ -147,39 +212,225 @@ pub fn executable_config_key(key: &str) -> Option<String> {
     hit.then_some(k)
 }
 
+fn empty_home_dir() -> PathBuf {
+    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("sj-git-home-{}-{nanos}", std::process::id()));
+        // create_dir (not create_dir_all): never adopt a pre-existing, possibly attacker-owned dir
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        let _ = b.create(&dir);
+        dir
+    })
+    .clone()
+}
+
+/// Non-executable user settings that change how git SEES the working tree (line endings). Without
+/// them every clean checkout made with `core.autocrlf=true` (the Git for Windows default) would
+/// look modified. Copied by value into a private file that replaces the user's global config, so
+/// no other user key (credential helpers, proxies, filters, aliases) is ever honoured.
+const USER_CONFIG_ALLOWLIST: &[&str] = &["core.autocrlf", "core.eol", "core.safecrlf"];
+
+fn sanitized_user_config() -> PathBuf {
+    // cached per distinct (GIT_CONFIG_GLOBAL, HOME): stable in production, correct if it changes
+    type EnvKey = (Option<OsString>, Option<OsString>);
+    static CACHE: std::sync::Mutex<Vec<(EnvKey, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let key = (std::env::var_os("GIT_CONFIG_GLOBAL"), std::env::var_os("HOME"));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, p)) = cache.iter().find(|(k, _)| *k == key) {
+        return p.clone();
+    }
+    let path = {
+        let home = empty_home_dir();
+        let path = home.join(format!("gitconfig-{}", cache.len()));
+        let mut body = String::from("[core]\n");
+        for key in USER_CONFIG_ALLOWLIST {
+            let mut cmd = Command::new("git");
+            cmd.current_dir(&home)
+                .args(["config", "--get", key])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(out) = cmd.output() {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let simple = !val.is_empty()
+                    && val.len() < 16
+                    && val.chars().all(|c| c.is_ascii_alphanumeric());
+                if out.status.success() && simple {
+                    let name = key.trim_start_matches("core.");
+                    body.push_str(&format!("\t{name} = {val}\n"));
+                }
+            }
+        }
+        let _ = std::fs::write(&path, body);
+        path
+    };
+    cache.push((key, path.clone()));
+    path
+}
+
+const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
+
+/// A `git` command with a SCRUBBED environment and config: nothing is inherited except the few
+/// variables git/ssh need to run (`PATH`, `HOME`, `SSH_AUTH_SOCK`, Windows system dirs). No
+/// global/system config, no proxy variables, no credential helpers, no askpass, no hooks, no
+/// fsmonitor, no submodule recursion. Repo-controlled config that could still steer git is gated
+/// separately by `executable_config_risk` before any proof call.
+fn scrubbed_git() -> Command {
+    let mut cmd = Command::new("git");
+    cmd.env_clear();
+    // HOME/USERPROFILE point at an EMPTY directory: curl would otherwise read ~/.netrc and send those
+    // credentials to whatever host a hostile repo names. ssh resolves `~` through the passwd entry,
+    // so its keys and known_hosts are unaffected.
+    let empty_home = empty_home_dir();
+    cmd.env("HOME", &empty_home).env("USERPROFILE", &empty_home);
+    for key in [
+        "PATH", "SSH_AUTH_SOCK", "SystemRoot", "SYSTEMROOT", "TEMP", "TMP", "TMPDIR",
+    ] {
+        if let Some(v) = std::env::var_os(key) {
+            cmd.env(key, v);
+        }
+    }
+    cmd.env("GIT_CONFIG_GLOBAL", sanitized_user_config())
+        .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "")
+        .env("SSH_ASKPASS", "")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes")
+        .env("LC_ALL", "C")
+        .args([
+            "-c",
+            "core.fsmonitor=false",
+            "-c",
+            "core.untrackedCache=false",
+            "-c",
+            &format!("core.hooksPath={NULL_DEVICE}"),
+            "-c",
+            "protocol.ext.allow=never",
+            "-c",
+            "protocol.allow=never",
+            "-c",
+            "protocol.file.allow=always",
+            "-c",
+            "protocol.http.allow=always",
+            "-c",
+            "protocol.https.allow=always",
+            "-c",
+            "protocol.ssh.allow=always",
+            "-c",
+            "protocol.git.allow=always",
+            "-c",
+            &format!("core.attributesFile={NULL_DEVICE}"),
+            "-c",
+            &format!("core.excludesFile={NULL_DEVICE}"),
+            "-c",
+            "credential.helper=",
+            "-c",
+            "http.proxy=",
+            "-c",
+            "http.sslVerify=true",
+            "-c",
+            "submodule.recurse=false",
+            "-c",
+            "status.submoduleSummary=false",
+            "-c",
+            "diff.ignoreSubmodules=all",
+        ]);
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        // own process group, so a timeout can kill git AND everything it spawned (ssh, helpers)
+        cmd.process_group(0);
+    }
+    cmd
+}
+
+/// Read a small text file that must be a regular, non-symlink file. Opening is non-blocking so a
+/// FIFO planted in its place can never hang the scan, and the type is checked on the open handle.
+fn read_regular_text(path: &Path) -> Result<String, String> {
+    const MAX: u64 = 1 << 20;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.custom_flags(libc::O_NONBLOCK | libc::O_NOFOLLOW);
+    }
+    let f = opts.open(path).map_err(|_| "unreadable".to_string())?;
+    let meta = f.metadata().map_err(|_| "unreadable".to_string())?;
+    if !meta.is_file() {
+        return Err("non_regular_file".to_string());
+    }
+    let mut buf = String::new();
+    f.take(MAX)
+        .read_to_string(&mut buf)
+        .map_err(|_| "unreadable".to_string())?;
+    Ok(buf)
+}
+
 /// Parse (never execute) the repo-local and per-worktree config and return the first key that could
 /// run a command. An unreadable config fails closed.
 fn executable_config_risk(git_ctx: &GitExecContext) -> Option<String> {
+    const UNREADABLE: &str = "repo_config_can_execute:unreadable_config";
     let mut common = git_ctx.git_dir.clone();
-    if let Ok(rel) = std::fs::read_to_string(git_ctx.git_dir.join("commondir")) {
+    let commondir = git_ctx.git_dir.join("commondir");
+    if std::fs::symlink_metadata(&commondir).is_ok() {
+        let Ok(rel) = read_regular_text(&commondir) else {
+            return Some(UNREADABLE.to_string());
+        };
         let rel = rel.trim();
         if !rel.is_empty() {
             common = resolve_relative_from_dir(&git_ctx.git_dir, Path::new(rel));
         }
     }
+    for name in ["info/attributes", "info/exclude"] {
+        let f = common.join(name);
+        match std::fs::symlink_metadata(&f) {
+            Err(e) if e.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Some(UNREADABLE.to_string()),
+            Ok(_) => {
+                if read_regular_text(&f).is_err() {
+                    return Some(UNREADABLE.to_string());
+                }
+            }
+        }
+    }
     let mut files = vec![common.join("config")];
     let wt_cfg = git_ctx.git_dir.join("config.worktree");
-    if wt_cfg.exists() {
+    if std::fs::symlink_metadata(&wt_cfg).is_ok() {
         files.push(wt_cfg);
     }
     for f in files {
-        if !f.exists() {
-            continue;
+        match std::fs::symlink_metadata(&f) {
+            Err(e) if e.kind() == ErrorKind::NotFound => continue,
+            Err(_) => return Some(UNREADABLE.to_string()),
+            Ok(_) => {}
         }
-        let out = Command::new("git")
-            .args(["config", "--file"])
+        // a FIFO/device/symlink at the config path must never reach `git config --file`, which
+        // would block on it: check the type on an O_NONBLOCK handle first
+        if read_regular_text(&f).is_err() {
+            return Some(UNREADABLE.to_string());
+        }
+        let mut cmd = scrubbed_git();
+        cmd.args(["config", "--file"])
             .arg(&f)
-            .args(["--list", "--name-only", "-z"])
-            .env("GIT_CONFIG_GLOBAL", if cfg!(windows) { "NUL" } else { "/dev/null" })
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .output();
-        let Ok(out) = out else {
-            return Some("repo_config_can_execute:unreadable_config".to_string());
+            .args(["--list", "--name-only", "-z"]);
+        let Ok((true, out)) = run_with_timeout(cmd, None, call_timeout()) else {
+            return Some(UNREADABLE.to_string());
         };
-        if !out.status.success() {
-            return Some("repo_config_can_execute:unreadable_config".to_string());
-        }
-        for key in String::from_utf8_lossy(&out.stdout).split('\0') {
+        for key in out.split('\0') {
             if key.is_empty() {
                 continue;
             }
@@ -191,6 +442,28 @@ fn executable_config_risk(git_ctx: &GitExecContext) -> Option<String> {
     None
 }
 
+/// Per-call timeout, capped by what is left of the scan-wide deadline. `Duration::ZERO` once the
+/// deadline has passed (the call then fails closed immediately).
+fn call_timeout() -> Duration {
+    let per_call = active_limits().call_timeout;
+    match SCAN_DEADLINE.with(|d| d.get()) {
+        Some(deadline) => per_call.min(deadline.saturating_duration_since(Instant::now())),
+        None => per_call,
+    }
+}
+
+/// Kill every process in the group led by `pgid` (git plus the ssh/helper children it spawned).
+/// Non-unix platforms only get `Child::kill` for the direct child.
+fn kill_process_group(pgid: u32) {
+    #[cfg(unix)]
+    // SAFETY: killpg only signals the process group we created with `process_group(0)`.
+    unsafe {
+        libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
+    }
+    #[cfg(not(unix))]
+    let _ = pgid;
+}
+
 /// Run a command with a hard timeout, optional stdin, and stdout capture on a reader thread (so a
 /// large output cannot deadlock the wait loop). Timeout kills the child and reports `git_timeout`.
 fn run_with_timeout(
@@ -198,10 +471,14 @@ fn run_with_timeout(
     input: Option<Vec<u8>>,
     timeout: Duration,
 ) -> Result<(bool, String), SjError> {
+    if timeout.is_zero() {
+        return Err(SjError::Git("git_timeout".to_string()));
+    }
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
     let mut child = cmd.spawn()?;
+    let pgid = child.id();
     if let (Some(data), Some(mut si)) = (input, child.stdin.take()) {
         std::thread::spawn(move || {
             let _ = si.write_all(&data);
@@ -211,20 +488,28 @@ fn run_with_timeout(
         .stdout
         .take()
         .ok_or_else(|| SjError::Git("git_stdout_unavailable".to_string()))?;
-    let reader = std::thread::spawn(move || {
+    let (out_tx, out_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    std::thread::spawn(move || {
         let mut buf = Vec::new();
         let _ = so.read_to_end(&mut buf);
-        buf
+        let _ = out_tx.send(buf);
     });
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait()? {
             Some(status) => {
-                let out = reader.join().unwrap_or_default();
+                // git is gone; reap anything it left holding our pipes so the join cannot block
+                kill_process_group(pgid);
+                // bounded: a descendant that escaped the group (setsid) may still hold the pipe
+                let left = deadline.saturating_duration_since(Instant::now());
+                let out = out_rx
+                    .recv_timeout(left.max(Duration::from_millis(250)))
+                    .map_err(|_| SjError::Git("git_timeout".to_string()))?;
                 return Ok((status.success(), String::from_utf8_lossy(&out).into_owned()));
             }
             None => {
                 if Instant::now() >= deadline {
+                    kill_process_group(pgid);
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(SjError::Git("git_timeout".to_string()));
@@ -252,38 +537,18 @@ where
     I: IntoIterator<Item = S>,
     S: AsRef<OsStr>,
 {
-    let mut cmd = Command::new("git");
-    // Neutralise repo-controlled config that can EXECUTE commands or LIE about the working tree:
-    // core.fsmonitor (hook that can claim "nothing changed"), untracked cache, hooks path.
-    let null_dev = if cfg!(windows) { "NUL" } else { "/dev/null" };
+    let mut cmd = scrubbed_git();
     cmd.current_dir(&git_ctx.work_tree)
-        .args([
-            "-c",
-            "core.fsmonitor=false",
-            "-c",
-            "core.untrackedCache=false",
-            "-c",
-            &format!("core.hooksPath={null_dev}"),
-            "-c",
-            "protocol.ext.allow=never",
-            "--no-optional-locks",
-        ])
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_INDEX_FILE")
-        .env_remove("GIT_COMMON_DIR")
+        .arg("--no-optional-locks")
         .arg("--git-dir")
         .arg(&git_ctx.git_dir)
         .arg("--work-tree")
         .arg(&git_ctx.work_tree)
-        .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_SSH_COMMAND", "ssh -o BatchMode=yes");
+        .args(args);
     if let Some(ref alt) = git_ctx.alternate_object_dirs {
         cmd.env("GIT_ALTERNATE_OBJECT_DIRECTORIES", alt);
     }
-    run_with_timeout(cmd, input, GIT_CALL_TIMEOUT)
+    run_with_timeout(cmd, input, call_timeout())
 }
 
 /// Of the given object ids, keep those that exist in this repository (remote tips we never fetched
@@ -414,7 +679,7 @@ fn collect_extra_local_commits(
 /// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
 /// survive the worktree being removed). None for a standalone repo.
 fn shared_git_ctx(git_ctx: &GitExecContext) -> Option<GitExecContext> {
-    let rel = std::fs::read_to_string(git_ctx.git_dir.join("commondir")).ok()?;
+    let rel = read_regular_text(&git_ctx.git_dir.join("commondir")).ok()?;
     let rel = rel.trim();
     if rel.is_empty() {
         return None;
@@ -520,10 +785,13 @@ fn validate_commondir(gitdir: &Path, ctx: &ProtectionContext) -> Result<(), Stri
             if meta.file_type().is_symlink() {
                 return Err("symlink_commondir_file".to_string());
             }
+            if !meta.is_file() {
+                return Err("non_regular_commondir_file".to_string());
+            }
         }
     }
     let common_raw =
-        std::fs::read_to_string(&commondir_file).map_err(|_| "unreadable_commondir".to_string())?;
+        read_regular_text(&commondir_file).map_err(|_| "unreadable_commondir".to_string())?;
     let common_trimmed = common_raw.trim();
     if common_trimmed.is_empty() {
         return Err("empty_commondir".to_string());
@@ -545,7 +813,7 @@ fn validate_gitdir_pointer(
     ctx: &ProtectionContext,
 ) -> Result<PathBuf, String> {
     let raw =
-        std::fs::read_to_string(dot_git_file).map_err(|_| "unreadable_dot_git_file".to_string())?;
+        read_regular_text(dot_git_file).map_err(|_| "unreadable_dot_git_file".to_string())?;
     let line = raw
         .lines()
         .find(|l| l.trim_start().starts_with("gitdir:"))
@@ -723,6 +991,20 @@ fn dir_bytes_no_follow(path: &Path) -> u64 {
     total
 }
 
+/// True when the repository has (or may have) submodules: a `.gitmodules`, a `.git/modules` dir,
+/// or any gitlink (mode 160000) in the index. Unknown (listing failed) counts as "has".
+fn has_submodules(git_ctx: &GitExecContext) -> bool {
+    if std::fs::symlink_metadata(git_ctx.work_tree.join(".gitmodules")).is_ok()
+        || std::fs::symlink_metadata(git_ctx.git_dir.join("modules")).is_ok()
+    {
+        return true;
+    }
+    match run_git_raw_ctx(git_ctx, ["ls-files", "--stage", "-z"]) {
+        Ok((true, out)) => out.split('\0').any(|e| e.starts_with("160000 ")),
+        _ => true,
+    }
+}
+
 fn validate_single_repo_at(
     actual_repo: &Path,
     logical_repo: &Path,
@@ -730,6 +1012,9 @@ fn validate_single_repo_at(
 ) -> Result<OrphanCandidate, Vec<String>> {
     let mut reasons = Vec::new();
     let proof_start = Instant::now();
+    if scan_deadline_passed() {
+        return Err(vec!["scan_budget_exceeded".to_string()]);
+    }
 
     // The gate rejects relative paths outright; anchor to the cwd WITHOUT touching `..` components
     // (symlink-then-`..` must still be resolved by the OS, not collapsed lexically).
@@ -761,6 +1046,14 @@ fn validate_single_repo_at(
         return Err(reasons);
     }
 
+    // Submodules carry their OWN config (.git/modules/*/config) that the gate above cannot vouch
+    // for, and `git status` would run its filters. Fail closed: a repository with submodules is
+    // never offered, and status never recurses into them.
+    if has_submodules(&git_ctx) {
+        reasons.push("has_submodules".to_string());
+        return Err(reasons);
+    }
+
     let Ok((head_ok, head_before)) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"])
     else {
         reasons.push("git_invocation_failed".to_string());
@@ -786,7 +1079,7 @@ fn validate_single_repo_at(
             "--porcelain=v1",
             "--untracked-files=all",
             "--ignored=traditional",
-            "--ignore-submodules=none",
+            "--ignore-submodules=all",
         ],
     )
     .unwrap_or((false, String::new()));
@@ -868,10 +1161,14 @@ fn validate_single_repo_at(
     let extra_commits = collect_extra_local_commits(&git_ctx);
     let mut all_branches_verified = false;
     if let Ok(ref local_branches) = refs_before {
-        if !remotes.is_empty() && proof_start.elapsed() < REPO_PROOF_BUDGET {
+        if !remotes.is_empty() && proof_start.elapsed() < active_limits().repo_budget {
             let mut remote_tips: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut remote_query_failed = false;
             for remote_name in &remotes {
+                if proof_start.elapsed() >= active_limits().repo_budget || scan_deadline_passed() {
+                    remote_query_failed = true;
+                    break;
+                }
                 let target_override = if actual_repo != logical_repo {
                     let logical_abs = match anchor_to_cwd(logical_repo) {
                         Ok(p) => p,
@@ -973,8 +1270,11 @@ fn validate_single_repo_at(
             }
         }
     }
-    if proof_start.elapsed() >= REPO_PROOF_BUDGET {
+    if proof_start.elapsed() >= active_limits().repo_budget {
         reasons.push("proof_time_budget_exceeded".to_string());
+    }
+    if scan_deadline_passed() {
+        reasons.push("scan_budget_exceeded".to_string());
     }
     if !all_branches_verified {
         reasons.push("remote_unverified_or_unpushed".to_string());
@@ -1018,6 +1318,16 @@ pub fn inspect_orphans(
     ctx: &ProtectionContext,
     opts: &OrphanOptions,
 ) -> Result<OrphansReport, SjError> {
+    inspect_orphans_with_limits(root, ctx, opts, ProofLimits::default())
+}
+
+pub fn inspect_orphans_with_limits(
+    root: &Path,
+    ctx: &ProtectionContext,
+    opts: &OrphanOptions,
+    limits: ProofLimits,
+) -> Result<OrphansReport, SjError> {
+    let _scope = ScanScope::enter(limits);
     if is_symlink_path(root)? {
         return Err(SjError::ProtectedPath(format!(
             "refusing symlink orphan scan root: {}",
@@ -1186,6 +1496,9 @@ pub fn discover_nested_repos_exhaustive(
         });
 
     for entry_res in walker {
+        if scan_deadline_passed() {
+            return Err("scan_budget_exceeded".to_string());
+        }
         let entry = entry_res.map_err(|e| format!("nested_scan_error:{e}"))?;
         if entry.read_children_error.is_some() {
             return Err(format!("nested_scan_unreadable:{}", entry.path().display()));

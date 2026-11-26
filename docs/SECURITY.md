@@ -66,10 +66,7 @@ Every pull request runs:
 
 ## 6. Known limitations (opt-in orphan scanning)
 
-Orphan-repo scanning is **off by default** because it runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk. Open findings tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12):
-- **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
-- **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
-- **B37:** timeouts and budgets are not a hard contract (git calls have a 25 s timeout, but some config reads have none, so a FIFO at `.git/config` can still hang a scan).
+Orphan-repo scanning is **off by default** because it runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk. Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). B35 (submodule filters), B36 (proxy/netrc credential leak) and B37 (timeouts, scan deadline, FIFO config) are fixed in the Rust core: git proofs run with a scrubbed environment and config, repositories with submodules or any `http.*`/`protocol.*` config are blocked, the whole git process group is killed on timeout, and the scan has a wall-clock deadline. Still open from the issue: worktrees of bare repositories, over-blocking of benign `filter.lfs`/`credential.helper` config, and the 3,000-ref cap. Windows only kills the direct git child on timeout.
 
 Opt in only for repositories you trust (`--include-orphans` or the confirmed desktop toggle).
 
