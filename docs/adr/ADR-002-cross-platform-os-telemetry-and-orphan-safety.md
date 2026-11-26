@@ -60,4 +60,4 @@ Every collector emits normalized DTOs conforming to `spacejanitor.*.v1` contract
 | Recursive git clean/pushed proof (7 gates, nested repos) | Implemented in `orphans.rs`, **off by default** because it runs git in repositories found on disk. Hardening tracked in [#12](https://github.com/adibirzu/spacejanitor/issues/12) (B35 submodule filter, B36 proxy credential leak, B37 timeouts) |
 | `PPID=1` reaper with PID, command-hash and start-time re-verification | Implemented, narrowed to own-UID MCP-lineage processes (`reap.rs`) |
 | Idle-age and active-CWD conditions for orphan worktrees | Not implemented |
-| Windows | Collectors implemented; removal and reaping refuse to execute; config reads not yet no-follow ([#16](https://github.com/adibirzu/spacejanitor/issues/16)); slow malformed-TOML parse ([#17](https://github.com/adibirzu/spacejanitor/issues/17)) |
+| Windows | Collectors implemented; removal is refused and the reaper finds no eligible targets; config reads not yet no-follow ([#16](https://github.com/adibirzu/spacejanitor/issues/16)); slow malformed-TOML parse ([#17](https://github.com/adibirzu/spacejanitor/issues/17)) |

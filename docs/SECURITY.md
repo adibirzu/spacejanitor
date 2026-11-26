@@ -11,7 +11,7 @@ SpaceJanitor inspects local filesystems, git repositories, running process argum
 1. **Read-only default.** Audit commands (`doctor`, `scan`, `trash`, `memory`, `blockers`, `mcp-audit`, `llm-audit`) and dry-run plans perform zero deletions, zero git mutations and zero signals. The one exception to "no git" is the opt-in orphan scan (section 6).
 2. **Rust `sj` is the only protection gate.** The Node denylist was removed. The desktop app and `packages/core` forward every path to `sj protect` / `sj plan --select` and treat any failure, timeout or unparseable reply as "protected". With `sj` unavailable every destructive action is refused.
 3. **Two-step, selection-bound execution.** `sj plan --select` reports a digest over exactly the selected items (path, dev/ino, size, mtime and a content snapshot). `--execute --confirm --selection-sha256` rebuilds the plan and refuses unless it hashes to that digest. The desktop session adds a typed phrase, a 5-minute TTL, single use and a mutex. `sj reap` binds execution to its own digest and re-verifies PID, command hash and start time.
-4. **Unix-only removal.** Removal is handle-anchored and no-follow (macOS, Linux). On Windows `sj` plans but refuses to execute.
+4. **Unix-only removal.** Removal is handle-anchored and no-follow (macOS, Linux). On Windows `sj plan --execute` is refused and `sj reap` finds no eligible targets.
 5. **Zero cloud telemetry.** No analytics, crash reports or workstation metadata leave the machine.
 
 ---
@@ -22,7 +22,7 @@ SpaceJanitor inspects local filesystems, git repositories, running process argum
 
 - **Protected Roots:** `/`, `$HOME`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows` (including macOS `/System/Volumes/Data` prefix stripping so APFS data volume paths cannot bypass system root checks).
 - **Credential & Agent Directories:** `.ssh`, `.gnupg`, `.aws`, `.kube`, `.claude`, `.config/gh` (checked both under `$HOME` and as any path segment, case-insensitively).
-- **Secret & Key Files:** `.env`, `.env.*`, `*.env`, `*.private.*`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`. Custom suffix names without a dot (e.g., `id_rsa_work` or `.envrc`) are **not** matched by the default filename rule unless placed inside a protected directory such as `~/.ssh`.
+- **Secret & Key Files:** `.env`, `.env.*`, `*.env`, `*.private.*`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`. Key names are prefix-matched (`id_rsa_work` is protected); `.envrc` is **not** matched unless it sits inside a protected directory such as `~/.ssh`.
 - **VM Disk Images:** `*.vmdk`, `*.qcow2`, `*.vhdx`, `*.vdi`, `*.raw`, `*.img`.
 - **Quarantine Staging Protection:** Any path segment beginning with `.sj-stage-` is protected to prevent double-mutation during staged recovery.
 
@@ -69,7 +69,7 @@ Every pull request runs:
 Orphan-repo scanning is **off by default** because it runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk. Open findings tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12):
 - **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
 - **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
-- **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+- **B37:** timeouts and budgets are not a hard contract (git calls have a 25 s timeout, but some config reads have none, so a FIFO at `.git/config` can still hang a scan).
 
 Opt in only for repositories you trust (`--include-orphans` or the confirmed desktop toggle).
 

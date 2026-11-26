@@ -32,7 +32,7 @@ cargo install --path crates/sj-cli
 
 ## 2. Run the `spacejanitor-axi` CLI from a clone
 
-The package is `private` and not published to npm, so `npx spacejanitor-axi` does not work yet.
+The workspace is `private` and the package is not published to npm, so `npx spacejanitor-axi` does not work yet.
 
 ```bash
 node packages/cli/bin/spacejanitor.mjs summary
@@ -67,7 +67,7 @@ ollama pull qwen2.5:1.5b
 node packages/cli/bin/spacejanitor.mjs advise --slm-url http://127.0.0.1:11434/v1/chat/completions
 ```
 
-It refuses to run when free RAM is below `2.5 GiB` and falls back to deterministic summaries.
+It refuses to run when free RAM is below `2.5 GiB` and returns no proposals (`memory_pressure_self_guard`).
 
 ---
 

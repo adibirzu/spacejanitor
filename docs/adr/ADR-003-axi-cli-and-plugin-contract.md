@@ -63,4 +63,4 @@ export interface SpaceJanitorPlugin {
 | Commands `summary`, `doctor`, `disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`, `advise` | Implemented; collectors call `sj`, Node fallback is read-only; `--execute` fails closed in Node |
 | `--fail-on-alert` exit code `2` | Implemented in `spacejanitor-axi`; not a flag of `sj` |
 | Plugin manifest contract (`rule-pack`, `collector`, `widget`, `exporter`) | Manifest validation implemented; **no loader or runtime**; rule targets validated by the Rust gate |
-| Distribution via `npx` | **Not published** (`private` package, no release) |
+| Distribution via `npx` | **Not published** (private workspace, no release) |

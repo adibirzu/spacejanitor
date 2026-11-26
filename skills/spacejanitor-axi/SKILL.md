@@ -18,29 +18,30 @@ Read-only workstation diagnostics and dry-run remediation planner for macOS, Lin
 
 ## Commands
 
-Default output is compact **TOON** (token-efficient line format). Pass `--json` for versioned `spacejanitor.*.v1` JSON envelopes.
+Run from a clone (the package is not published to npm yet). Default output is compact **TOON** (token-efficient line format). Pass `--json` for versioned `spacejanitor.*.v1` JSON envelopes.
 
 ```sh
-npx spacejanitor-axi summary [--json]     # aggregated health across disk, memory, blockers, mcp (orphans: not scanned unless --include-orphans)
-npx spacejanitor-axi doctor [--json]      # verify platform, Node runtime, and schema versions
-npx spacejanitor-axi disk [--json]        # storage capacity, thresholds, and top consumers
-npx spacejanitor-axi memory [--json]      # true footprint (RSS + compressed/swap) by process
-npx spacejanitor-axi blockers [--json]    # kernel vnodes / inotify / handles / VFS lock blockers
-npx spacejanitor-axi mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
-npx spacejanitor-axi orphans --include-orphans [--json]  # EXPERIMENTAL, opt-in: runs git inside repos found on disk; without the flag reports "not scanned"
-npx spacejanitor-axi trash [--json]       # OS Trash / Recycle Bin audit
-npx spacejanitor-axi remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
+node packages/cli/bin/spacejanitor.mjs summary [--json]     # aggregated health across disk, memory, blockers, mcp (orphans: not scanned unless --include-orphans)
+node packages/cli/bin/spacejanitor.mjs doctor [--json]      # verify platform, Node runtime, and schema versions
+node packages/cli/bin/spacejanitor.mjs disk [--json]        # storage capacity, thresholds, and top consumers
+node packages/cli/bin/spacejanitor.mjs memory [--json]      # true footprint (RSS + compressed/swap) by process
+node packages/cli/bin/spacejanitor.mjs blockers [--json]    # kernel vnodes / inotify / handles / VFS lock blockers
+node packages/cli/bin/spacejanitor.mjs mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
+node packages/cli/bin/spacejanitor.mjs orphans --include-orphans [--json]  # EXPERIMENTAL, opt-in: runs git inside repos found on disk; without the flag reports "not scanned"
+node packages/cli/bin/spacejanitor.mjs trash [--json]       # OS Trash / Recycle Bin audit
+node packages/cli/bin/spacejanitor.mjs remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
+node packages/cli/bin/spacejanitor.mjs advise --slm-url <loopback url>  # optional local SLM advisor; off without a loopback endpoint
 ```
 
 ## Exit Codes
 
 - `0`: Healthy (`OK`/`CHECK`) or dry-run completed cleanly.
-- `1`: Operational/runtime error, missing/invalid remediation confirmation flags, or `--execute` in read-only Node AXI CLI (`not_implemented`).
+- `1`: Operational/runtime error, or `--execute` in the read-only Node AXI CLI (`not_implemented`).
 - `2`: Threshold breach (`ALERT`/`CRITICAL`) when `--fail-on-alert` is passed.
 
 ## Engine Notes (`sj-core` vs `node-fallback`)
 
-- When the Rust `sj` binary is present, `doctor`, `disk` (`spacejanitor.storage.v1`), `trash` (`spacejanitor.trash.v1`), and `orphans` (`spacejanitor.orphans.v1`) are backed by `sj-core` and normalized to the shared v1 contract.
+- When the Rust `sj` binary is present, `doctor`, `disk`, `trash`, `orphans`, `memory`, `blockers` and `mcp-audit` are backed by `sj-core` and normalized to the shared v1 contract.
 - When `sj` is absent, `@spacejanitor/core` provides `node-fallback` telemetry (`spacejanitor.disk.v1`, `memory.v1`, `blockers.v1`, `mcp_audit.v1`, `orphans.v1`, `trash.v1`, `summary.v1`).
 
 ## Safety Rules for Agents

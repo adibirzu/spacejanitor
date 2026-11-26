@@ -42,6 +42,6 @@ Integrate an **optional, strictly on-demand Small Language Model (SLM) advisor**
 |---|---|
 | On-demand, off by default, `0 MiB` idle | Implemented (no resident model; user supplies a loopback endpoint) |
 | Loopback-only (`127.0.0.1`, `localhost`, `::1`) | Implemented and tested |
-| `2.5 GiB` free-RAM self-guard with deterministic fallback | Implemented |
+| `2.5 GiB` free-RAM self-guard (returns no proposals, no deterministic fallback) | Implemented |
 | Redacted input, no execution capability, re-validation by `sj protect` | Implemented |
 | Spawning/unloading GGUF via `llama.cpp`, GBNF/grammar decoding, model presets, fleet benchmark | Not implemented |

@@ -24,7 +24,7 @@ All commands are **read-only by default** and take `--json` for versioned machin
 | `sj serve-stdio` | NDJSON JSON-RPC 2.0 on stdin/stdout | `spacejanitor.*.v1` |
 
 Notes:
-- `--execute` on `sj plan` and `sj reap` is **Unix-only (macOS, Linux)**. On Windows `sj` plans and refuses to execute.
+- `--execute` on `sj plan` and `sj reap` is **Unix-only (macOS, Linux)**. On Windows `plan --execute` is refused, and `sj reap` finds no eligible targets (process UIDs are unverifiable there).
 - `sj reap` only targets processes **owned by you** and in an MCP lineage; foreign-UID, protected, too-young and non-MCP processes appear under `excluded` with a reason. The confirm phrase is printed by the dry-run (for example `REAP 4 ORPHAN PROCESS(ES)`).
 - `sj llm-audit` has no `--execute`: it only reports planned actions.
 - Output of `mcp-audit`, `llm-audit`, `reap`, `memory` and `serve-stdio` is built from a closed vocabulary; see [SECURITY.md](./SECURITY.md).
@@ -87,9 +87,9 @@ node packages/cli/bin/spacejanitor.mjs <command> [flags]   # from a clone; not p
 | `trash` | OS Trash / Recycle Bin |
 | `mcp-audit` | MCP fan-out, duplicates, redacted secret risks |
 | `remediate` | Dry-run plan preview only; `--execute` **fails closed** in the Node CLI (use the desktop app or `sj`) |
-| `advise` | Optional local SLM advisor; off unless `--slm-url <loopback url>` |
+| `advise` | Optional local SLM advisor; off unless `--slm-url <loopback url>` (`--allow-lan` opts in to LAN hosts) |
 
-Flags: `--json`, `--fail-on-alert` (exit `2` on `ALERT`/`CRITICAL`), `--path <dir>`, `--include-orphans`, `--execute` (guard only), `--confirm <phrase>`, `--plan-sha256 <sha>`, `-h/--help`, `-v/--version`.
+Flags: `--json`, `--fail-on-alert` (exit `2` on `ALERT`/`CRITICAL`), `--path <dir>`, `--include-orphans`, `--slm-url <url>`, `--allow-lan`, `--execute` (guard only), `--confirm <phrase>`, `--plan-sha256 <sha>`, `-h/--help`, `-v/--version`.
 
 > **Agent safety rule:** agents must never pass `--execute`. Present the dry-run plan to the human operator.
 
@@ -98,7 +98,7 @@ Flags: `--json`, `--fail-on-alert` (exit `2` on `ALERT`/`CRITICAL`), `--path <di
 ## 3. Desktop UI & OS Tray Mode
 
 - **Tray badge:** worst active status across disk, true memory/swap and OS blockers (`OK`, `CHECK`, `ALERT`, `CRITICAL`).
-- **Tabs:** Overview (gauges), Disk (top consumers, Trash, candidates), Memory (stacked Resident vs. Compressed/Swap), MCP (fleet counts and duplicates).
+- **Tabs:** Overview (gauges), Disk & Orphans (top consumers, Trash, candidates), Memory & Blockers (process table), MCP (fleet counts and duplicates).
 - **Orphans:** shown as "not scanned (disabled by default)" until you turn on the Disk-view toggle, which asks for native confirmation first.
 - **Selection-bound confirmation:** only items accepted by `sj` are selectable; blocked items show the reason and cache directories are listed as "Not removable from the desktop". **Review Plan** shows targets, bytes and the selection digest; execution needs the typed `CONFIRM-XXXXXXXX` phrase within 5 minutes, single use.
 - **Fail closed:** if `sj` is missing or fails, every destructive action is refused with a message; dashboards keep working.
@@ -113,7 +113,7 @@ Flags: `--json`, `--fail-on-alert` (exit `2` on `ALERT`/`CRITICAL`), `--path <di
 `sj` (Rust) is the only component that decides what is protected. It refuses to stage or delete:
 - System roots (`/`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows`) and `$HOME`
 - Credential & agent directories (`~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`)
-- Secret & key files (`.env`, `.env.*`, `*.env`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*` — custom suffix names without a dot such as `id_rsa_work` or `.envrc` are **not** matched by the default filename rule unless placed inside a protected directory such as `~/.ssh`)
+- Secret & key files (`.env`, `.env.*`, `*.env`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*` — names such as `id_rsa_work` are matched by the `id_rsa*` prefix rule; `.envrc` is **not** matched unless it sits inside a protected directory such as `~/.ssh`)
 - VM disk images (`*.vmdk`, `*.qcow2`, `*.vhdx`, `*.vdi`, `*.raw`, `*.img`)
 - Any path containing a `.sj-stage-*` quarantine staging segment or dangling/unresolvable symlinks
 
@@ -125,5 +125,5 @@ Flags: `--json`, `--fail-on-alert` (exit `2` on `ALERT`/`CRITICAL`), `--path <di
   `sj orphans` enforces all seven safety gates in `crates/sj-core/src/orphans.rs` across the repository and any nested sub-repositories: (1) clean working tree (`dirty_or_untracked`), (2) at least one configured remote (`no_remote`), (3) no git stashes (`has_stashes`), (4) no unpushed commits across all branches, (5) no ignored files present (`ignored_files_present`), (6) not in detached HEAD (`detached_head`), and (7) not an unborn HEAD (`unborn_head`). Note that ignored build artifacts such as `target/` or `node_modules/` trigger `BLOCKED [ignored_files_present]`—which is **not** cleared by committing or pushing—so clean or remove ignored artifacts (and commit/push changes or clear stashes) before pruning.
 - **Why does `sj plan --execute` exit with code `2`?**
   Execution needs `--execute --confirm` plus either `--plan-sha256 <sha> --item <id>` or `--selection-sha256 <sha> --select <path>...` from a dry run of the same selection (and `--trash-path` cannot be combined with `--execute`). Execution is **Unix-only**: on Windows `crates/sj-core/src/safe_remove.rs` returns an `ExecutionGate` refusal (exit `2`).
-- **Why did the Local SLM Advisor fall back to deterministic rules?**
-  Either no loopback endpoint is configured (`--slm-url`), or free RAM is below `2.5 GiB`, triggering the memory-pressure self-guard so the advisor never worsens swap thrashing.
+- **Why did the Local SLM Advisor return no proposals?**
+  It reports `slm_disabled` when no loopback endpoint is configured (`--slm-url`) or `memory_pressure_self_guard` when free RAM is below `2.5 GiB`; it returns an empty proposal list rather than guessing, triggering the memory-pressure self-guard so the advisor never worsens swap thrashing.

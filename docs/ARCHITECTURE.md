@@ -104,7 +104,7 @@ CLI users run the same two steps by hand (`sj plan --select ...` then `--execute
 | **True memory footprint** | `top`, `vm_stat`, `sysctl vm.swapusage` | `/proc/<pid>/smaps_rollup` (`Pss` + `SwapPss`), `/proc/meminfo` | WMI/CIM process data, pagefile |
 | **Kernel / VFS blockers** | `kern.num_vnodes`/`maxvnodes`, `fseventsd`, `U`-state waits | `/proc/sys/fs/file-nr`, `fs.inotify.*`, `D`-state | handle counts, pool and pagefile pressure |
 | **Orphan work** (opt-in) | recursive `.git` proof | recursive `.git` proof | recursive `.git` proof |
-| **`PPID=1` reaper** | own-UID MCP-lineage only, non-recursive cwd checks | own-UID MCP-lineage only, `/proc` | plans only |
+| **`PPID=1` reaper** | own-UID MCP-lineage only, non-recursive cwd checks | own-UID MCP-lineage only, `/proc` | no eligible targets (UID unverifiable) |
 | **Removal (`--execute`)** | handle-anchored, no-follow | handle-anchored, no-follow | **refused** (plan only) |
 
 Collectors never run recursive `lsof +D`. Linux systemd/podman blockers and extra Linux audit coverage are in open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18).

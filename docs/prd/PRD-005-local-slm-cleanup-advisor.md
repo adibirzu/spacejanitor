@@ -46,7 +46,7 @@ When SpaceJanitor surfaces unfamiliar large directories, idle worktrees, OS Tras
 |---|---|---|
 | FR-5.1 Opt-in, on-demand | Implemented against a **loopback OpenAI-compatible endpoint** (for example Ollama), only on request and with a user-supplied URL. SpaceJanitor does not spawn or unload `llama.cpp` itself | `packages/core/src/slm.mjs`, `apps/desktop/src/slmAdvisor.ts` |
 | FR-5.2 Grammar-constrained proposals | Partial: JSON-shaped response with `temperature 0.1`, parsed and validated; **no GBNF or JSON-schema constrained decoding** | `slm.mjs` |
-| FR-5.3 Memory self-guard | Implemented: refuses below `2.5 GiB` free RAM and falls back to deterministic output | `slm.mjs` |
+| FR-5.3 Memory self-guard | Implemented: refuses below `2.5 GiB` free RAM (returns no proposals; no deterministic fallback) | `slm.mjs` |
 | FR-5.4 Deterministic re-validation | Implemented: every proposed path goes through the Rust `sj protect` gate; protected targets become `keep_protected` | `slm.mjs`, `candidateAnnotations.ts` |
 | FR-5.5 Model presets | Not implemented (default model name only) | n/a |
 | FR-5.6 Evaluation harness | Not implemented | n/a |

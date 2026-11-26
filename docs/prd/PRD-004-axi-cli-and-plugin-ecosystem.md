@@ -41,7 +41,7 @@ SpaceJanitor should serve equally well as a standalone human CLI, an AI-agent AX
 
 | Requirement | State | Where |
 |---|---|---|
-| FR-4.1 Zero-install Node CLI | Implemented from a clone: `summary`, `doctor`, `disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`, `advise`. **`npx spacejanitor-axi` does not work: the package is private and unpublished** | `packages/cli/bin/spacejanitor.mjs` |
+| FR-4.1 Zero-install Node CLI | Implemented from a clone: `summary`, `doctor`, `disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`, `advise`. **`npx spacejanitor-axi` does not work: the package is unpublished** | `packages/cli/bin/spacejanitor.mjs` |
 | FR-4.2 TOON and versioned JSON | Implemented (`spacejanitor.*.v1`); collectors call `sj` and fall back to read-only Node views | `packages/core/src/toon.mjs`, `sjGate.mjs` |
 | FR-4.3 Agent skill | Implemented | `skills/spacejanitor-axi/SKILL.md` |
 | FR-4.4 Plugin SDK | Partial: manifest validation for `rule-pack`, `collector`, `widget`, `exporter`; no plugin loader or runtime | `packages/plugin-sdk` |

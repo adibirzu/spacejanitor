@@ -136,7 +136,7 @@ mcp-audit: files=4 servers=40 running=45 duplicates=24 orphans=9 secret_findings
 Add `--json` for the `spacejanitor.mcp_audit.v1` report: per-config servers (user-chosen labels shown only when they pass the label rules), duplicate groups, orphaned processes and `secret_findings` that name the *kind* of signal, never the value.
 
 ### How SpaceJanitor Solves It Safely
-- **Config-to-process matching:** live MCP processes are matched back to the configured server entries so duplicates, orphans (`PPID=1`) and unused servers stand out; `npx` double-spawning shows up as duplicates.
+- **Config-to-process matching:** live MCP processes are matched back to the configured server entries so duplicates, and orphans (`PPID=1`) stand out (`sj llm-audit` reports unused servers); `npx` double-spawning shows up as duplicates.
 - **Closed-vocabulary output:** commands, packages, flag names and URLs are printed only from a fixed catalog or reduced to a hash; flag values are always `<REDACTED>` and URL userinfo, paths and queries are never shown. Raw secrets never appear in `sj` output (see [SECURITY.md](./SECURITY.md)). `sj llm-audit` extends the same audit to unused plugins, skills, MCP servers and idle sessions, read-only.
 
 ### Verification

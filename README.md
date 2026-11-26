@@ -21,7 +21,7 @@ Standard utilities like `df` and `ps` mislead developers and AI-workstation user
 
 | What `df` / `ps` Show | What Is Actually Happening | How SpaceJanitor Fixes It |
 |---|---|---|
-| `ps` reports modest `RSS` per process | Tens of GiB sit in **compressed RAM and swap** across IDE, browser, and agent clusters | Measures **True Memory Footprint** (`Resident + Compressed + Swap`) per process |
+| `ps` reports modest `RSS` per process | Tens of GiB sit in **compressed RAM and swap** across IDE, browser, and agent clusters | Measures **True Memory Footprint** (resident, compressed and swap) per process |
 | Disk looks "fine" or `du` crawls | **Orphan git worktrees**, stale `target/`/`node_modules`, OS Trash, and APFS local snapshots eat SSD headroom | Runs bounded parallel scans; an **opt-in** recursive git clean/pushed proof marks safe orphan worktrees |
 | Terminals & SSH hang with free CPU | **Kernel/VFS blockers** saturate macOS vnodes, `fseventsd`, Linux `inotify` watches, or Windows handles | Audits OS kernel/VFS tables **without** ever running recursive `lsof +D` |
 | Dozens of background `node`/`python` PIDs | **Duplicated stdio MCP servers** multiply per editor/CLI session and leak tokens in CLI args | Audits MCP configs and live processes and **never prints inline secrets** |
@@ -184,10 +184,10 @@ Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12) 
 - **Orphan-repo scanning is OFF by default (experimental).** Finding and pruning orphan git worktrees runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk, including repositories SpaceJanitor did not create. An independent review showed a repository's own configuration can still steer that git in ways our proofs do not yet block:
   - **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
   - **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
-  - **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+  - **B37:** timeouts and budgets are not a hard contract (git calls have a 25 s timeout, but some config reads have none, so a FIFO at `.git/config` can still hang a scan).
 
   Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). By default no git command touches any repository (`doctor` only runs `git --version`). Opt in only for repositories you trust: `sj orphans --include-orphans`, `sj plan --include-orphans`, `spacejanitor-axi orphans --include-orphans`, or the explicit toggle in the desktop app (Disk view). When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash cleanup, the confirmation gate, the protection gate, redaction, MCP audit and the SLM advisor are unaffected.
-- **Removal is Unix-only.** `sj plan --execute` and `sj reap --execute` run on macOS and Linux; on Windows they plan and refuse to execute.
+- **Removal is Unix-only.** `sj plan --execute` and `sj reap --execute` run on macOS and Linux; on Windows `plan --execute` is refused and `sj reap` finds no eligible targets.
 - **Windows config reads** do not yet open MCP config files no-follow (issue #16), and a huge malformed TOML config can parse slowly (issue #17).
 - **No signed installers.** Nothing is published; when releases start they will be unsigned until code signing and notarization are enabled.
 

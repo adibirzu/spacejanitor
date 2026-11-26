@@ -42,7 +42,7 @@ Adopt a **two-layer hybrid architecture**:
 | Item | State |
 |---|---|
 | Rust core and `sj` CLI | Implemented (`crates/sj-core`, `crates/sj-cli`) |
-| `sj serve-stdio` NDJSON JSON-RPC sidecar | Implemented; the Electron main process spawns it as a sidecar and also runs one-shot `sj` calls for plans and execution (`apps/desktop/src/sjBridge.ts`) |
+| `sj serve-stdio` NDJSON JSON-RPC sidecar | Implemented; the Electron main process spawns it as a sidecar and also runs one-shot `sj` calls for plans and execution (`sjBridge.ts`, `remediationGate.ts`) |
 | Electron shell, tray and close-to-tray renderer destruction | Implemented (`apps/desktop`, `apps/ui`) |
 | `sj` bundled into the app as `resources/bin/sj`, staged per target | Implemented in `release.yml` / `before-pack.cjs`; **never run**: no tag, no published installers |
 | AXI entrypoint | Implemented as `spacejanitor-axi` from a clone (not on npm) |

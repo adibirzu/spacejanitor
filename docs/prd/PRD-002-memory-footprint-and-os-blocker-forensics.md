@@ -45,7 +45,7 @@ Workstations running multiple IDEs, local LLMs, VMs, and background agent worker
 | FR-2.1 True per-process footprint | Implemented per process (top-N) on macOS, Linux, Windows collectors; **no owner-group aggregation** | `sj memory` (`memory.rs`) |
 | FR-2.2 Kernel and VFS blockers | Implemented: macOS vnodes/`fseventsd`/U-state, Linux `file-nr`/`inotify`/`D`-state, Windows handles/pagefile. Linux systemd/podman blockers are in open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18) | `sj blockers` (`blockers.rs`) |
 | FR-2.3 Orphan process storms | Implemented for `PPID=1` MCP-lineage processes of the current user, with PID, command-hash and start-time re-verification; unix-only execute. Zombie parents / walker detection not implemented | `sj reap` (`reap.rs`) |
-| FR-2.4 MCP fleet auditor | Implemented (configs plus live processes, duplicates, orphans, unused servers) plus `sj llm-audit` for plugins, skills and idle sessions (read-only, no execute) | `mcp_audit.rs`, `llm_audit.rs` |
+| FR-2.4 MCP fleet auditor | Implemented (configs plus live processes, duplicates, orphans) plus `sj llm-audit` for unused MCP servers, plugins, skills and idle sessions (read-only, no execute) | `mcp_audit.rs`, `llm_audit.rs` |
 | FR-2.5 Redaction | Implemented as a closed vocabulary (`crates/sj-core/data/redact_catalog.json`), not pattern matching | `redact.rs` |
 | FR-2.6 Remediation action IDs (`m1-reap-*`, `m2-*`) | Not implemented as named; reaping uses `sj reap` with its own digest and confirm phrase. Daemon restart / `sudo` actions are intentionally absent | `reap.rs` |
 
