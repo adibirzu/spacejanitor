@@ -1,7 +1,8 @@
 appId: dev.spacejanitor.desktop
 productName: SpaceJanitor
 copyright: Copyright (c) 2026 Adrian Birzu (MIT License)
-electronVersion: "35.7.5"
+# MUST equal the apps/desktop "electron" devDependency; scripts/electron-pin.cjs (CI + desktop tests) enforces it.
+electronVersion: "42.11.16"
 asar: true
 beforePack: scripts/before-pack.cjs
 

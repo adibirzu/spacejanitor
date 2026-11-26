@@ -63,6 +63,8 @@ jobs:
         run: npm ci
       - name: Rust tests (also builds target/debug/sj for the Node and desktop gate tests)
         run: cargo test --workspace
+      - name: Electron pin matches the installed electron
+        run: node apps/desktop/scripts/electron-pin.cjs check
       - name: Node tests (with sj)
         run: npm test
       - name: Node tests with the gate disabled (fail closed)
@@ -231,6 +233,9 @@ jobs:
         env:
           CSC_IDENTITY_AUTO_DISCOVERY: "false"
         run: npx --workspace @spacejanitor/desktop electron-builder --config electron-builder.yml --publish never ${{ matrix.eb_flags }}
+      - name: Verify the packaged binary is the pinned Electron (read from the binary, not the config)
+        shell: bash
+        run: node apps/desktop/scripts/verify-packaged-electron.cjs --platform ${{ matrix.sj_platform }} --arch ${{ matrix.sj_arch }}
       - name: Verify the bundled sj gate inside the packaged app (arch, exec bit, absolute resources path)
         shell: bash
         run: |
