@@ -1,6 +1,11 @@
+use crate::linux::{
+    allowed_tmp_roots, discover_linux_audit, execute_linux_command_item, LinuxAuditReport,
+};
 use crate::orphans::{inspect_orphans, OrphanOptions};
-use crate::protect::ProtectionContext;
-use crate::safe_remove::{capture_target_snapshot, safe_remove_plan_item};
+use crate::protect::{check_path_protection_anchored, ProtectionContext};
+use crate::safe_remove::{
+    capture_target_snapshot, safe_remove_plan_item, safe_remove_plan_item_with_roots,
+};
 use crate::trash::{default_trash_paths, discover_trash_at};
 use crate::{SjError, SCHEMA_PROPOSAL_V1};
 use serde::Serialize;
@@ -99,10 +104,48 @@ pub fn compute_plan_sha256(items: &[PlanItem]) -> Result<String, SjError> {
     Ok(sha256_hex(&canonical))
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct LinuxPlanOptions {
+    pub include_linux: bool,
+    pub audit_override: Option<LinuxAuditReport>,
+    pub tmp_root_override: Option<PathBuf>,
+}
+
+fn command_snapshot(entry_type: &str, size: u64, identity: &str) -> TargetSnapshot {
+    TargetSnapshot {
+        entry_type: entry_type.to_string(),
+        dev: None,
+        ino: None,
+        size,
+        mtime_secs: None,
+        mtime_nanos: None,
+        content_or_tree_sha256: sha256_hex(identity.as_bytes()),
+        git_head: None,
+        git_tree: None,
+        git_refs_sha256: None,
+    }
+}
+
+fn is_linux_command_kind(kind: &str) -> bool {
+    matches!(
+        kind,
+        "docker_exited_container" | "docker_dangling_image" | "podman_exited_container"
+    )
+}
+
 pub fn build_remediation_plan(
     root: &Path,
     ctx: &ProtectionContext,
     opts: &PlanOptions,
+) -> Result<RemediationPlan, SjError> {
+    build_remediation_plan_with_linux(root, ctx, opts, &LinuxPlanOptions::default())
+}
+
+pub fn build_remediation_plan_with_linux(
+    root: &Path,
+    ctx: &ProtectionContext,
+    opts: &PlanOptions,
+    linux_opts: &LinuxPlanOptions,
 ) -> Result<RemediationPlan, SjError> {
     let mut items = Vec::new();
     let mut protected_exclusions = Vec::new();
@@ -167,6 +210,187 @@ pub fn build_remediation_plan(
         }
     }
 
+    if linux_opts.include_linux {
+        let audit = linux_opts.audit_override.clone().unwrap_or_else(|| {
+            discover_linux_audit(&ctx.home_dir, linux_opts.tmp_root_override.as_deref())
+        });
+
+        for cache in &audit.package_caches.user_caches {
+            let p = Path::new(&cache.path);
+            let prot = check_path_protection_anchored(p, ctx);
+            if prot.protected {
+                protected_exclusions.push(ExcludedItem {
+                    path: cache.path.clone(),
+                    reason: prot.reason,
+                });
+                continue;
+            }
+            if let Ok(snapshot) = capture_target_snapshot(p, false, ctx) {
+                items.push(PlanItem {
+                    id: deterministic_item_id("linux_user_cache", &cache.path),
+                    kind: "linux_user_cache".to_string(),
+                    path: cache.path.clone(),
+                    bytes: cache.bytes,
+                    tier: "tier1".to_string(),
+                    safety_reasons: vec![
+                        "rebuildable_package_cache".to_string(),
+                        "not_protected".to_string(),
+                    ],
+                    snapshot,
+                });
+            }
+        }
+
+        for tmp_art in &audit.stale_tmp_entries {
+            let p = Path::new(&tmp_art.path);
+            let prot = check_path_protection_anchored(p, ctx);
+            if prot.protected {
+                protected_exclusions.push(ExcludedItem {
+                    path: tmp_art.path.clone(),
+                    reason: prot.reason,
+                });
+                continue;
+            }
+            if let Ok(snapshot) = capture_target_snapshot(p, false, ctx) {
+                items.push(PlanItem {
+                    id: deterministic_item_id("stale_tmp_entry", &tmp_art.path),
+                    kind: "stale_tmp_entry".to_string(),
+                    path: tmp_art.path.clone(),
+                    bytes: tmp_art.bytes,
+                    tier: "tier2".to_string(),
+                    safety_reasons: vec![tmp_art.reason.clone(), "not_active_mountpoint".to_string()],
+                    snapshot,
+                });
+            }
+        }
+
+        for c in &audit.docker.exited_containers {
+            let ref_path = format!("docker://container/{}/{}", c.id, c.name);
+            items.push(PlanItem {
+                id: deterministic_item_id("docker_exited_container", &ref_path),
+                kind: "docker_exited_container".to_string(),
+                path: ref_path.clone(),
+                bytes: c.size_bytes,
+                tier: "tier2".to_string(),
+                safety_reasons: vec![
+                    format!("state:{}", c.state),
+                    format!("cmd:docker rm {}", c.id),
+                ],
+                snapshot: command_snapshot("docker_container", c.size_bytes, &format!("{ref_path}:{}", c.status)),
+            });
+        }
+        for img in &audit.docker.dangling_images {
+            let ref_path = format!("docker://image/{}", img.id);
+            items.push(PlanItem {
+                id: deterministic_item_id("docker_dangling_image", &ref_path),
+                kind: "docker_dangling_image".to_string(),
+                path: ref_path.clone(),
+                bytes: img.size_bytes,
+                tier: "tier2".to_string(),
+                safety_reasons: vec![
+                    "dangling_image".to_string(),
+                    format!("cmd:docker rmi {}", img.id),
+                ],
+                snapshot: command_snapshot("docker_image", img.size_bytes, &format!("{ref_path}:{}", img.size_bytes)),
+            });
+        }
+        if audit.docker.df.build_cache_reclaimable_bytes > 0 {
+            protected_exclusions.push(ExcludedItem {
+                path: "docker://build-cache".to_string(),
+                reason: format!(
+                    "manual_review_only:docker_build_cache:{}B:docker builder prune -f",
+                    audit.docker.df.build_cache_reclaimable_bytes
+                ),
+            });
+        }
+
+        for c in &audit.podman.exited_containers {
+            let ref_path = format!("podman://container/{}/{}", c.id, c.name);
+            items.push(PlanItem {
+                id: deterministic_item_id("podman_exited_container", &ref_path),
+                kind: "podman_exited_container".to_string(),
+                path: ref_path.clone(),
+                bytes: c.size_bytes,
+                tier: "tier2".to_string(),
+                safety_reasons: vec![
+                    format!("state:{}", c.state),
+                    format!("cmd:podman rm {}", c.id),
+                ],
+                snapshot: command_snapshot("podman_container", c.size_bytes, &format!("{ref_path}:{}", c.status)),
+            });
+        }
+        if audit.podman.df.images_reclaimable_bytes > 0 {
+            protected_exclusions.push(ExcludedItem {
+                path: "podman://images/dangling".to_string(),
+                reason: format!(
+                    "manual_review_only:podman_dangling_images:{}B:podman image prune -f",
+                    audit.podman.df.images_reclaimable_bytes
+                ),
+            });
+        }
+        if audit.podman.df.volumes_reclaimable_bytes > 0 {
+            protected_exclusions.push(ExcludedItem {
+                path: "podman://volumes/unused".to_string(),
+                reason: format!(
+                    "manual_review_only:podman_unused_volumes:{}B:podman volume prune -f",
+                    audit.podman.df.volumes_reclaimable_bytes
+                ),
+            });
+        }
+
+        if audit.journald.available && audit.journald.bytes > 500 * 1024 * 1024 {
+            let bytes = audit.journald.bytes.saturating_sub(500 * 1024 * 1024);
+            protected_exclusions.push(ExcludedItem {
+                path: "systemd://journald".to_string(),
+                reason: format!(
+                    "manual_review_only:journald_vacuum:{}B:journalctl --vacuum-size=500M",
+                    bytes
+                ),
+            });
+        }
+
+        if audit.package_caches.apt_archives_bytes > 0 {
+            protected_exclusions.push(ExcludedItem {
+                path: format!("apt://{}", audit.package_caches.apt_archives_path),
+                reason: format!(
+                    "manual_review_only:apt_cache_clean:{}B:apt-get clean",
+                    audit.package_caches.apt_archives_bytes
+                ),
+            });
+        }
+
+        // Manual-review-only items are NEVER placed in `items` and cannot be executed automatically.
+        for m in &audit.model_caches {
+            protected_exclusions.push(ExcludedItem {
+                path: m.path.clone(),
+                reason: format!("manual_review_only:model_cache:{}B", m.bytes),
+            });
+        }
+        for b in &audit.old_backups {
+            protected_exclusions.push(ExcludedItem {
+                path: b.path.clone(),
+                reason: format!("manual_review_only:old_backup:{}B", b.bytes),
+            });
+        }
+        for app_mnt in &audit.appimage_mounts {
+            protected_exclusions.push(ExcludedItem {
+                path: app_mnt.mountpoint.clone(),
+                reason: "manual_review_only:active_appimage_mount".to_string(),
+            });
+        }
+        for c in audit
+            .docker
+            .unhealthy_containers
+            .iter()
+            .chain(audit.podman.unhealthy_containers.iter())
+        {
+            protected_exclusions.push(ExcludedItem {
+                path: format!("{}://container/{}/{}", c.runtime, c.id, c.name),
+                reason: format!("manual_review_only:unhealthy_container:{}", c.status),
+            });
+        }
+    }
+
     items.sort_by(|a, b| {
         a.kind
             .cmp(&b.kind)
@@ -200,11 +424,31 @@ pub fn execute_plan_item(
     execute_plan_item_with_roots(plan, gate, ctx, &allowed)
 }
 
+pub fn execute_plan_item_with_linux(
+    plan: &RemediationPlan,
+    gate: &ExecutionGate,
+    ctx: &ProtectionContext,
+    allowed_tmp: &[PathBuf],
+) -> Result<PlanItem, SjError> {
+    let allowed_trash = default_trash_paths(&ctx.home_dir);
+    execute_plan_item_inner(plan, gate, ctx, &allowed_trash, allowed_tmp)
+}
+
 pub fn execute_plan_item_with_roots(
     plan: &RemediationPlan,
     gate: &ExecutionGate,
     ctx: &ProtectionContext,
     allowed_trash_roots: &[PathBuf],
+) -> Result<PlanItem, SjError> {
+    execute_plan_item_inner(plan, gate, ctx, allowed_trash_roots, &allowed_tmp_roots())
+}
+
+fn execute_plan_item_inner(
+    plan: &RemediationPlan,
+    gate: &ExecutionGate,
+    ctx: &ProtectionContext,
+    allowed_trash_roots: &[PathBuf],
+    allowed_tmp: &[PathBuf],
 ) -> Result<PlanItem, SjError> {
     if !gate.execute {
         return Err(SjError::ExecutionGate(
@@ -239,7 +483,11 @@ pub fn execute_plan_item_with_roots(
             ))
         })?;
 
-    safe_remove_plan_item(&item, ctx, allowed_trash_roots)?;
+    if is_linux_command_kind(&item.kind) {
+        execute_linux_command_item(&item)?;
+    } else {
+        safe_remove_plan_item_with_roots(&item, ctx, allowed_trash_roots, allowed_tmp)?;
+    }
 
     Ok(item)
 }
@@ -342,7 +590,12 @@ pub fn execute_selection_with_roots(
         failed: Vec::new(),
     };
     for item in items {
-        match safe_remove_plan_item(&item, ctx, allowed_trash_roots) {
+        let res = if is_linux_command_kind(&item.kind) {
+            execute_linux_command_item(&item)
+        } else {
+            safe_remove_plan_item(&item, ctx, allowed_trash_roots)
+        };
+        match res {
             Ok(()) => outcome.executed.push(item),
             Err(e) => outcome.failed.push((item, e.to_string())),
         }

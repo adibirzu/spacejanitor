@@ -1,15 +1,17 @@
 use clap::{Parser, Subcommand};
 use sj_core::{
+    linux::{collect_blockers_report, collect_memory_report, discover_linux_audit},
     orphans::{inspect_orphans, OrphanOptions},
     plan::{
-        build_remediation_plan, execute_plan_item, execute_selection, select_by_paths,
-        selection_sha256 as selection_sha256_fn, ExecutionGate, PlanOptions, SelectionGate,
+        build_remediation_plan_with_linux, execute_plan_item, execute_selection, select_by_paths,
+        selection_sha256 as selection_sha256_fn, ExecutionGate, LinuxPlanOptions, PlanOptions,
+        SelectionGate,
     },
     protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
     scan::{scan_directory, ScanOptions},
     trash::{default_trash_paths, discover_trash_at},
-    SjError, SCHEMA_BLOCKERS_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1,
-    SCHEMA_PROTECT_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
+    SjError, SCHEMA_BLOCKERS_V1, SCHEMA_LINUX_AUDIT_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1,
+    SCHEMA_PROPOSAL_V1, SCHEMA_PROTECT_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
 };
 use std::env;
 use std::path::PathBuf;
@@ -81,6 +83,9 @@ enum Commands {
         /// (OFF by default; unreviewed, experimental)
         #[arg(long, default_value_t = false)]
         include_orphans: bool,
+        /// Include Linux diagnostics cleanup candidates (user caches, stale /tmp, docker/podman/journald/apt)
+        #[arg(long, default_value_t = false)]
+        include_linux: bool,
         /// Override trash directory path
         #[arg(long)]
         trash_path: Option<PathBuf>,
@@ -150,6 +155,33 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
+    /// Audit Linux storage consumers, mounts, containers, journald, caches, and systemd units
+    LinuxAudit {
+        /// Home/root directory for user cache & model discovery (defaults to HOME)
+        #[arg(long)]
+        path: Option<PathBuf>,
+        /// Optional /tmp directory override
+        #[arg(long)]
+        tmp_path: Option<PathBuf>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Detect kernel/VFS blockers and systemd / podman healthcheck unit failures
+    Blockers {
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Audit true memory footprint (RAM + swap) across processes
+    Memory {
+        /// Maximum number of processes to include
+        #[arg(long, default_value_t = 15)]
+        top: usize,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
 }
 
 enum CliError {
@@ -190,6 +222,7 @@ fn print_doctor(json_mode: bool) -> Result<(), CliError> {
         SCHEMA_BLOCKERS_V1,
         SCHEMA_ORPHANS_V1,
         SCHEMA_PROPOSAL_V1,
+        SCHEMA_LINUX_AUDIT_V1,
     ];
 
     if json_mode {
@@ -237,6 +270,66 @@ fn run() -> Result<(), CliError> {
     match cli.command {
         Commands::Doctor { json } => {
             print_doctor(json)?;
+        }
+        Commands::LinuxAudit {
+            path,
+            tmp_path,
+            json,
+        } => {
+            let home = path.unwrap_or_else(|| ctx.home_dir.clone());
+            let report = discover_linux_audit(&home, tmp_path.as_deref());
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "linux-audit: {}/{} | mounts={} appimages={} docker_exited={} podman_exited={} journald={}B apt={}B systemd_sys_failed={} systemd_user_failed={}",
+                    report.os,
+                    report.arch,
+                    report.mounts.len(),
+                    report.appimage_mounts.len(),
+                    report.docker.exited_containers.len(),
+                    report.podman.exited_containers.len(),
+                    report.journald.bytes,
+                    report.package_caches.apt_archives_bytes,
+                    report.systemd.system_failed.len(),
+                    report.systemd.user_failed.len(),
+                );
+            }
+        }
+        Commands::Blockers { json } => {
+            let report = collect_blockers_report();
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!("blockers: status={} counters={}", report.status, report.counters.len());
+                for c in &report.counters {
+                    println!("  {}: {}/{} ({}%) [{}]", c.name, c.current, c.max, c.percent, c.status);
+                }
+            }
+        }
+        Commands::Memory { top, json } => {
+            let report = collect_memory_report(top);
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "memory: status={} free={}B total={}B swap_used={}B procs={}",
+                    report.status,
+                    report.free_bytes,
+                    report.total_bytes,
+                    report.swap_used_bytes,
+                    report.processes.len()
+                );
+            }
         }
         Commands::Protect {
             paths,
@@ -398,6 +491,7 @@ fn run() -> Result<(), CliError> {
             path,
             include_trash,
             include_orphans,
+            include_linux,
             trash_path,
             depth,
             execute,
@@ -422,7 +516,7 @@ fn run() -> Result<(), CliError> {
                 ));
             }
             // Orphan scanning is OFF unless explicitly requested; a bare `sj plan` is trash only.
-            let (inc_trash, inc_orphans) = if !include_trash && !include_orphans {
+            let (inc_trash, inc_orphans) = if !include_trash && !include_orphans && !include_linux {
                 (true, false)
             } else {
                 (include_trash, include_orphans)
@@ -436,7 +530,15 @@ fn run() -> Result<(), CliError> {
                 trash_path_override: trash_path,
                 orphan_max_depth: depth,
             };
-            let plan = build_remediation_plan(&path, &ctx, &opts)?;
+            let plan = build_remediation_plan_with_linux(
+                &path,
+                &ctx,
+                &opts,
+                &LinuxPlanOptions {
+                    include_linux,
+                    ..Default::default()
+                },
+            )?;
             if execute && selection_sha256.is_some() {
                 let gate = SelectionGate {
                     execute,

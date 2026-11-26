@@ -10,8 +10,16 @@ import {
   collectBlockers,
   collectMcpAudit as _collectMcpAudit,
   collectCleanableCaches as _collectCleanableCaches,
+  collectLinuxAudit as _collectLinuxAudit,
   collectSummary as _collectSummary,
   normalizeReportEnvelope,
+  parseProcMounts,
+  parseLinuxMeminfo,
+  parseProcStatusVmSwap,
+  parseSystemctlUnits,
+  parseLinuxProcessStates,
+  parseHumanSize,
+  classifyLinuxMount,
 } from "./telemetry.mjs";
 import {
   validateLoopbackSlmUrl,
@@ -48,7 +56,18 @@ export {
   validateLoopbackSlmUrl,
   formatToon,
   normalizeReportEnvelope,
+  parseProcMounts,
+  parseLinuxMeminfo,
+  parseProcStatusVmSwap,
+  parseSystemctlUnits,
+  parseLinuxProcessStates,
+  parseHumanSize,
+  classifyLinuxMount,
 };
+
+export function collectLinuxAudit(options = {}) {
+  return _collectLinuxAudit({ ...options, isProtectedFn: isProtectedPath });
+}
 
 export function collectCleanableCaches(options = {}) {
   return _collectCleanableCaches({ ...options, isProtectedFn: isProtectedPath });

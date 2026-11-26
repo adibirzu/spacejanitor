@@ -34,7 +34,29 @@ export function formatToon(rawReport) {
     for (const c of report.counters || []) {
       lines.push(`  - ${c.name}: ${c.current}/${c.max} (${c.percent}%) [${c.status}]`);
     }
-    if ((report.counters || []).length === 0) lines.push("  - no_kernel_blockers_detected");
+    if (report.systemd) {
+      for (const u of report.systemd.systemFailed || []) {
+        lines.push(`  - systemd[system]: ${u.unit} (${u.active}/${u.sub})`);
+      }
+      for (const u of report.systemd.userFailed || []) {
+        lines.push(`  - systemd[user]: ${u.unit} (${u.active}/${u.sub})${u.isPodmanHealthcheck ? " [PODMAN_HEALTHCHECK]" : ""}`);
+      }
+    }
+    if ((report.counters || []).length === 0 && !(report.systemd?.systemFailed?.length || report.systemd?.userFailed?.length)) {
+      lines.push("  - no_kernel_blockers_detected");
+    }
+  } else if (report.schema === "spacejanitor.linux_audit.v1") {
+    lines.push(`host: ${report.os}/${report.arch} | mounts: ${(report.mounts || []).length} | appimage_mounts: ${(report.appimageMounts || []).length}`);
+    const dk = report.docker || {};
+    const pm = report.podman || {};
+    const dkBuildGiB = ((dk.buildCacheReclaimableBytes ?? dk.df?.buildCacheReclaimableBytes ?? 0) / 1024 ** 3).toFixed(2);
+    const dkImgGiB = ((dk.imagesReclaimableBytes ?? dk.df?.imagesReclaimableBytes ?? 0) / 1024 ** 3).toFixed(2);
+    lines.push(`docker: exited=${(dk.exitedContainers || []).length} unhealthy=${(dk.unhealthyContainers || []).length} dangling_imgs=${(dk.danglingImages || []).length} img_reclaim_gib=${dkImgGiB} docker_build_cache_gib=${dkBuildGiB}`);
+    lines.push(`podman: exited=${(pm.exitedContainers || []).length} unhealthy=${(pm.unhealthyContainers || []).length}`);
+    const jMiB = ((report.journald?.bytes || 0) / 1024 ** 2).toFixed(1);
+    const aptMiB = ((report.packageCaches?.aptArchivesBytes || 0) / 1024 ** 2).toFixed(1);
+    lines.push(`journald_mib: ${jMiB} | apt_archives_mib: ${aptMiB} | stale_tmp: ${(report.staleTmpEntries || []).length}`);
+    lines.push(`manual_review: model_caches=${(report.modelCaches || []).length} old_backups=${(report.oldBackups || []).length}`);
   } else if (report.schema === "spacejanitor.mcp_audit.v1") {
     lines.push(`servers: ${report.totalServers} | duplicates: ${report.duplicateCount} | secret_risks: ${report.secretRiskCount}`);
     for (const s of (report.servers || []).slice(0, 10)) {

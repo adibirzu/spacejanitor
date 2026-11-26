@@ -92,6 +92,16 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "/sys",
     "/dev",
     "/boot",
+    "/run",
+    "/snap",
+    "/lost+found",
+    "/var/lib/dpkg",
+    "/var/lib/rpm",
+    "/var/lib/systemd",
+    "/var/lib/docker",
+    "/var/lib/containers",
+    "/var/log/journal",
+    "/var/cache/apt",
 ];
 
 /// Protected as the directory itself only (children are governed by the other rules).

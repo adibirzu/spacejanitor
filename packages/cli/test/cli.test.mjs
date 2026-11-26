@@ -33,6 +33,7 @@ test("AXI CLI emits compact TOON by default and valid v1 JSON with --json", () =
     ["mcp-audit", "spacejanitor.mcp_audit.v1"],
     ["orphans", "spacejanitor.orphans.v1"],
     ["trash", "spacejanitor.trash.v1"],
+    ["linux-audit", "spacejanitor.linux_audit.v1"],
   ];
 
   for (const [cmd, expectedSchema] of commands) {
@@ -150,10 +151,12 @@ test("B-R3-2: remediate asks sj for trash with and without --include-orphans (or
     const env = { SPACEJANITOR_SJ_BIN: fake, SPACEJANITOR_NO_SJ: "", HOME: base };
     runCli(["remediate", "--json", "--path", base], env);
     runCli(["remediate", "--json", "--path", base, "--include-orphans"], env);
+    runCli(["remediate", "--json", "--path", base, "--include-linux"], env);
     const lines = fs.readFileSync(log, "utf8").trim().split("\n");
-    assert.equal(lines.length, 2);
-    assert.ok(lines[0].includes("--include-trash") && !lines[0].includes("--include-orphans"), lines[0]);
+    assert.equal(lines.length, 3);
+    assert.ok(lines[0].includes("--include-trash") && !lines[0].includes("--include-orphans") && !lines[0].includes("--include-linux"), lines[0]);
     assert.ok(lines[1].includes("--include-trash") && lines[1].includes("--include-orphans"), lines[1]);
+    assert.ok(lines[2].includes("--include-trash") && lines[2].includes("--include-linux"), lines[2]);
   } finally {
     fs.rmSync(base, { recursive: true, force: true });
   }

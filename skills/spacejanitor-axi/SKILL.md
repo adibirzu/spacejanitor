@@ -29,7 +29,8 @@ npx spacejanitor-axi blockers [--json]    # kernel vnodes / inotify / handles / 
 npx spacejanitor-axi mcp-audit [--json]   # MCP process fan-out, duplicates & redacted secret risks
 npx spacejanitor-axi orphans --include-orphans [--json]  # EXPERIMENTAL, opt-in: runs git inside repos found on disk; without the flag reports "not scanned"
 npx spacejanitor-axi trash [--json]       # OS Trash / Recycle Bin audit
-npx spacejanitor-axi remediate [--json]   # dry-run SHA-256 plan preview only (zero deletions)
+npx spacejanitor-axi linux-audit [--json] # Linux mounts, Docker/Podman, journald, apt/user caches, AppImages, models & systemd audit
+npx spacejanitor-axi remediate [--include-linux] [--json] # dry-run SHA-256 plan preview only (zero deletions)
 ```
 
 ## Exit Codes
