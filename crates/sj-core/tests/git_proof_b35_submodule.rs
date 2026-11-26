@@ -27,7 +27,14 @@ fn submodule_clean_filter_never_runs_during_the_parent_proof() {
     let repo = clean_pushed_repo(root, "parent");
     git(
         &repo,
-        &["-c", "protocol.file.allow=always", "submodule", "add", sub_origin.to_str().unwrap(), "sub"],
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            sub_origin.to_str().unwrap(),
+            "sub",
+        ],
     );
     git(&repo, &["commit", "-m", "add sub"]);
     git(&repo, &["push", "origin", "HEAD"]);
@@ -40,7 +47,13 @@ fn submodule_clean_filter_never_runs_during_the_parent_proof() {
     assert!(module_cfg.exists(), "submodule gitdir config must exist");
     git(
         root,
-        &["config", "--file", module_cfg.to_str().unwrap(), "filter.evil.clean", shim.to_str().unwrap()],
+        &[
+            "config",
+            "--file",
+            module_cfg.to_str().unwrap(),
+            "filter.evil.clean",
+            shim.to_str().unwrap(),
+        ],
     );
     // stat-dirty a tracked submodule file so status must re-hash it through the clean filter
     let status = std::process::Command::new("touch")
@@ -53,7 +66,10 @@ fn submodule_clean_filter_never_runs_during_the_parent_proof() {
     let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
     let report = inspect_orphans(root, &ctx, &OrphanOptions { max_depth: 5 }).unwrap();
 
-    assert!(!marker.exists(), "submodule clean filter executed during the proof (B35)");
+    assert!(
+        !marker.exists(),
+        "submodule clean filter executed during the proof (B35)"
+    );
     assert!(
         report
             .safe_to_prune

@@ -94,7 +94,11 @@ impl AttackerProxy {
                 }
             }
         });
-        Self { port, stop, captured }
+        Self {
+            port,
+            stop,
+            captured,
+        }
     }
 
     pub fn url(&self) -> String {

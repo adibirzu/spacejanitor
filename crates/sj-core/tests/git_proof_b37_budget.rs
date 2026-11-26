@@ -38,21 +38,38 @@ fn timeout_kills_the_whole_process_group_not_just_git() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path();
     let repo = clean_pushed_repo(root, "stall");
-    git(&repo, &["remote", "set-url", "origin", "ssh://stall.invalid/repo.git"]);
+    git(
+        &repo,
+        &[
+            "remote",
+            "set-url",
+            "origin",
+            "ssh://stall.invalid/repo.git",
+        ],
+    );
     let (pids, path) = stall_shim(root);
     let old_path = std::env::var("PATH").unwrap();
     std::env::set_var("PATH", path);
     let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
-    let _ = inspect_orphans_with_limits(root, &ctx, &OrphanOptions { max_depth: 5 }, lim(2, 60)).unwrap();
+    let _ = inspect_orphans_with_limits(root, &ctx, &OrphanOptions { max_depth: 5 }, lim(2, 60))
+        .unwrap();
     std::env::set_var("PATH", old_path);
 
     std::thread::sleep(Duration::from_millis(500));
     let recorded = fs::read_to_string(&pids).unwrap_or_default();
-    assert!(!recorded.trim().is_empty(), "the ssh shim never ran; probe is not exercising the proof");
-    for pid in recorded.lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
+    assert!(
+        !recorded.trim().is_empty(),
+        "the ssh shim never ran; probe is not exercising the proof"
+    );
+    for pid in recorded
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+    {
         let alive = pid_alive(pid);
         if alive {
-            let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+            let _ = std::process::Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .status();
         }
         assert!(!alive, "ssh child {pid} survived the git timeout (B37)");
     }
@@ -65,7 +82,15 @@ fn scan_wide_deadline_bounds_total_time_across_stalled_remotes() {
     let root = tmp.path();
     for i in 0..4 {
         let repo = clean_pushed_repo(root, &format!("stall{i}"));
-        git(&repo, &["remote", "set-url", "origin", "ssh://stall.invalid/repo.git"]);
+        git(
+            &repo,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                "ssh://stall.invalid/repo.git",
+            ],
+        );
     }
     let (pids, path) = stall_shim(root);
     let old_path = std::env::var("PATH").unwrap();
@@ -73,17 +98,31 @@ fn scan_wide_deadline_bounds_total_time_across_stalled_remotes() {
     let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
     let t0 = Instant::now();
     // 4 stalled remotes at 3s per call would take 12s+; the scan deadline is 4s
-    let report = inspect_orphans_with_limits(root, &ctx, &OrphanOptions { max_depth: 5 }, lim(3, 4)).unwrap();
+    let report =
+        inspect_orphans_with_limits(root, &ctx, &OrphanOptions { max_depth: 5 }, lim(3, 4))
+            .unwrap();
     let took = t0.elapsed();
     std::env::set_var("PATH", old_path);
-    for pid in fs::read_to_string(&pids).unwrap_or_default().lines().filter_map(|l| l.trim().parse::<i32>().ok()) {
-        let _ = std::process::Command::new("kill").args(["-9", &pid.to_string()]).status();
+    for pid in fs::read_to_string(&pids)
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|l| l.trim().parse::<i32>().ok())
+    {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid.to_string()])
+            .status();
     }
 
-    assert!(took < Duration::from_secs(9), "scan took {took:?}; no scan-wide deadline (B37)");
+    assert!(
+        took < Duration::from_secs(9),
+        "scan took {took:?}; no scan-wide deadline (B37)"
+    );
     assert!(report.safe_to_prune.is_empty());
     assert!(
-        report.blocked.iter().any(|b| b.reasons.iter().any(|r| r == "scan_budget_exceeded")),
+        report
+            .blocked
+            .iter()
+            .any(|b| b.reasons.iter().any(|r| r == "scan_budget_exceeded")),
         "repos past the deadline must say so: {:?}",
         report.blocked
     );
@@ -97,7 +136,11 @@ fn fifo_at_git_config_cannot_hang_the_scan() {
     let repo = clean_pushed_repo(&root, "fifo");
     let cfg = repo.join(".git/config");
     fs::remove_file(&cfg).unwrap();
-    assert!(std::process::Command::new("mkfifo").arg(&cfg).status().unwrap().success());
+    assert!(std::process::Command::new("mkfifo")
+        .arg(&cfg)
+        .status()
+        .unwrap()
+        .success());
 
     let (tx, rx) = std::sync::mpsc::channel();
     let r2 = root.clone();
@@ -109,5 +152,9 @@ fn fifo_at_git_config_cannot_hang_the_scan() {
     let finished = rx.recv_timeout(Duration::from_secs(15));
     // release any reader still blocked on the FIFO so the probe never leaks a hung process
     let _ = fs::OpenOptions::new().read(true).write(true).open(&cfg);
-    assert_eq!(finished, Ok(true), "scan hung on a FIFO planted at .git/config (B37)");
+    assert_eq!(
+        finished,
+        Ok(true),
+        "scan hung on a FIFO planted at .git/config (B37)"
+    );
 }

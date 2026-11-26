@@ -9,7 +9,7 @@
     "include.path", "includeif.gitdir:/x/.path",
     "diff.external", "diff.x.textconv", "diff.x.command",
     "gpg.program", "gpg.ssh.program", "gpg.x509.program",
-    "uploadpack.packobjectshook", "http.proxy", "http.sslcertpasswordprotected", "ssh.variant.x"
+    "uploadpack.packobjectshook", "http.proxy", "http.sslcertpasswordprotected", "http.https://example.com/.proxy", "http.https://example.com/.sslverify", "http.sslcainfo", "http.extraheader", "ssh.variant.x"
   ],
   "allow": [
     "core.bare", "core.filemode", "core.repositoryformatversion", "core.worktree", "core.fsmonitor", "core.hookspath",
