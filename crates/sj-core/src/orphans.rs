@@ -241,10 +241,17 @@ fn empty_home_dir() -> PathBuf {
 const USER_CONFIG_ALLOWLIST: &[&str] = &["core.autocrlf", "core.eol", "core.safecrlf"];
 
 fn sanitized_user_config() -> PathBuf {
-    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    FILE.get_or_init(|| {
+    // cached per distinct (GIT_CONFIG_GLOBAL, HOME): stable in production, correct if it changes
+    type EnvKey = (Option<OsString>, Option<OsString>);
+    static CACHE: std::sync::Mutex<Vec<(EnvKey, PathBuf)>> = std::sync::Mutex::new(Vec::new());
+    let key = (std::env::var_os("GIT_CONFIG_GLOBAL"), std::env::var_os("HOME"));
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some((_, p)) = cache.iter().find(|(k, _)| *k == key) {
+        return p.clone();
+    }
+    let path = {
         let home = empty_home_dir();
-        let path = home.join("gitconfig");
+        let path = home.join(format!("gitconfig-{}", cache.len()));
         let mut body = String::from("[core]\n");
         for key in USER_CONFIG_ALLOWLIST {
             let mut cmd = Command::new("git");
@@ -267,8 +274,9 @@ fn sanitized_user_config() -> PathBuf {
         }
         let _ = std::fs::write(&path, body);
         path
-    })
-    .clone()
+    };
+    cache.push((key, path.clone()));
+    path
 }
 
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
@@ -1157,6 +1165,10 @@ fn validate_single_repo_at(
             let mut remote_tips: BTreeMap<String, Vec<String>> = BTreeMap::new();
             let mut remote_query_failed = false;
             for remote_name in &remotes {
+                if proof_start.elapsed() >= active_limits().repo_budget || scan_deadline_passed() {
+                    remote_query_failed = true;
+                    break;
+                }
                 let target_override = if actual_repo != logical_repo {
                     let logical_abs = match anchor_to_cwd(logical_repo) {
                         Ok(p) => p,

@@ -1,5 +1,5 @@
 {
-  "comment": "Git config keys (as printed by `git config --name-only`) that can make git EXECUTE a command during a read-only proof (status/ls-remote). A repository whose local or worktree config sets any of them is blocked with repo_config_can_execute. Run by crates/sj-core (executable_config_key) and packages/core (classifyExecutableConfigKey).",
+  "comment": "Git config keys (as printed by `git config --name-only`) that can make git EXECUTE a command during a read-only proof (status/ls-remote). A repository whose local or worktree config sets any of them is blocked with repo_config_can_execute. Run by crates/sj-core (executable_config_key).",
   "block": [
     "filter.evil.clean", "filter.evil.smudge", "filter.evil.process",
     "remote.origin.uploadpack", "remote.origin.receivepack", "remote.origin.vcs", "remote.origin.proxy",
