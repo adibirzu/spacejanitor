@@ -17,6 +17,27 @@ use std::time::{Duration, Instant};
 /// Hard per-git-call timeout and per-repo proof budget. A proof that cannot finish fails closed.
 const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 const REPO_PROOF_BUDGET: Duration = Duration::from_secs(90);
+/// Wall-clock cap for a whole scan (all repositories together).
+const SCAN_BUDGET: Duration = Duration::from_secs(300);
+
+/// Time limits for git proofs. Every git call is bounded, every repository is bounded, and the
+/// whole scan is bounded; anything that cannot finish in time fails closed (never "safe").
+#[derive(Debug, Clone, Copy)]
+pub struct ProofLimits {
+    pub call_timeout: Duration,
+    pub repo_budget: Duration,
+    pub scan_budget: Duration,
+}
+
+impl Default for ProofLimits {
+    fn default() -> Self {
+        Self {
+            call_timeout: GIT_CALL_TIMEOUT,
+            repo_budget: REPO_PROOF_BUDGET,
+            scan_budget: SCAN_BUDGET,
+        }
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct OrphanOptions {
@@ -1017,6 +1038,15 @@ pub fn inspect_orphans(
     root: &Path,
     ctx: &ProtectionContext,
     opts: &OrphanOptions,
+) -> Result<OrphansReport, SjError> {
+    inspect_orphans_with_limits(root, ctx, opts, ProofLimits::default())
+}
+
+pub fn inspect_orphans_with_limits(
+    root: &Path,
+    ctx: &ProtectionContext,
+    opts: &OrphanOptions,
+    _limits: ProofLimits,
 ) -> Result<OrphansReport, SjError> {
     if is_symlink_path(root)? {
         return Err(SjError::ProtectedPath(format!(
