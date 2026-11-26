@@ -150,3 +150,10 @@ test("packaging: linux executableName is a safe path component (not the scoped n
   const cfg = fs.readFileSync(path.join(repoRoot, "apps/desktop/electron-builder.yml"), "utf8");
   assert.match(cfg, /^linux:\n(?:[ \t].*\n)*?[ \t]+executableName:\s*spacejanitor\s*$/m);
 });
+
+test("packaging: .deb metadata (homepage + maintainer) is configured so the deb target can build", () => {
+  const cfg = fs.readFileSync(path.join(repoRoot, "apps/desktop/electron-builder.yml"), "utf8");
+  assert.match(cfg, /^linux:\n(?:[ \t].*\n)*?[ \t]+maintainer:\s*\S.*<\S+@\S+>/m);
+  const pkg = JSON.parse(fs.readFileSync(path.join(repoRoot, "apps/desktop/package.json"), "utf8"));
+  assert.match(pkg.homepage, /^https:\/\//);
+});

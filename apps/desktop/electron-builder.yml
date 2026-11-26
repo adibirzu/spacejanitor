@@ -48,6 +48,8 @@ linux:
   category: System
   # Without this electron-builder derives the name from the scoped npm package (@spacejanitor/desktop).
   executableName: spacejanitor
+  # Required by the .deb target; a no-reply address so no personal email ships in the package.
+  maintainer: SpaceJanitor contributors <noreply@users.noreply.github.com>
   icon: build/icon.png
   artifactName: SpaceJanitor-${version}-${arch}.${ext}
   target:
