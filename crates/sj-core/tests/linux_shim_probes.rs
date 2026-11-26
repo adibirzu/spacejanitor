@@ -69,3 +69,70 @@ esac"#,
     assert_eq!(audit.podman.exited_containers.len(), 1);
     assert_eq!(audit.podman.exited_containers[0].size_bytes, 7_000_000);
 }
+
+const SECRETS: [&str; 6] = [
+    "PROBE_NAME_SECRET",
+    "PROBE_IMAGE_SECRET",
+    "PROBE_STATUS_SECRET",
+    "PROBE_STATE_SECRET",
+    "PROBE_UNIT_DESC_SECRET",
+    "PROBE_UNIT_NAME_SECRET",
+];
+
+fn assert_no_secrets(label: &str, text: &str) {
+    for s in SECRETS {
+        assert!(!text.contains(s), "{label} leaked {s}: {text}");
+    }
+}
+
+/// PR #18 probe review (c): container metadata and systemd descriptions are free text.
+#[test]
+fn container_metadata_never_reaches_output_unredacted() {
+    let rows = [
+        r#"{"ID":"abc123","Names":"worker --token=PROBE_NAME_SECRET","Image":"user:PROBE_IMAGE_SECRET@registry.example.com/app:1","Status":"Exited (0) 2 days ago sk-ant-PROBE_STATUS_SECRET","State":"exited PROBE_STATE_SECRET"}"#,
+        r#"{"ID":"-f","Names":"flaglike","Image":"x","Status":"Exited (0) 1 day ago","State":"exited"}"#,
+        r#"{"ID":"ok1","Names":"plain_name-1","Image":"nginx:1.27","Status":"Exited (0) 3 days ago","State":"exited"}"#,
+    ]
+    .join("\n");
+    let docker = sj_core::linux::parse_docker_containers(&rows);
+    let json = serde_json::to_string(&docker).unwrap();
+    assert_no_secrets("docker containers", &json);
+    assert!(docker.iter().all(|c| !c.id.starts_with('-')), "flag-like container ids must be dropped: {json}");
+    let ok = docker.iter().find(|c| c.id == "ok1").expect("plain container kept");
+    assert_eq!(ok.name, "plain_name-1");
+    assert_eq!(ok.image, "nginx:1.27");
+    assert_eq!(ok.status, "Exited (0) 3 days ago");
+
+    let podman_raw = r#"[{"Id":"p1","Names":["pod-PROBE_NAME_SECRET=1"],"Image":"quay.io/app:PROBE_IMAGE_SECRET@x","State":"exited","Status":"Exited (0) 5d ago PROBE_STATUS_SECRET"}]"#;
+    let podman = sj_core::linux::parse_podman_ps(podman_raw);
+    assert_no_secrets("podman containers", &serde_json::to_string(&podman).unwrap());
+
+    let units = "PROBE_UNIT_NAME_SECRET=x.service loaded failed failed Backup --password=PROBE_UNIT_DESC_SECRET\nok.service loaded failed failed Plain description\n";
+    let issues = sj_core::linux::parse_systemctl_failed(units, "system");
+    assert_no_secrets("systemd units", &serde_json::to_string(&issues).unwrap());
+    assert!(issues.iter().any(|u| u.unit == "ok.service"));
+}
+
+/// End to end: shimmed runtime output goes through audit + plan and nothing leaks.
+#[test]
+fn shimmed_runtime_secrets_do_not_reach_audit_or_plan_output() {
+    let td = tempfile::tempdir().unwrap();
+    let shims = td.path().join("bin");
+    fs::create_dir_all(&shims).unwrap();
+    write_shim(
+        &shims,
+        "docker",
+        r#"case "$1" in
+ ps) echo '{"ID":"abc123","Names":"w --token=PROBE_NAME_SECRET","Image":"x:PROBE_IMAGE_SECRET@h","Status":"Exited (0) 2 days ago PROBE_STATUS_SECRET","State":"exited","Size":"1MB"}';;
+ inspect) echo exited;;
+esac"#,
+    );
+    write_shim(&shims, "podman", "echo '[]'");
+    let home = td.path().join("home");
+    let tmp = td.path().join("tmp");
+    fs::create_dir_all(&home).unwrap();
+    fs::create_dir_all(&tmp).unwrap();
+    let audit = with_path(&shims, || sj_core::linux::discover_linux_audit(&home, Some(&tmp)));
+    assert_eq!(audit.docker.exited_containers.len(), 1);
+    assert_no_secrets("audit json", &serde_json::to_string(&audit).unwrap());
+}

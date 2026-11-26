@@ -336,3 +336,31 @@ test("collectLinuxAudit asks docker/podman for container sizes (Size is empty wi
   assert.equal(audit.docker.exitedContainers[0].sizeBytes, 5e6);
   assert.equal(audit.podman.exitedContainers[0].sizeBytes, 7e6);
 });
+
+test("container and systemd free text never reaches JSON or TOON unredacted", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-redact-"));
+  const secrets = ["PROBE_NAME_SECRET", "PROBE_IMAGE_SECRET", "PROBE_STATUS_SECRET", "PROBE_UNIT_DESC_SECRET", "PROBE_UNIT_NAME_SECRET"];
+  const execFn = async (cmd, args) => {
+    if (cmd === "docker" && args[0] === "ps") {
+      return {
+        ok: true,
+        stdout: [
+          JSON.stringify({ ID: "abc123", Names: "w --token=PROBE_NAME_SECRET", Image: "x:PROBE_IMAGE_SECRET@h", Status: "Exited (0) 2 days ago PROBE_STATUS_SECRET", State: "exited" }),
+          JSON.stringify({ ID: "-f", Names: "flaglike", Image: "x", Status: "Exited (0) 1 day ago", State: "exited" }),
+          JSON.stringify({ ID: "ok1", Names: "plain_name-1", Image: "nginx:1.27", Status: "Exited (0) 3 days ago", State: "exited" }),
+        ].join("\n"),
+      };
+    }
+    if (cmd === "systemctl") {
+      return { ok: true, stdout: "PROBE_UNIT_NAME_SECRET=x.service loaded failed failed Backup --password=PROBE_UNIT_DESC_SECRET\nok.service loaded failed failed Plain description\n" };
+    }
+    return { ok: false, stdout: "" };
+  };
+  const audit = await collectLinuxAudit({ platformOverride: "linux", homeDir: home, tmpDir: path.join(home, "tmp"), aptArchivesDir: path.join(home, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", execFn });
+  const blockers = await collectBlockers({ platformOverride: "linux", execFn });
+  const text = JSON.stringify(audit) + JSON.stringify(blockers) + formatToon(blockers) + formatToon(audit);
+  for (const s of secrets) assert.ok(!text.includes(s), `leaked ${s}: ${text.slice(0, 400)}`);
+  assert.deepEqual(audit.docker.exitedContainers.map((c) => c.id).sort(), ["abc123", "ok1"]);
+  assert.ok(audit.docker.exitedContainers.some((c) => c.name === "plain_name-1" && c.image === "nginx:1.27"));
+  assert.ok(!audit.docker.exitedContainers.some((c) => c.id.startsWith("-")));
+});

@@ -416,7 +416,132 @@ pub fn parse_docker_system_df(stdout: &str) -> DockerDfSummary {
     summary
 }
 
-pub fn parse_docker_containers(stdout: &str) -> Vec<ContainerInfo> {
+
+// ---------------------------------------------------------------------------------------------
+// Closed-vocabulary sanitizers for runtime-provided free text (container/unit metadata).
+// Anything that is not plainly a name/ref/status is replaced by a hash label; nothing is judged
+// by "does it look secret" (see redact.rs).
+// ---------------------------------------------------------------------------------------------
+
+fn short_hash(raw: &str) -> String {
+    crate::redact::hash8(raw)
+}
+
+/// Container or unit identifier safe to print and to embed in a plan ref: `[A-Za-z0-9][A-Za-z0-9_.:@\\-]*`.
+fn safe_name(raw: &str, prefix: &str) -> String {
+    let ok = !raw.is_empty()
+        && raw.len() <= 96
+        && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '@' | '\\'));
+    if ok {
+        raw.to_string()
+    } else {
+        format!("{prefix}-{}", short_hash(raw))
+    }
+}
+
+/// Image reference: `repo[:tag]` or `repo@sha256:...`. No userinfo, no whitespace.
+fn safe_image(raw: &str) -> String {
+    let (body, digest_ok) = match raw.split_once('@') {
+        Some((b, d)) => (b, d.starts_with("sha256:") && d[7..].chars().all(|c| c.is_ascii_hexdigit())),
+        None => (raw, true),
+    };
+    let ok = digest_ok
+        && !body.is_empty()
+        && raw.len() <= 200
+        && body.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && body
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '/'))
+        && !body.contains("//");
+    if raw.is_empty() {
+        String::new()
+    } else if ok {
+        raw.to_string()
+    } else {
+        format!("image-{}", short_hash(raw))
+    }
+}
+
+/// Runtime status text ("Exited (0) 2 days ago", "Up 3 hours (unhealthy)"): words, digits,
+/// parentheses only, and it must open with a known state word.
+fn safe_status(raw: &str) -> String {
+    const OPEN: [&str; 8] = ["up", "exited", "created", "dead", "paused", "restarting", "removing", "running"];
+    let low = raw.to_ascii_lowercase();
+    let first = low.split_whitespace().next().unwrap_or("");
+    let words_ok = raw
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '(' || c == ')')
+        && raw.len() <= 80;
+    // Every word after the opener must come from the status vocabulary or be numeric.
+    const VOCAB: [&str; 22] = [
+        "about", "an", "a", "less", "than", "second", "seconds", "minute", "minutes", "hour",
+        "hours", "day", "days", "week", "weeks", "month", "months", "year", "years", "ago",
+        "healthy", "unhealthy",
+    ];
+    let vocab_ok = low
+        .split_whitespace()
+        .skip(1)
+        .map(|w| w.trim_matches(|c| c == '(' || c == ')'))
+        .all(|w| {
+            w.is_empty()
+                || w.chars().all(|c| c.is_ascii_digit())
+                || VOCAB.contains(&w)
+                || matches!(w, "starting" | "paused" | "health:")
+        });
+    if OPEN.contains(&first) && words_ok && vocab_ok {
+        raw.to_string()
+    } else if raw.is_empty() {
+        String::new()
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
+/// systemd LOAD/ACTIVE/SUB columns: short lowercase words only.
+fn safe_token(raw: &str) -> String {
+    let ok = !raw.is_empty()
+        && raw.len() <= 24
+        && raw.chars().all(|c| c.is_ascii_lowercase() || c == '-');
+    if ok {
+        raw.to_string()
+    } else {
+        "unknown".to_string()
+    }
+}
+
+fn safe_state(raw: &str) -> String {
+    let low = raw.trim().to_ascii_lowercase();
+    if matches!(
+        low.as_str(),
+        "" | "running" | "exited" | "created" | "dead" | "paused" | "restarting" | "removing" | "stopped" | "configured"
+    ) {
+        low
+    } else {
+        "unknown".to_string()
+    }
+}
+
+/// Container ids are hex (docker) or hex/name (podman); reject anything that could be a flag.
+fn safe_container_id(raw: &str) -> bool {
+    !raw.is_empty()
+        && raw.len() <= 128
+        && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && raw.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Free text is never printed: only its presence is recorded.
+fn safe_description(raw: &str) -> String {
+    if raw.is_empty() {
+        String::new()
+    } else {
+        "<redacted>".to_string()
+    }
+}
+
+fn parse_docker_containers_raw(stdout: &str) -> Vec<ContainerInfo> {
     let mut out = Vec::new();
     for line in stdout.lines() {
         let line = line.trim();
@@ -514,7 +639,29 @@ pub fn parse_docker_dangling_images(stdout: &str) -> Vec<DanglingImage> {
     out
 }
 
+
+fn sanitize_containers(raw: Vec<ContainerInfo>) -> Vec<ContainerInfo> {
+    raw.into_iter()
+        .filter(|c| safe_container_id(&c.id))
+        .map(|mut c| {
+            c.name = safe_name(&c.name, "container");
+            c.image = safe_image(&c.image);
+            c.status = safe_status(&c.status);
+            c.state = safe_state(&c.state);
+            c
+        })
+        .collect()
+}
+
+pub fn parse_docker_containers(stdout: &str) -> Vec<ContainerInfo> {
+    sanitize_containers(parse_docker_containers_raw(stdout))
+}
+
 pub fn parse_podman_ps(stdout: &str) -> Vec<ContainerInfo> {
+    sanitize_containers(parse_podman_ps_raw(stdout))
+}
+
+fn parse_podman_ps_raw(stdout: &str) -> Vec<ContainerInfo> {
     let trimmed = stdout.trim();
     if trimmed.is_empty() {
         return Vec::new();
@@ -640,12 +787,12 @@ pub fn parse_systemctl_failed(stdout: &str, scope: &str) -> Vec<SystemdUnitIssue
             && (low_unit.contains("healthcheck") || low_desc.contains("healthcheck"))
             || low_unit.contains("healthcheck") && low_desc.contains("conmon");
         out.push(SystemdUnitIssue {
-            unit: unit.to_string(),
+            unit: safe_name(unit, "unit"),
             scope: scope.to_string(),
-            load: load.to_string(),
-            active: active.to_string(),
-            sub: sub.to_string(),
-            description,
+            load: safe_token(load),
+            active: safe_token(active),
+            sub: safe_token(sub),
+            description: safe_description(&description),
             is_podman_healthcheck,
         });
     }

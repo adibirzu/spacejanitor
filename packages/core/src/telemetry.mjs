@@ -2,6 +2,7 @@ import { isProtectedPath, protectPaths } from "./protect.mjs";
 import { SjGateError, runSj } from "./sjGate.mjs";
 import { redactSecrets, redactArgv } from "./redact.mjs";
 import { execFile } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -552,6 +553,61 @@ export async function collectMemory({ top = 15, redactFn = redactSecrets, platfo
   };
 }
 
+
+// Closed-vocabulary sanitizers for runtime-provided free text (mirrors crates/sj-core/src/linux.rs).
+// Anything that is not plainly a name/ref/status becomes a hash label; shapes are never "judged secret".
+function hash8(raw) {
+  return crypto.createHash("sha256").update(String(raw)).digest("hex").slice(0, 8);
+}
+
+export function safeName(raw, prefix) {
+  const v = String(raw ?? "");
+  return /^[A-Za-z0-9][A-Za-z0-9_.:@\\-]{0,95}$/.test(v) ? v : `${prefix}-${hash8(v)}`;
+}
+
+export function safeImage(raw) {
+  const v = String(raw ?? "");
+  if (!v) return "";
+  const [body, digest, ...extra] = v.split("@");
+  const digestOk = digest === undefined || (extra.length === 0 && /^sha256:[0-9a-fA-F]+$/.test(digest));
+  const ok = digestOk && v.length <= 200 && /^[A-Za-z0-9][A-Za-z0-9_.:/-]*$/.test(body) && !body.includes("//");
+  return ok ? v : `image-${hash8(v)}`;
+}
+
+const STATUS_OPEN = new Set(["up", "exited", "created", "dead", "paused", "restarting", "removing", "running"]);
+const STATUS_VOCAB = new Set([
+  "about", "an", "a", "less", "than", "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days",
+  "week", "weeks", "month", "months", "year", "years", "ago", "healthy", "unhealthy", "starting", "paused", "health:",
+]);
+export function safeStatus(raw) {
+  const v = String(raw ?? "");
+  if (!v) return "";
+  const words = v.toLowerCase().split(/\s+/).filter(Boolean);
+  const ok =
+    v.length <= 80 &&
+    /^[A-Za-z0-9 ()]+$/.test(v) &&
+    STATUS_OPEN.has(words[0]) &&
+    words.slice(1).every((w) => {
+      const t = w.replace(/^\(+|\)+$/g, "");
+      return t === "" || /^\d+$/.test(t) || STATUS_VOCAB.has(t);
+    });
+  return ok ? v : "<redacted>";
+}
+
+const STATE_WORDS = new Set(["", "running", "exited", "created", "dead", "paused", "restarting", "removing", "stopped", "configured"]);
+export function safeState(raw) {
+  const v = String(raw ?? "").trim().toLowerCase();
+  return STATE_WORDS.has(v) ? v : "unknown";
+}
+
+function safeToken(raw) {
+  return /^[a-z-]{1,24}$/.test(String(raw ?? "")) ? String(raw) : "unknown";
+}
+
+export function safeContainerId(raw) {
+  return /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/.test(String(raw ?? ""));
+}
+
 export function parseSystemctlUnits(stdout, scope = "system") {
   const units = [];
   for (const rawLine of String(stdout || "").split(/\r?\n/)) {
@@ -568,12 +624,12 @@ export function parseSystemctlUnits(stdout, scope = "system") {
         (lowUnit.includes("healthcheck") || lowDesc.includes("healthcheck"))) ||
       (lowUnit.includes("healthcheck") && lowDesc.includes("conmon"));
     units.push({
-      unit,
+      unit: safeName(unit, "unit"),
       scope,
-      load,
-      active,
-      sub,
-      description,
+      load: safeToken(load),
+      active: safeToken(active),
+      sub: safeToken(sub),
+      description: description ? "<redacted>" : "",
       isPodmanHealthcheck,
     });
   }
@@ -1088,7 +1144,7 @@ function parseContainerPs(stdout, runtime) {
   for (const obj of rows) {
     if (!obj || typeof obj !== "object") continue;
     const id = String(obj.Id || obj.ID || "");
-    if (!id) continue;
+    if (!safeContainerId(id)) continue;
     const name = Array.isArray(obj.Names) ? String(obj.Names[0] || id) : String(obj.Names || id);
     const status = String(obj.Status || "");
     const state = String(obj.State || "");
@@ -1103,10 +1159,10 @@ function parseContainerPs(stdout, runtime) {
     out.push({
       runtime,
       id,
-      name,
-      image: String(obj.Image || ""),
-      status,
-      state,
+      name: safeName(name, "container"),
+      image: safeImage(String(obj.Image || "")),
+      status: safeStatus(status),
+      state: safeState(state),
       sizeBytes:
         typeof obj.Size === "number"
           ? obj.Size
