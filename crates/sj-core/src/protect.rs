@@ -39,6 +39,7 @@ pub const PROTECTED_HOME_SUBPATHS: &[&str] = &[
     ".mozilla",
     ".terraform.d",
     ".claude",
+    ".claude.json",
     ".codex",
     ".zshrc",
     ".bashrc",
@@ -88,6 +89,12 @@ pub const PROTECTED_SYSTEM_ROOTS: &[&str] = &[
     "C:/Windows",
     "C:/Program Files",
     "C:/Program Files (x86)",
+    "/ProgramData",
+    "C:/ProgramData",
+    "/PROGRA~1",
+    "/PROGRA~2",
+    "C:/PROGRA~1",
+    "C:/PROGRA~2",
     "/proc",
     "/sys",
     "/dev",
@@ -265,6 +272,13 @@ fn normalize_separators(raw: &str) -> Result<String, &'static str> {
 
 /// Lexical `.` / `..` collapse over a separator-normalised absolute string.
 fn collapse_dots(norm: &str) -> String {
+    collapse_dots_with(norm, false)
+}
+
+/// `win32_names`: the Win32 API drops trailing dots and spaces from every path segment, so
+/// `C:\Windows.\System32` IS `C:\Windows\System32`. Only applied to Windows-looking input; on POSIX
+/// `foo.` is a different, legitimate name.
+fn collapse_dots_with(norm: &str, win32_names: bool) -> String {
     let (prefix, rest): (String, &str) = if is_drive_letter_start(norm) {
         (norm[..2].to_string(), norm[2..].trim_start_matches('/'))
     } else {
@@ -277,6 +291,11 @@ fn collapse_dots(norm: &str) -> String {
         }
         if seg == ".." {
             stack.pop();
+        } else if win32_names {
+            let clean = seg.trim_end_matches(['.', ' ']);
+            if !clean.is_empty() {
+                stack.push(clean);
+            }
         } else {
             stack.push(seg);
         }
@@ -307,7 +326,9 @@ fn collapse_dots(norm: &str) -> String {
 }
 
 fn normalize_lexical(raw: &str) -> Result<String, &'static str> {
-    Ok(collapse_dots(&normalize_separators(raw)?))
+    let norm = normalize_separators(raw)?;
+    let win = raw.contains('\\') || is_drive_letter_start(&norm);
+    Ok(collapse_dots_with(&norm, win))
 }
 
 /// `~` and `~/rest` are replaced textually (no `..` collapsing: that must wait until symlinks are

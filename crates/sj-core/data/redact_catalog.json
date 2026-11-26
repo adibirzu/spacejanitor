@@ -1,0 +1,75 @@
+{
+  "_doc": "Closed vocabulary for redact.rs. Anything not listed here is replaced by a placeholder or a hash; nothing is ever derived from untrusted text. Package ids come from config/mcp-policy.json (hostinger entries), the mcp_plugin_audit.py reference and the common public MCP servers. Add names here, never loosen the matching code.",
+  "commands": [
+    "sh", "bash", "zsh", "dash", "ksh", "fish", "cmd", "powershell", "pwsh",
+    "node", "nodejs", "npx", "npm", "pnpm", "yarn", "bun", "bunx", "deno",
+    "python", "python2", "python3", "uv", "uvx", "pipx", "pip", "pip3", "poetry",
+    "java", "ruby", "go", "cargo", "rustc", "php", "dotnet",
+    "docker", "podman", "kubectl", "git", "gh", "ssh", "scp", "curl", "wget",
+    "mysql", "psql", "sqlcmd", "redis-cli", "sqlite3", "mongosh",
+    "env", "sudo", "nice", "nohup", "time", "tsx", "ts-node", "esbuild", "vite",
+    "codex", "claude", "gemini", "cursor", "code", "opencode", "zed", "windsurf", "agy", "cline",
+    "mcp-remote", "mcp-proxy", "supergateway", "sj"
+  ],
+  "clients": ["claude", "codex", "gemini", "cursor", "opencode", "windsurf", "cline", "code", "zed", "agy"],
+  "packages": [
+    "mcp-remote", "mcp-proxy", "supergateway", "chrome-devtools-mcp", "git-mcp-server",
+    "firecrawl-mcp", "exa-mcp-server", "tavily-mcp", "figma-developer-mcp", "mcp-obsidian",
+    "mcp-server-git", "mcp-server-fetch", "mcp-server-time", "mcp-server-sqlite",
+    "mcp-server-memory", "mcp-server-sequential-thinking", "mcp-server-supabase",
+    "mcp-server-filesystem", "mcp-server-postgres", "mcp-server-brave-search",
+    "mcp_oci_opsi", "hostinger-api-mcp", "@hostinger/mcp",
+    "@playwright/mcp", "@upstash/context7-mcp", "@notionhq/notion-mcp-server",
+    "@supabase/mcp-server-supabase", "@stripe/mcp", "@sentry/mcp-server",
+    "@cloudflare/mcp-server-cloudflare", "@azure/mcp", "@21st-dev/magic",
+    "@wonderwhy-er/desktop-commander", "@browserbasehq/mcp-server-browserbase",
+    "@executeautomation/playwright-mcp-server", "@openai/codex", "@anthropic-ai/claude-code",
+    "@modelcontextprotocol/inspector",
+    "@modelcontextprotocol/server-filesystem", "@modelcontextprotocol/server-github",
+    "@modelcontextprotocol/server-git", "@modelcontextprotocol/server-memory",
+    "@modelcontextprotocol/server-postgres", "@modelcontextprotocol/server-sqlite",
+    "@modelcontextprotocol/server-puppeteer", "@modelcontextprotocol/server-fetch",
+    "@modelcontextprotocol/server-brave-search", "@modelcontextprotocol/server-slack",
+    "@modelcontextprotocol/server-gdrive", "@modelcontextprotocol/server-google-maps",
+    "@modelcontextprotocol/server-everything", "@modelcontextprotocol/server-sequential-thinking",
+    "@modelcontextprotocol/server-redis", "@modelcontextprotocol/server-gitlab",
+    "@modelcontextprotocol/server-sentry", "@modelcontextprotocol/server-time",
+    "@modelcontextprotocol/server-everart", "@modelcontextprotocol/server-aws-kb-retrieval"
+  ],
+  "bool_flags": [
+    "-y", "-q", "-v", "-h", "--yes", "--quiet", "--silent", "--no-install", "--verbose",
+    "--help", "--version", "--debug", "--stdio", "--no-warnings", "--sse", "--readonly",
+    "--read-only", "--headless", "--isolated", "--no-sandbox", "--ignore-https-errors",
+    "--watch", "--production", "--offline", "--no-color", "--json", "--force",
+    "-NoProfile", "-NonInteractive"
+  ],
+  "value_flags": [
+    "--port", "--host", "--transport", "--config", "--config-file", "--log-level",
+    "--log-file", "--url", "--endpoint", "--path", "--dir", "--directory", "--root",
+    "--project", "--project-ref", "--workspace", "--name", "--timeout", "--header",
+    "--headers", "--env", "--cwd", "--from", "--with", "--python", "--browser",
+    "--user-data-dir", "--executable-path", "--allowed-origins", "--allowed-hosts",
+    "--token", "--access-token", "--auth-token", "--api-key", "--apikey", "--secret",
+    "--client-secret", "--client-id", "--password", "--passwd", "--pwd", "--auth",
+    "--bearer", "--private-key", "--key", "--credentials", "--username", "--user",
+    "-p", "-u", "-a", "-H", "-e", "-c", "-f", "-d", "-n", "-o", "-t", "-m", "-r", "-s", "-i", "-w", "-X", "-U", "-P"
+  ],
+  "win_flags": ["p", "t", "u", "c", "k", "key", "pass", "pwd", "auth", "user", "token"],
+  "keys": [
+    "PATH", "HOME", "USER", "SHELL", "LANG", "TERM", "TMPDIR", "PWD", "NODE_ENV", "NODE_OPTIONS",
+    "LOG_LEVEL", "DEBUG", "PORT", "HOST", "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "PYTHONPATH",
+    "PYTHONUNBUFFERED", "UV_PROJECT_ENVIRONMENT", "NPM_CONFIG_REGISTRY", "TZ", "CI", "FORCE_COLOR",
+    "GITHUB_TOKEN", "GITHUB_PERSONAL_ACCESS_TOKEN", "GH_TOKEN", "API_KEY", "API_TOKEN", "ACCESS_TOKEN",
+    "OPENAI_API_KEY", "ANTHROPIC_API_KEY", "GEMINI_API_KEY", "GOOGLE_API_KEY", "BRAVE_API_KEY",
+    "FIRECRAWL_API_KEY", "EXA_API_KEY", "TAVILY_API_KEY", "SLACK_BOT_TOKEN", "SLACK_TEAM_ID",
+    "NOTION_TOKEN", "SUPABASE_ACCESS_TOKEN", "STRIPE_API_KEY", "SENTRY_AUTH_TOKEN", "AWS_ACCESS_KEY_ID",
+    "AWS_SECRET_ACCESS_KEY", "AWS_REGION", "AZURE_CLIENT_SECRET", "DATABASE_URL", "POSTGRES_URL",
+    "Authorization", "Proxy-Authorization", "Cookie", "Content-Type", "Accept", "User-Agent",
+    "X-Api-Key", "X-API-Key", "X-Auth-Token", "X-Request-Id"
+  ],
+  "process_words": [
+    "google", "chrome", "helper", "renderer", "gpu", "plugin", "utility", "network", "service",
+    "safari", "firefox", "slack", "code", "electron", "claude", "codex", "cursor", "node", "python",
+    "java", "docker", "finder", "dock", "windowserver", "spotlight", "xcode", "simulator", "com.apple"
+  ]
+}

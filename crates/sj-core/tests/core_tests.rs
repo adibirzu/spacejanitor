@@ -2949,3 +2949,219 @@ fn execute_selection_removes_only_the_confirmed_items_and_refuses_when_the_selec
     assert!(!trash.join("a.bin").exists() && !trash.join("c.bin").exists());
     assert!(trash.join("b.bin").exists(), "unselected item must survive");
 }
+#[test]
+fn protect_cross_platform_posix_and_windows_roots() {
+    let ctx = ProtectionContext::new(PathBuf::from("/home/developer"), vec![]);
+
+    for posix_root in [
+        "/",
+        "/foo/..",
+        "/var/../etc/passwd",
+        "\\etc\\passwd",
+        "\\foo\\..",
+    ] {
+        assert!(
+            check_path_protection(Path::new(posix_root), &ctx).protected,
+            "POSIX root/traversal {posix_root} must be protected"
+        );
+    }
+
+    for win_root in [
+        "C:\\",
+        "C:/",
+        "c:\\foo\\..",
+        "C:\\Windows",
+        "C:\\Windows\\System32",
+        "c:/windows/system32/drivers/etc/hosts",
+        "C:\\Program Files",
+        "c:/program files/SomeApp",
+        "C:\\Program Files (x86)",
+        "c:/program files (x86)/SomeApp",
+        "C:\\ProgramData",
+        "c:/programdata/Microsoft",
+        "C:\\Temp\\..\\Windows\\System32",
+        "C:\\Users\\alice\\..\\..\\Windows\\System32",
+    ] {
+        assert!(
+            check_path_protection(Path::new(win_root), &ctx).protected,
+            "Windows system root {win_root} must be protected"
+        );
+    }
+
+    // a drive-letter string is rejected outright on a POSIX host (main's gate), so the
+    // "unprotected user path" half is only meaningful where the OS understands the path
+    #[cfg(windows)]
+    let verdict = check_path_protection(
+        Path::new("C:\\Users\\alice\\projects\\work"),
+        // the user's own home: another user's `C:/Users/*` is a protected foreign home
+        &ProtectionContext::new(PathBuf::from("C:\\Users\\alice"), vec![]),
+    );
+    #[cfg(windows)]
+    assert!(
+        !verdict.protected,
+        "Non-protected Windows user path should not be blocked (reason: {})",
+        verdict.reason
+    );
+}
+
+#[test]
+fn protect_handles_windows_extended_prefixes_driveless_roots_and_unix_backslash_leaf() {
+    use sj_core::is_protected_path;
+
+    let win_home = "C:\\Users\\alice";
+    let exact = ["C:\\Users\\alice\\Documents\\tax"];
+
+    for protected_cand in [
+        "\\\\?\\C:\\Windows\\System32",
+        "\\\\.\\C:\\Windows",
+        "\\\\?\\C:\\",
+        "D:\\",
+        "\\Program Files\\App",
+        "\\ProgramData\\x",
+        "\\Users\\alice",
+        "\\Users\\alice\\Documents\\tax",
+        "C:\\Windows.\\System32",
+        "C:\\PROGRA~1\\App",
+        "C:\\PROGRA~2\\App",
+        "\\\\?\\UNC\\server\\share\\..\\..\\Windows\\System32",
+    ] {
+        assert!(
+            is_protected_path(protected_cand, win_home, &exact).protected,
+            "expected {protected_cand} to be protected"
+        );
+    }
+
+    // Also via check_path_protection for extended prefixes and driveless Windows roots
+    let win_ctx = ProtectionContext::new(
+        PathBuf::from(win_home),
+        vec![PathBuf::from("C:\\Users\\alice\\Documents\\tax")],
+    );
+    for protected_cand in [
+        "\\\\?\\C:\\Windows\\System32",
+        "\\\\.\\C:\\Windows",
+        "\\\\?\\C:\\",
+        "D:\\",
+        "\\Program Files\\App",
+        "\\ProgramData\\x",
+        "\\Users\\alice",
+        "C:\\Windows.\\System32",
+    ] {
+        assert!(
+            check_path_protection(Path::new(protected_cand), &win_ctx).protected,
+            "check_path_protection expected {protected_cand} to be protected"
+        );
+    }
+
+    // Unix: relative leaf name starting with '\' inside ~/.ssh must stay relative to ~/.ssh
+    #[cfg(unix)]
+    {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let ssh_dir = home.join(".ssh");
+        std::fs::create_dir_all(&ssh_dir).unwrap();
+        #[allow(clippy::join_absolute_paths)]
+        let leaf_in_ssh = ssh_dir.join("\\newfile");
+        std::fs::write(&leaf_in_ssh, "dummy").unwrap();
+        let ctx = ProtectionContext::new(home, vec![]);
+        assert!(
+            check_path_protection(&leaf_in_ssh, &ctx).protected,
+            "leaf starting with backslash inside ~/.ssh must be protected"
+        );
+        // Also when evaluated via is_protected_path relative to cwd or check_dir_descendants_safe
+        assert!(
+            sj_core::protect::check_dir_descendants_safe(&ssh_dir, &ctx, 100).protected,
+            "descendant \\newfile inside ~/.ssh must be protected"
+        );
+    }
+}
+
+#[test]
+fn protect_covers_claude_state_files_and_app_support_pure_string_windows_and_posix() {
+    use sj_core::is_protected_path;
+    let home = "/home/developer";
+    for p in [
+        "/home/developer/.claude.json",
+        "/home/developer/.claude/skills/x/SKILL.md",
+        "/home/developer/Library/Application Support/Claude",
+        "/home/developer/Library/Application Support/Claude/config.json",
+        "/home/developer/library/application support/claude/Local Storage",
+        "~/.claude.json",
+    ] {
+        assert!(is_protected_path(p, home, &[]).protected, "{p}");
+    }
+    // Windows-semantics mirror of the two historically red Windows CI cases:
+    // these are pure string checks and must hold on every host OS.
+    for p in [
+        "/",
+        "/etc/passwd",
+        "/tmp/foo/../../etc/passwd",
+        "C:\\Windows\\System32",
+    ] {
+        assert!(
+            is_protected_path(p, "/home/developer", &[]).protected,
+            "{p}"
+        );
+    }
+    assert!(
+        !is_protected_path(
+            "/home/developer/projects/Other",
+            home,
+            &[]
+        )
+        .protected
+    );
+}
+
+// ---- R3 blocker regressions (item 70) ----
+
+#[test]
+fn r3_b6_windows_drive_exact_paths_match_case_insensitively() {
+    let exact = ["C:\\Users\\alice\\Documents\\tax"];
+    for cand in [
+        "c:\\users\\alice\\documents\\tax\\2025.pdf",
+        "C:\\Users\\alice\\DOCUMENTS\\tax",
+        "C:\\Users\\alice\\Documents\\tax\\2025.pdf",
+    ] {
+        let v = sj_core::is_protected_path(cand, "C:\\Users\\alice", &exact);
+        assert!(v.protected, "{cand} must be protected: {v:?}");
+    }
+    assert!(
+        !sj_core::is_protected_path(
+            "c:\\users\\alice\\projects\\other.pdf",
+            "C:\\Users\\alice",
+            &exact
+        )
+        .protected
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b3_non_canonical_home_still_protects_claude_json_and_app_support() {
+    use std::os::unix::fs::symlink;
+    let tmp = tempdir().unwrap();
+    let real = tmp.path().join("real");
+    fs::create_dir_all(real.join("Library/Application Support/Claude")).unwrap();
+    fs::write(real.join(".claude.json"), "{}").unwrap();
+    symlink(&real, tmp.path().join("homelink")).unwrap();
+    let home = tmp.path().join("homelink");
+    let ctx = ProtectionContext::new(home.clone(), vec![]);
+    for rel in [
+        ".claude.json",
+        "Library/Application Support/Claude",
+        "Library/Application Support/Claude/Local Storage",
+    ] {
+        // reached through the symlinked home, and through its canonical spelling
+        assert!(
+            check_path_protection(&home.join(rel), &ctx).protected,
+            "{rel} via link"
+        );
+        assert!(
+            check_path_protection(&real.canonicalize().unwrap().join(rel), &ctx).protected,
+            "{rel} via canonical"
+        );
+    }
+    // a symlink inside the home pointing at the protected file is denied too
+    symlink(real.join(".claude.json"), real.join(".mcp.json")).unwrap();
+    assert!(check_path_protection(&home.join(".mcp.json"), &ctx).protected);
+}
