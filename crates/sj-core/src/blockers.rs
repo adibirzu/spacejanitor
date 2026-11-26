@@ -402,6 +402,36 @@ fn collect_platform_blockers() -> Result<BlockersReport, SjError> {
     ))
 }
 
+/// Total inotify watches held by the processes readable under `proc_root` (a `/proc` tree): every
+/// fd whose link is `anon_inode:inotify` contributes its `inotify wd:` lines from `fdinfo`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn count_inotify_watches(proc_root: &std::path::Path) -> Option<u64> {
+    let mut total = 0u64;
+    for ent in std::fs::read_dir(proc_root).ok()?.flatten() {
+        if ent.file_name().to_string_lossy().parse::<u32>().is_err() {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(ent.path().join("fd")) else {
+            continue; // another user's process, or it exited
+        };
+        for fd in fds.flatten() {
+            let is_inotify = std::fs::read_link(fd.path())
+                .map(|t| t.to_string_lossy() == "anon_inode:inotify")
+                .unwrap_or(false);
+            if !is_inotify {
+                continue;
+            }
+            if let Ok(info) = std::fs::read_to_string(
+                ent.path().join("fdinfo").join(fd.file_name()),
+            ) {
+                let n = info.lines().filter(|l| l.starts_with("inotify wd:")).count() as u64;
+                total = total.saturating_add(n);
+            }
+        }
+    }
+    Some(total)
+}
+
 #[cfg(target_os = "linux")]
 fn collect_platform_blockers() -> Result<BlockersReport, SjError> {
     let mut warnings = Vec::new();
@@ -440,7 +470,7 @@ fn collect_platform_blockers() -> Result<BlockersReport, SjError> {
         files_used,
         files_max,
         Some(d_state),
-        None,
+        inotify_max.and_then(|_| count_inotify_watches(std::path::Path::new("/proc"))),
         inotify_max,
         warnings,
     ))
@@ -472,6 +502,36 @@ pub fn collect_blockers_report() -> Result<BlockersReport, SjError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn inotify_watches_are_summed_from_a_proc_fixture_tree() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // pid 10: one inotify fd with 2 watches, one regular fd that must be ignored
+        let p10 = root.join("10");
+        std::fs::create_dir_all(p10.join("fd")).unwrap();
+        std::fs::create_dir_all(p10.join("fdinfo")).unwrap();
+        symlink("anon_inode:inotify", p10.join("fd/3")).unwrap();
+        symlink("/dev/null", p10.join("fd/4")).unwrap();
+        std::fs::write(
+            p10.join("fdinfo/3"),
+            "pos:\t0\nflags:\t02004000\ninotify wd:1 ino:5 sdev:7 mask:2 ignored_mask:0\ninotify wd:2 ino:6 sdev:7 mask:2 ignored_mask:0\n",
+        )
+        .unwrap();
+        std::fs::write(p10.join("fdinfo/4"), "inotify wd:9 ino:1\n").unwrap();
+        // pid 11: one inotify fd with 1 watch; a non-pid entry must be skipped
+        let p11 = root.join("11");
+        std::fs::create_dir_all(p11.join("fd")).unwrap();
+        std::fs::create_dir_all(p11.join("fdinfo")).unwrap();
+        symlink("anon_inode:inotify", p11.join("fd/5")).unwrap();
+        std::fs::write(p11.join("fdinfo/5"), "inotify wd:1 ino:5 sdev:7 mask:2 ignored_mask:0\n").unwrap();
+        std::fs::create_dir_all(root.join("sys")).unwrap();
+        assert_eq!(count_inotify_watches(root), Some(3));
+        assert_eq!(count_inotify_watches(&root.join("missing")), None);
+    }
+
 
     #[test]
     fn macos_blocker_thresholds_cover_ok_warn_and_critical() {
