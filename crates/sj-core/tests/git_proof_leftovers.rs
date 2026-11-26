@@ -113,10 +113,10 @@ fn linked_worktree_of_a_bare_repo_never_runs_git_in_the_bare_repos_parent_dir() 
     assert!(!cwds.trim().is_empty(), "shim never ran; probe is not exercising the proof");
     let parent = root.join("holder");
     for c in cwds.lines() {
-        assert_ne!(
-            Path::new(c),
-            parent.as_path(),
-            "git ran with the bare repo's PARENT directory as cwd/work-tree"
+        assert_ne!(Path::new(c), parent.as_path(), "git ran in the bare repo's parent dir");
+        assert!(
+            !c.ends_with("/worktrees") && !c.contains("/main.git/worktrees/"),
+            "git ran with a made-up work tree inside the git admin dir: {c}"
         );
     }
     assert!(!is_safe(&r, "/feat"), "detached commit is unpushed: {r:?}");
@@ -175,7 +175,7 @@ fn hostile_filter_and_credential_values_stay_blocked_and_never_execute() {
         ("filter.lfs.clean".into(), "git-lfs clean -- %f ".to_string() + &format!("`{touch}`")),
         ("filter.evil.clean".into(), touch.clone()),
         ("lfs.extension.x.clean".into(), touch.clone()),
-        ("lfs.customtransfer.x.path".into(), format!("/bin/sh")),
+        ("lfs.customtransfer.x.path".into(), "/bin/sh".to_string()),
         ("lfs.standalonetransferagent".into(), "x".into()),
         ("credential.helper".into(), format!("!{touch}")),
         ("credential.helper".into(), format!("osxkeychain; {touch}")),
