@@ -248,8 +248,7 @@ fn linux_plan_is_dry_run_by_default_gates_execution_and_keeps_models_backups_man
     assert!(matches!(err, sj_core::SjError::ExecutionGate(_)));
     assert!(pip_cache.join("wheel.whl").exists());
 
-    // Execute WITH --execute --confirm --plan-sha256 --item removes ONLY the targeted pip cache
-    let removed = execute_plan_item_with_linux(
+    let result = execute_plan_item_with_linux(
         &plan,
         &ExecutionGate {
             execute: true,
@@ -259,10 +258,23 @@ fn linux_plan_is_dry_run_by_default_gates_execution_and_keeps_models_backups_man
         },
         &ctx,
         &[tmp_root.clone()],
-    )
-    .unwrap();
-    assert_eq!(removed.id, pip_item.id);
-    assert!(!pip_cache.exists());
+    );
+
+    #[cfg(unix)]
+    {
+        assert_eq!(result.unwrap().id, pip_item.id);
+        assert!(!pip_cache.exists());
+    }
+
+    #[cfg(not(unix))]
+    {
+        assert!(matches!(
+            result,
+            Err(sj_core::SjError::ExecutionGate(message)) if message.contains("dry-run planning only")
+        ));
+        assert!(pip_cache.join("wheel.whl").exists());
+    }
+
     assert!(hf_cache.join("weights.safetensors").exists());
     assert!(stale_appimage.join("AppRun").exists());
 }
@@ -275,8 +287,17 @@ fn scan_directory_records_fs_capacity_and_filters_nested_mountpoints() {
     fs::write(root.join("logs/app.log"), vec![1u8; 512]).unwrap();
     let ctx = ProtectionContext::new(root.to_path_buf(), vec![]);
     let report = scan_directory(root, &ctx, &ScanOptions::default()).unwrap();
-    assert!(report.fs_total_bytes.unwrap_or(0) > 0);
-    assert!(report.fs_free_bytes.is_some());
+    #[cfg(unix)]
+    {
+        assert!(report.fs_total_bytes.unwrap_or(0) > 0);
+        assert!(report.fs_free_bytes.is_some());
+    }
+
+    #[cfg(not(unix))]
+    {
+        assert_eq!(report.fs_total_bytes, None);
+        assert_eq!(report.fs_free_bytes, None);
+    }
 }
 
 #[cfg(unix)]

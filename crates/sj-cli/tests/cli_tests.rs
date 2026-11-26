@@ -1136,7 +1136,6 @@ fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
     assert_eq!(unconfirmed.status.code(), Some(2));
     assert!(cache.join("a.whl").exists());
 
-    // Valid --execute --confirm --plan-sha256 --item executes cleanly
     let exec = Command::new(sj_bin())
         .env("HOME", &home)
         .env("USERPROFILE", &home)
@@ -1155,10 +1154,21 @@ fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
         ])
         .output()
         .unwrap();
-    assert_eq!(exec.status.code(), Some(0), "{}", String::from_utf8_lossy(&exec.stderr));
-    let ej: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
-    assert_eq!(ej["mutated"], true);
-    assert!(!cache.exists());
+    #[cfg(unix)]
+    {
+        assert_eq!(exec.status.code(), Some(0), "{}", String::from_utf8_lossy(&exec.stderr));
+        let ej: serde_json::Value = serde_json::from_slice(&exec.stdout).unwrap();
+        assert_eq!(ej["mutated"], true);
+        assert!(!cache.exists());
+    }
+
+    #[cfg(not(unix))]
+    {
+        let stderr = String::from_utf8_lossy(&exec.stderr);
+        assert_eq!(exec.status.code(), Some(2), "{stderr}");
+        assert!(stderr.contains("dry-run planning only"), "{stderr}");
+        assert!(cache.join("a.whl").exists());
+    }
 }
 
 #[test]

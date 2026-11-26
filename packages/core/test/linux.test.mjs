@@ -104,7 +104,9 @@ test("collectBlockers detects Linux systemd failed units, broken user services, 
 });
 
 test("collectLinuxAudit probes Docker, Podman, journald, apt, AppImage mounts, HF caches, and old backups in dry-run", async () => {
-  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "sj-linux-audit-")));
+  // Windows runner temp files live under the protected user profile.
+  const fixtureRoot = process.platform === "win32" ? process.cwd() : os.tmpdir();
+  const tmp = fs.realpathSync(fs.mkdtempSync(path.join(fixtureRoot, "sj-linux-audit-")));
   try {
     const home = path.join(tmp, "home");
     const tmpDir = path.join(tmp, "tmp");
