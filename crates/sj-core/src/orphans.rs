@@ -198,6 +198,9 @@ pub fn executable_config_key(key: &str) -> Option<String> {
         // `http.sslverify`, which our own `-c http.sslVerify=true` overrides.
         || (k.starts_with("http.") && k != "http.sslverify")
         || k.starts_with("https.")
+        // protocol.<scheme>.allow is more specific than our `-c protocol.allow=never` and would
+        // re-enable any git-remote-<scheme> helper (or fd::); only protocol.version is harmless
+        || (k.starts_with("protocol.") && k != "protocol.version")
         || k.starts_with("credential.")
         || (k.starts_with("url.") && ends(&["insteadof", "pushinsteadof"]))
         || k.starts_with("include.")
@@ -212,8 +215,20 @@ pub fn executable_config_key(key: &str) -> Option<String> {
 fn empty_home_dir() -> PathBuf {
     static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     DIR.get_or_init(|| {
-        let dir = std::env::temp_dir().join(format!("sj-git-home-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir()
+            .join(format!("sj-git-home-{}-{nanos}", std::process::id()));
+        // create_dir (not create_dir_all): never adopt a pre-existing, possibly attacker-owned dir
+        let mut b = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::DirBuilderExt;
+            b.mode(0o700);
+        }
+        let _ = b.create(&dir);
         dir
     })
     .clone()

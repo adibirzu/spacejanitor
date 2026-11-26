@@ -140,3 +140,29 @@ fn fifo_behind_core_attributes_file_does_not_burn_the_call_timeout() {
         "scan stalled on a repo-pointed FIFO: {took:?}"
     );
 }
+
+#[test]
+fn repo_protocol_allow_cannot_reenable_a_remote_helper() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = clean_pushed_repo(root, "protoallow");
+    git(&repo, &["remote", "set-url", "origin", "evil::pwned"]);
+    git(&repo, &["config", "protocol.evil.allow", "always"]);
+    let bin = root.join("bin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = root.join("PWNED");
+    write_script(
+        &bin.join("git-remote-evil"),
+        &format!("touch '{}'\nexit 1", marker.display()),
+    );
+    let (report, _) = with_path_shim(&bin, || scan(root, 5));
+    assert!(
+        !marker.exists(),
+        "protocol.evil.allow=always re-enabled a remote helper"
+    );
+    assert!(report
+        .safe_to_prune
+        .iter()
+        .all(|c| !c.path.ends_with("/protoallow")));
+}
