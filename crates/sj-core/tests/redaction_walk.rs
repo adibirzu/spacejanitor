@@ -10,7 +10,15 @@ use sj_core::mcp_audit::{audit_mcp_with_processes, McpAuditOptions, ObservedProc
 use sj_core::memory::parse_macos_ps_fallback;
 use sj_core::reap::build_reap_plan_from_processes;
 use std::fs;
-use tempfile::tempdir;
+/// Temp dir outside protected home subtrees; on Windows the default sits under `AppData`, which
+/// the protect list refuses, so the audits would scan nothing.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    if cfg!(windows) {
+        tempfile::Builder::new().tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+    } else {
+        tempfile::tempdir()
+    }
+}
 
 #[test]
 fn mcp_audit_walk_every_string_against_probe_fixture() {

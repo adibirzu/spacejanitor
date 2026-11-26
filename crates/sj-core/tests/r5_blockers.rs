@@ -9,7 +9,15 @@ mod probe;
 use probe::{assert_no_needles, write_fixture_home};
 use sj_core::mcp_audit::{audit_mcp_with_processes, McpAuditOptions, ObservedProcess};
 use std::fs;
-use tempfile::tempdir;
+/// Temp dir outside protected home subtrees; on Windows the default sits under `AppData`, which
+/// the protect list refuses, so the audits would scan nothing.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    if cfg!(windows) {
+        tempfile::Builder::new().tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+    } else {
+        tempfile::tempdir()
+    }
+}
 
 fn proc(pid: u32, ppid: u32, command: &str) -> ObservedProcess {
     ObservedProcess {

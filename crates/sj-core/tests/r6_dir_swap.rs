@@ -10,7 +10,15 @@ use std::fs;
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use tempfile::tempdir;
+/// Temp dir outside protected home subtrees; on Windows the default sits under `AppData`, which
+/// the protect list refuses, so the audits would scan nothing.
+fn tempdir() -> std::io::Result<tempfile::TempDir> {
+    if cfg!(windows) {
+        tempfile::Builder::new().tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+    } else {
+        tempfile::tempdir()
+    }
+}
 
 fn swap(a: &Path, b: &Path) -> bool {
     let ca = CString::new(a.to_str().unwrap()).unwrap();
