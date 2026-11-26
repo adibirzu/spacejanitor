@@ -327,6 +327,7 @@ fn create_private_dir() -> Option<PathBuf> {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("sj-git-home-{}-{nanos}-{seq}", std::process::id()));
     // create_dir (not create_dir_all): never adopt a pre-existing, possibly attacker-owned dir
+    #[allow(unused_mut)]
     let mut b = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
@@ -357,7 +358,8 @@ fn empty_home_dir() -> PathBuf {
 }
 
 fn unleased_home() -> PathBuf {
-    std::env::temp_dir().join(format!("sj-no-home-{}", std::process::id()))
+    // not a creatable, predictable temp path: `<null device>/.netrc` can never exist
+    PathBuf::from(NULL_DEVICE)
 }
 
 /// Non-executable user settings that change how git SEES the working tree (line endings). Without
