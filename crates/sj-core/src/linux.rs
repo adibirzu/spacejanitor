@@ -1473,7 +1473,7 @@ pub(crate) fn execute_linux_command_item(item: &crate::plan::PlanItem) -> Result
             let id = path
                 .strip_prefix("docker://container/")
                 .and_then(|rest| rest.split('/').next())
-                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .filter(|s| safe_container_id(s))
                 .ok_or_else(|| SjError::ExecutionGate(format!("invalid docker container ref: {path}")))?;
             let state = run_cmd_capture("docker", &["inspect", "-f", "{{.State.Status}}", id])
                 .ok_or_else(|| SjError::ExecutionGate(format!("failed to re-verify docker container {id}")))?;
@@ -1496,7 +1496,8 @@ pub(crate) fn execute_linux_command_item(item: &crate::plan::PlanItem) -> Result
             let id = path
                 .strip_prefix("docker://image/")
                 .filter(|s| {
-                    !s.is_empty()
+                    !s.starts_with('-')
+                        && !s.is_empty()
                         && s.chars()
                             .all(|c| c.is_ascii_alphanumeric() || c == ':' || c == '_' || c == '-')
                 })
@@ -1532,7 +1533,7 @@ pub(crate) fn execute_linux_command_item(item: &crate::plan::PlanItem) -> Result
             let id = path
                 .strip_prefix("podman://container/")
                 .and_then(|rest| rest.split('/').next())
-                .filter(|s| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-'))
+                .filter(|s| safe_container_id(s))
                 .ok_or_else(|| SjError::ExecutionGate(format!("invalid podman container ref: {path}")))?;
             let state = run_cmd_capture("podman", &["inspect", "-f", "{{.State.Status}}", id])
                 .ok_or_else(|| SjError::ExecutionGate(format!("failed to re-verify podman container {id}")))?;
