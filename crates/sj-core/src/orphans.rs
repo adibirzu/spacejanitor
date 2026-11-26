@@ -801,7 +801,7 @@ fn collect_extra_local_commits(
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
-    if refs.len() + reflog.len() > active_limits().max_extra_commits {
+    if refs.union(&reflog).count() > active_limits().max_extra_commits {
         return Err("too_many_local_commits_to_verify".to_string());
     }
     if refs
@@ -1175,6 +1175,27 @@ fn dir_bytes_no_follow(path: &Path) -> u64 {
     total
 }
 
+/// True when the checkout actually USES git-lfs: a tracked or info `.gitattributes` rule with
+/// `filter=lfs`, or a non-empty local LFS object store. Pushed commits then prove nothing about the
+/// LFS CONTENT (it may exist only in `<common>/lfs/objects` if the LFS upload was skipped), so such a
+/// checkout is never offered. Unused benign LFS config does not trigger this.
+fn uses_lfs(git_ctx: &GitExecContext) -> bool {
+    let common = linked_common_dir(&git_ctx.git_dir).unwrap_or_else(|| git_ctx.git_dir.clone());
+    let store = common.join("lfs").join("objects");
+    if let Ok(mut rd) = std::fs::read_dir(&store) {
+        if rd.next().is_some() {
+            return true;
+        }
+    }
+    [git_ctx.work_tree.join(".gitattributes"), common.join("info").join("attributes")]
+        .iter()
+        .any(|f| match std::fs::symlink_metadata(f) {
+            Err(e) if e.kind() == ErrorKind::NotFound => false,
+            Err(_) => true, // cannot tell: fail closed
+            Ok(_) => read_regular_text(f).map(|t| t.contains("filter=lfs")).unwrap_or(true),
+        })
+}
+
 /// True when the repository has (or may have) submodules: a `.gitmodules`, a `.git/modules` dir,
 /// or any gitlink (mode 160000) in the index. Unknown (listing failed) counts as "has".
 fn has_submodules(git_ctx: &GitExecContext) -> bool {
@@ -1236,6 +1257,11 @@ fn validate_single_repo_at(
     // it would destroy their git metadata and every branch only they hold. Refuse, by name.
     if is_worktree && linked_common_dir(&git_ctx.git_dir).is_none() && common_dir_is_bare(&git_ctx.git_dir) {
         reasons.push("bare_main_repository".to_string());
+        return Err(reasons);
+    }
+
+    if uses_lfs(&git_ctx) {
+        reasons.push("lfs_objects_unverified".to_string());
         return Err(reasons);
     }
 
@@ -1896,7 +1922,12 @@ mod tests {
         #[cfg(unix)]
         {
             // SAFETY: signal 0 only checks existence.
-            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                return false;
+            }
+            // a killed process nobody has reaped yet is a zombie: dead for our purposes
+            let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
+            !matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
         }
         #[cfg(windows)]
         {

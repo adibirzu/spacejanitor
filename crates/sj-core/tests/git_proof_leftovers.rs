@@ -367,3 +367,46 @@ fn temp_home_is_removed_when_the_scan_errors_out() {
     });
     assert_eq!(homes_in(&priv_tmp), Vec::<String>::new(), "temp HOME leaked on the error path");
 }
+
+// ------------------------------------------------ review follow-ups (CodeRabbit on PR #26)
+
+#[test]
+fn a_checkout_that_actually_uses_lfs_stays_blocked_until_its_objects_are_verified() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = pushed_repo_with_config(
+        root,
+        "lfsuser",
+        &[
+            ("filter.lfs.clean", "git-lfs clean -- %f"),
+            ("filter.lfs.smudge", "git-lfs smudge -- %f"),
+            ("filter.lfs.process", "git-lfs filter-process"),
+        ],
+    );
+    // commits are pushed, but the LFS object store is local-only (push of LFS content was skipped)
+    fs::write(repo.join(".gitattributes"), "*.bin filter=lfs diff=lfs merge=lfs -text\n").unwrap();
+    git(&repo, &["add", ".gitattributes"]);
+    git(&repo, &["commit", "-m", "track bins with lfs"]);
+    git(&repo, &["push", "origin", "HEAD"]);
+    let obj = repo.join(".git/lfs/objects/ab/cd");
+    fs::create_dir_all(&obj).unwrap();
+    fs::write(obj.join("abcd0000"), "local only content").unwrap();
+    let r = scan(root);
+    assert!(!is_safe(&r, "/lfsuser"), "LFS content that may exist only locally was offered as safe");
+    let reasons = reasons_for(&r, "/lfsuser").unwrap();
+    assert!(reasons.iter().any(|x| x == "lfs_objects_unverified"), "{reasons:?}");
+}
+
+#[test]
+fn a_commit_shared_by_a_tag_and_the_reflog_counts_once_against_the_cap() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let repo = clean_pushed_repo(root, "shared");
+    git(&repo, &["tag", "v1"]);
+    git(&repo, &["push", "origin", "v1"]);
+    let limits = ProofLimits { max_extra_commits: 1, ..ProofLimits::default() };
+    let r = scan_with(root, limits);
+    assert!(is_safe(&r, "/shared"), "one distinct commit must fit a cap of 1: {:?}", reasons_for(&r, "/shared"));
+}
