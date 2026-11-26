@@ -8,7 +8,7 @@
 
 use crate::mcp_audit::{audit_mcp_with_processes, McpAuditOptions};
 use crate::protect::{check_path_protection, ProtectionContext};
-use crate::safe_read::{read_config_file, EntryKind, ReadPolicy, SafeDir};
+use crate::safe_read::{read_trusted_client_config, EntryKind, ReadPolicy, SafeDir};
 use crate::SjError;
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -267,7 +267,7 @@ fn parse_codex_plugin_states(raw: &str) -> BTreeMap<String, bool> {
 /// it is canonicalised and refused (recorded as a `SymlinkedRoot`, never listed) when:
 /// - it, or any ancestor, is a symlink that resolves outside the canonical home, or
 /// - its canonical path is inside a protected root (`~/.claude`, Claude app support, `.ssh`,
-///   ...). The only exception is the explicit read-only `claude` client reached without any
+///   ...). The only exception is an audited client directory reached without any
 ///   symlink: names only, never contents, never a candidate.
 ///
 /// A leaf symlink is always refused (never opened), preserving the R3 behaviour.
@@ -328,8 +328,12 @@ impl<'a> Guard<'a> {
             .ok()
             .map(|rel| self.canon_home.join(rel));
         let through_symlink = leaf_symlink || lexical.as_deref() != Some(canon.as_path());
-        let claude_names_only = client == "claude" && !through_symlink;
-        let refuse = leaf_symlink || outside_home || (protected && !claude_names_only);
+        // Every audited root is a fixed path this module builds under the home. Main's gate now
+        // protects client homes such as `~/.codex` and `~/.config` wholesale (credentials live
+        // there), so a symlink-free listing of directory NAMES is the one allowed read of a
+        // protected root; contents are never opened (see `SafeDir::open`'s exact exemption).
+        let names_only = !through_symlink;
+        let refuse = leaf_symlink || outside_home || (protected && !names_only);
         if !refuse {
             return true;
         }
@@ -340,7 +344,10 @@ impl<'a> Guard<'a> {
         } else {
             canon.to_string_lossy().into_owned()
         };
-        let reason = if protected {
+        // Main's gate also protects whatever a credential-store entry (`~/.codex`) points at, so
+        // a client root symlinked outside the home is "protected" too; the cause worth naming is
+        // the symlink. `target_protected` still carries the verdict.
+        let reason = if protected && !outside_home {
             "protected_target"
         } else {
             "symlinked_root"
@@ -361,14 +368,12 @@ impl<'a> Guard<'a> {
             canon_home: &self.canon_home,
             require_in_home: true,
         };
-        // the read-only claude client may list names of exactly its own directory
-        let exact = (client == "claude")
-            .then(|| {
-                dir.strip_prefix(&self.ctx.home_dir)
-                    .ok()
-                    .map(|rel| self.canon_home.join(rel))
-            })
-            .flatten();
+        // a symlink-free audited directory may list the names of exactly itself, even when
+        // it sits inside a protected client home (`~/.claude`, `~/.codex`, `~/.config/...`)
+        let exact = dir
+            .strip_prefix(&self.ctx.home_dir)
+            .ok()
+            .map(|rel| self.canon_home.join(rel));
         SafeDir::open(dir, &policy, exact.as_deref()).ok()
     }
 
@@ -577,10 +582,7 @@ pub fn audit_llm_with_processes(
     let codex_toml = home.join(".codex").join("config.toml");
     let mut states = BTreeMap::new();
     let mut guard = Guard::new(&ctx);
-    if guard.allow("codex", &home.join(".codex"))
-        && !check_path_protection(&codex_toml, &ctx).protected
-        && fs::symlink_metadata(&codex_toml).is_ok()
-    {
+    if guard.allow("codex", &home.join(".codex")) && fs::symlink_metadata(&codex_toml).is_ok() {
         // opened once without following symlinks; the handle is validated (regular file,
         // canonical path inside the canonical home and outside every protected root) and
         // the content is read from that handle, never by re-opening the path
@@ -589,7 +591,7 @@ pub fn audit_llm_with_processes(
             canon_home: &guard.canon_home,
             require_in_home: true,
         };
-        match read_config_file(&codex_toml, &policy) {
+        match read_trusted_client_config(&codex_toml, &policy) {
             Ok(raw) => states = parse_codex_plugin_states(&raw),
             Err(refusal) => warnings.push(format!("codex config not read ({})", refusal.code())),
         }
@@ -1025,7 +1027,7 @@ enabled = false
         fs::create_dir_all(h.join(".codex/skills")).unwrap();
         #[cfg(unix)]
         {
-            std::os::unix::fs::symlink("/nonexistent-sj-fixture", h.join(".codex/skills/dead"))
+            std::os::unix::fs::symlink("/nonexistent-sj-fixture", h.join(".agents/skills/dead"))
                 .unwrap();
             std::os::unix::fs::symlink(
                 h.join(".agents/skills/fresh-skill"),
@@ -1148,7 +1150,7 @@ enabled = false
         }
         // nothing on disk changed
         assert!(tmp.path().join(".agents/skills/old-skill").is_dir());
-        assert!(fs::symlink_metadata(tmp.path().join(".codex/skills/dead")).is_ok());
+        assert!(fs::symlink_metadata(tmp.path().join(".agents/skills/dead")).is_ok());
     }
 
     #[cfg(unix)]

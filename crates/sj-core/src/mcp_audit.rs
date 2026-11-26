@@ -3,7 +3,10 @@ use crate::redact::{
     env_key_label, header_key_label, is_secret_name, known_client, known_command, known_key,
     known_package_in, redact_argv, redact_command, server_label, unknown_label, url_label,
 };
-use crate::safe_read::{read_config_file, EntryKind, ReadPolicy, ReadRefusal, SafeDir};
+use crate::safe_read::{
+    read_config_file, read_trusted_client_config, trusted_client_config_ok, EntryKind, ReadPolicy,
+    ReadRefusal, SafeDir,
+};
 use crate::{SjError, SCHEMA_MCP_AUDIT_V1};
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
@@ -928,11 +931,19 @@ pub fn audit_mcp_with_processes(
 
     for file in files {
         let file_str = file.to_string_lossy().into_owned();
-        if check_path_protection(&file, &ctx).protected {
+        // files from the fixed default table may sit in a client home the gate protects for
+        // cleanup (`~/.codex`, `~/.config`, `Library`); an explicit --config-dir never may
+        let table_file = default_discovery && trusted_client_config_ok(&file, &policy);
+        if !table_file && check_path_protection(&file, &ctx).protected {
             warnings.push(format!("protected_target: {file_str}"));
             continue;
         }
-        let raw = match read_config_file(&file, &policy) {
+        let read = if default_discovery {
+            read_trusted_client_config(&file, &policy)
+        } else {
+            read_config_file(&file, &policy)
+        };
+        let raw = match read {
             Ok(r) => r,
             Err(refusal) => {
                 warnings.push(format!(

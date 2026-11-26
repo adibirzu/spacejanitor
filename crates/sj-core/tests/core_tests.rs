@@ -2988,9 +2988,12 @@ fn protect_cross_platform_posix_and_windows_roots() {
         );
     }
 
+    // a drive-letter string is rejected outright on a POSIX host (main's gate), so the
+    // "unprotected user path" half is only meaningful where the OS understands the path
+    #[cfg(windows)]
     assert!(
         !check_path_protection(
-            Path::new("C:\\Users\\alice\\AppData\\Local\\Temp\\work"),
+            Path::new("C:\\Users\\alice\\projects\\work"),
             &ctx
         )
         .protected,
@@ -3098,7 +3101,7 @@ fn protect_covers_claude_state_files_and_app_support_pure_string_windows_and_pos
     }
     assert!(
         !is_protected_path(
-            "/home/developer/Library/Application Support/Other",
+            "/home/developer/projects/Other",
             home,
             &[]
         )
@@ -3121,7 +3124,7 @@ fn r3_b6_windows_drive_exact_paths_match_case_insensitively() {
     }
     assert!(
         !sj_core::is_protected_path(
-            "c:\\users\\alice\\documents\\other.pdf",
+            "c:\\users\\alice\\projects\\other.pdf",
             "C:\\Users\\alice",
             &exact
         )

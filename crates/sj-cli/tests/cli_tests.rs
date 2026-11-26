@@ -928,7 +928,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
                 symlink(abs(step["target"].as_str().unwrap()), abs(l)).unwrap();
             }
         }
-        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(|c| abs(c)).unwrap_or_else(|| root.clone());
+        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(abs).unwrap_or_else(|| root.clone());
         fs::create_dir_all(&cwd).unwrap();
         let home = abs(case["home"].as_str().unwrap());
         let list = |k: &str| -> Vec<String> {
@@ -1036,6 +1036,8 @@ fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it
     assert_eq!(planned(&["--include-trash"]), 1);
     assert_eq!(planned(&["--include-orphans"]), 0, "documented sj semantics: orphans INSTEAD of trash");
     assert_eq!(planned(&["--include-trash", "--include-orphans"]), 1, "trash plus orphans keeps the trash item");
+}
+
 #[test]
 fn cli_memory_blockers_mcp_audit_and_reap_end_to_end() {
     let tmp = tempdir().unwrap();
@@ -1227,7 +1229,9 @@ fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
     ] {
         let _ = fs::File::open(&p).unwrap().set_modified(old);
     }
-    std::os::unix::fs::symlink("/nonexistent-sj-cli-fixture", h.join(".codex/skills/dead"))
+    // `.codex` is a protected credential root on main (read-only for the audit), so the
+    // removable-symlink fixture lives in an unprotected client root.
+    std::os::unix::fs::symlink("/nonexistent-sj-cli-fixture", h.join(".agents/skills/dead"))
         .unwrap();
     fs::write(
         h.join(".codex/config.toml"),
@@ -1271,7 +1275,7 @@ fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
     assert!(!text.contains("CLI_TOK_SECRET") && !text.contains("CLI_CLAUDE_MARKER"));
     // nothing moved
     assert!(h.join(".agents/skills/stale-skill").is_dir());
-    assert!(fs::symlink_metadata(h.join(".codex/skills/dead")).is_ok());
+    assert!(fs::symlink_metadata(h.join(".agents/skills/dead")).is_ok());
 
     // no execute path exists
     let ex = Command::new(sj_bin())

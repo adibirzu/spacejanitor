@@ -77,6 +77,51 @@ pub(crate) fn read_config_file(
     path: &Path,
     policy: &ReadPolicy<'_>,
 ) -> Result<String, ReadRefusal> {
+    read_config_file_inner(path, policy, false)
+}
+
+/// Home-relative subtrees that the sj gate protects wholesale as *cleanup* targets (credentials
+/// and user data live there) but under which the audits' fixed client-config tables sit
+/// (`~/.codex/config.toml`, `~/.config/opencode/opencode.json`, VS Code's `mcp.json`).
+const TRUSTED_CLIENT_HOMES: &[&str] = &[".codex", ".config", "Library", "AppData"];
+
+/// Like [`read_config_file`] for a path taken from one of the audits' FIXED client-config
+/// tables. The file may sit inside a subtree the gate protects for cleanup, because reading it is
+/// what the audit is for, but only when ALL of these hold: the verdict is exactly one of
+/// [`TRUSTED_CLIENT_HOMES`] (never `.ssh`, `.claude`, system roots, key material, ...), the
+/// canonical path equals the lexical in-home path (no symlink anywhere on the way), and the
+/// handle checks of [`read_config_file`] pass. Output still goes through the closed vocabulary.
+pub(crate) fn read_trusted_client_config(
+    path: &Path,
+    policy: &ReadPolicy<'_>,
+) -> Result<String, ReadRefusal> {
+    read_config_file_inner(path, policy, true)
+}
+
+/// True when `path` (lexical, under the home) is protected ONLY because it sits in a trusted
+/// client home and no symlink is involved. Used to skip the caller's pre-check for table files.
+pub(crate) fn trusted_client_config_ok(path: &Path, policy: &ReadPolicy<'_>) -> bool {
+    let Ok(canon) = fs::canonicalize(path) else {
+        return false;
+    };
+    let Ok(rel) = path.strip_prefix(&policy.ctx.home_dir) else {
+        return false;
+    };
+    if canon != policy.canon_home.join(rel) {
+        return false;
+    }
+    let v = check_path_protection(&canon, policy.ctx);
+    !v.protected
+        || TRUSTED_CLIENT_HOMES
+            .iter()
+            .any(|h| v.reason == format!("protected_credential_store:~/{h}"))
+}
+
+fn read_config_file_inner(
+    path: &Path,
+    policy: &ReadPolicy<'_>,
+    trusted_client: bool,
+) -> Result<String, ReadRefusal> {
     let lm = fs::symlink_metadata(path).map_err(|_| ReadRefusal::Unreadable)?;
     if lm.file_type().is_symlink() {
         return Err(ReadRefusal::Symlink);
@@ -100,7 +145,12 @@ pub(crate) fn read_config_file(
     if policy.require_in_home && !canon.starts_with(policy.canon_home) {
         return Err(ReadRefusal::OutsideHome);
     }
-    if check_path_protection(&canon, policy.ctx).protected {
+    let protected = if trusted_client {
+        !trusted_client_config_ok(path, policy)
+    } else {
+        check_path_protection(&canon, policy.ctx).protected
+    };
+    if protected {
         return Err(ReadRefusal::Protected);
     }
     // The handle we hold must be the file at the canonical path we just validated.
@@ -367,5 +417,46 @@ mod tests {
         // names-only exception applies to exactly one directory
         assert!(SafeDir::open(&h.join(".ssh"), &p, Some(&h.join(".ssh"))).is_ok());
         assert!(SafeDir::open(&h.join(".ssh"), &p, Some(&h.join("other"))).is_err());
+    }
+
+    #[test]
+    fn trusted_client_config_reads_protected_client_homes_but_nothing_else() {
+        let tmp = tempdir().unwrap();
+        let h = tmp.path().canonicalize().unwrap();
+        let ctx = ProtectionContext::new(h.clone(), vec![]);
+        let p = policy(&ctx, &h, true);
+        for (rel, ok) in [
+            (".codex/config.toml", true),
+            (".config/opencode/opencode.json", true),
+            // credential stores and Claude state are never readable through the trusted path
+            (".ssh/config", false),
+            (".aws/credentials", false),
+            (".claude/settings.json", false),
+            (".gnupg/gpg.conf", false),
+        ] {
+            let f = h.join(rel);
+            fs::create_dir_all(f.parent().unwrap()).unwrap();
+            fs::write(&f, "x = 1\n").unwrap();
+            assert_eq!(read_trusted_client_config(&f, &p).is_ok(), ok, "{rel}");
+        }
+        // the plain reader still refuses every protected root (explicit --config-dir path)
+        assert!(matches!(
+            read_config_file(&h.join(".codex/config.toml"), &p),
+            Err(ReadRefusal::Protected)
+        ));
+    }
+
+    #[test]
+    fn trusted_client_config_refuses_a_symlinked_client_home() {
+        let tmp = tempdir().unwrap();
+        let h = tmp.path().canonicalize().unwrap().join("home");
+        let elsewhere = tmp.path().canonicalize().unwrap().join("elsewhere");
+        fs::create_dir_all(&h).unwrap();
+        fs::create_dir_all(&elsewhere).unwrap();
+        fs::write(elsewhere.join("config.toml"), "x = 1\n").unwrap();
+        symlink(&elsewhere, h.join(".codex")).unwrap();
+        let ctx = ProtectionContext::new(h.clone(), vec![]);
+        let p = policy(&ctx, &h, true);
+        assert!(read_trusted_client_config(&h.join(".codex/config.toml"), &p).is_err());
     }
 }
