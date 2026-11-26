@@ -94,6 +94,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build the Rust sj gate (desktop integration tests drive the real binary)
         run: cargo build -p sj-cli
+      - name: Electron pin must match the installed electron (electron-builder packages the pin, not the dependency)
+        run: node apps/desktop/scripts/electron-pin.cjs check
       - name: Typecheck desktop and UI
         run: npm run desktop:typecheck
       - name: Run desktop tests
@@ -102,6 +104,35 @@ jobs:
         run: npm run desktop:test
         env:
           SPACEJANITOR_NO_SJ: "1"
+
+  desktop-package-smoke:
+    name: Desktop package & start (macos-15)
+    runs-on: macos-15
+    env:
+      # Electron >= 42 does not download itself on install; electron-builder fetches the pinned runtime
+      # for packaging, so this job passes with the skip flag set exactly like the test jobs.
+      ELECTRON_SKIP_BINARY_DOWNLOAD: "1"
+      CSC_IDENTITY_AUTO_DISCOVERY: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install workspace dependencies
+        run: npm ci
+      - name: Build and stage the Rust sj gate
+        run: |
+          cargo build --release -p sj-cli
+          mkdir -p apps/desktop/resources/bin
+          cp target/release/sj apps/desktop/resources/bin/sj
+          chmod +x apps/desktop/resources/bin/sj
+      - name: Build UI & Electron main/preload
+        run: npm run desktop:build
+      - name: Pack (unsigned, --dir, no publish)
+        run: npm --workspace @spacejanitor/desktop run pack
+      - name: Packaged binary must be the pinned Electron, and the packaged app must start and answer through the bundled sj
+        run: node apps/desktop/scripts/verify-packaged-electron.cjs --platform darwin --probe
 
   # Electron desktop release matrix (enabled once M5 desktop bundle lands):
   #   - macOS Universal (arm64 + x86_64) on macos-15

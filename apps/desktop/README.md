@@ -5,6 +5,10 @@ Per [ADR-001](../../docs/adr/ADR-001-desktop-runtime-tauri-vs-electron.md), Spac
 - **Linux:** `linux-x64` and `linux-arm64` (`.AppImage` / `.deb`, zero WebKitGTK version lock)
 - **Windows:** `win32-x64` and `win32-arm64` (`.msi` / `.exe` / NSIS)
 
+## Electron version pin
+
+`electron-builder` packages the runtime named by `electronVersion` in `electron-builder.yml`, not the `electron` devDependency, so the two must be bumped together. `node scripts/electron-pin.cjs check` (CI, and a desktop test) fails on any drift, and `scripts/verify-packaged-electron.cjs` re-reads the Electron version from the packaged binary after packing (CI on macOS, and every release target). Since Electron 42 the `electron` package no longer downloads its binary on install: `npm start` runs `scripts/ensure-electron.cjs` for you, and packaging does not need it (electron-builder downloads its own copy).
+
 ## Tray Memory Discipline
 
 When minimized/closed to the menu bar or system tray, the Electron main process destroys the `BrowserWindow` renderer and keeps only the lightweight Rust telemetry daemon active (`~8–20 MiB`), recreating the UI window on demand.

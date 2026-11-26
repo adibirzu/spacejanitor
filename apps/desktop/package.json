@@ -9,6 +9,9 @@
   "scripts": {
     "generate-icons": "node scripts/generate-icons.mjs",
     "typecheck": "tsc --noEmit",
+    "electron:ensure": "node scripts/ensure-electron.cjs",
+    "electron:pin": "node scripts/electron-pin.cjs check",
+    "start": "node scripts/ensure-electron.cjs && electron .",
     "build": "node scripts/generate-icons.mjs && tsc",
     "test": "tsc -p tsconfig.test.json && node --test dist-test/test/*.test.js",
     "pack": "electron-builder --config electron-builder.yml --dir --publish never",
@@ -19,7 +22,7 @@
   },
   "devDependencies": {
     "@types/node": "^22.10.0",
-    "electron": "35.7.5",
+    "electron": "42.11.16",
     "electron-builder": "^26.0.12",
     "typescript": "^5.8.2"
   }
