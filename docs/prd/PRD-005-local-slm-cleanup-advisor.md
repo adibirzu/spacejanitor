@@ -1,7 +1,7 @@
 # PRD-005: On-Demand Local SLM Cleanup & Forensics Advisor
 
 **Version:** 1.0  
-**Status:** Draft  
+**Status:** Partially implemented (loopback advisor on `main`; GGUF spawning, grammar decoding and benchmarks not implemented)
 **Related ADRs:** [ADR-004](../adr/ADR-004-privacy-zero-leak-and-two-step-remediation.md), [ADR-005](../adr/ADR-005-local-slm-cleanup-advisor.md)
 
 ---
@@ -37,3 +37,18 @@ When SpaceJanitor surfaces unfamiliar large directories, idle worktrees, OS Tras
 
 - **M1 (PRD-005 / Milestone 6):** Grammar schema + redacted prompt builder + memory-pressure self-guard + deterministic re-validator pass synthetic unit tests with 0% unsafe recommendations.
 - **M2 (Fleet Eval):** Benchmark across macOS ARM64, Linux x64/ARM64, and Windows hosts records peak RAM, inference latency, and JSON accuracy.
+
+---
+
+## Implementation Status (as of `main`, PR #10)
+
+| Requirement | State | Where |
+|---|---|---|
+| FR-5.1 Opt-in, on-demand | Implemented against a **loopback OpenAI-compatible endpoint** (for example Ollama), only on request and with a user-supplied URL. SpaceJanitor does not spawn or unload `llama.cpp` itself | `packages/core/src/slm.mjs`, `apps/desktop/src/slmAdvisor.ts` |
+| FR-5.2 Grammar-constrained proposals | Partial: JSON-shaped response with `temperature 0.1`, parsed and validated; **no GBNF or JSON-schema constrained decoding** | `slm.mjs` |
+| FR-5.3 Memory self-guard | Implemented: refuses below `2.5 GiB` free RAM (returns no proposals; no deterministic fallback) | `slm.mjs` |
+| FR-5.4 Deterministic re-validation | Implemented: every proposed path goes through the Rust `sj protect` gate; protected targets become `keep_protected` | `slm.mjs`, `candidateAnnotations.ts` |
+| FR-5.5 Model presets | Not implemented (default model name only) | n/a |
+| FR-5.6 Evaluation harness | Not implemented | n/a |
+
+The advisor has **no execution capability**; any action still goes through the `sj` two-step gate. Loopback-only enforcement covers `127.0.0.1`, `localhost` and `::1`.

@@ -1,7 +1,7 @@
 # PRD-001: Core Storage, Trash & Orphan Work Engine
 
 **Version:** 1.0  
-**Status:** Draft  
+**Status:** Partially implemented (core engine on `main`; Tier/idle-age/delta/script-generation items open)
 **Related ADRs:** [ADR-002](../adr/ADR-002-cross-platform-os-telemetry-and-orphan-safety.md), [ADR-004](../adr/ADR-004-privacy-zero-leak-and-two-step-remediation.md)
 
 ---
@@ -36,3 +36,21 @@ Developers running containers, multi-language toolchains, and AI coding agents a
 
 - **M1:** Core path protection, git clean/pushed validator, Trash scanner, and Tier 1/2 classification pass cross-platform unit tests on `ubuntu-latest`, `macos-15`, and `windows-latest`.
 - **M2:** Dry-run script generator emits syntactically valid, idempotent cleanup plans with zero modifications during dry-run verification.
+
+---
+
+## Implementation Status (as of `main`, after PRs #8, #10, #11, #15)
+
+| Requirement | State | Where |
+|---|---|---|
+| FR-1.1 Capacity and mounts | Implemented | `sj scan` (`crates/sj-core/src/scan.rs`, `--same-fs`); capacity via AXI `disk` (`packages/core/src/telemetry.mjs`) |
+| FR-1.2 Trash / Recycle Bin | Implemented (size and item list; age distribution not reported) | `sj trash` (`trash.rs`) |
+| FR-1.3 Tiering | Partial: Trash items are `tier1`, verified orphan worktrees `tier2`; protected items excluded. No Tier-1 cache classifier in `sj`; caches are listed read-only in the desktop UI | `plan.rs` |
+| FR-1.4 Orphan proof | Implemented, **opt-in and off by default**: clean tree, remote, stashes, unpushed commits, ignored files, detached/unborn HEAD, nested repos; never `lsof +D`. **Not implemented:** minimum idle age and active-process-CWD check | `orphans.rs`; hardening in [#12](https://github.com/adibirzu/spacejanitor/issues/12) |
+| FR-1.5 `manual_review_only` bloat | Not implemented | n/a |
+| FR-1.6 New-consumer detection and deltas | Not implemented | n/a |
+| FR-1.7 Dry-run plans and preview scripts | Partial: deterministic plans with SHA-256 and selection digests are implemented; **bash/PowerShell preview scripts are not** | `plan.rs`, `sj plan --select` |
+| NFR zero data loss | Implemented: Rust protection gate, no-follow handle-anchored removal, execute-time re-checks; **Unix-only** removal (Windows plans only) | `protect.rs`, `safe_remove.rs` |
+| NFR latency `< 15 s` | Not benchmarked | n/a |
+
+**Open items:** [#12](https://github.com/adibirzu/spacejanitor/issues/12) (git-proof hardening B35-B37; orphan scanning stays off by default until fixed), Windows removal, items marked "Not implemented" above, and the M7 release matrix (no tag yet, no published artifacts). Linux additions are in open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18).
