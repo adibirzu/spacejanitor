@@ -2991,13 +2991,12 @@ fn protect_cross_platform_posix_and_windows_roots() {
     // a drive-letter string is rejected outright on a POSIX host (main's gate), so the
     // "unprotected user path" half is only meaningful where the OS understands the path
     #[cfg(windows)]
+    let verdict = check_path_protection(Path::new("C:\\Users\\alice\\projects\\work"), &ctx);
+    #[cfg(windows)]
     assert!(
-        !check_path_protection(
-            Path::new("C:\\Users\\alice\\projects\\work"),
-            &ctx
-        )
-        .protected,
-        "Non-protected Windows user temp path should not be blocked"
+        !verdict.protected,
+        "Non-protected Windows user path should not be blocked (reason: {})",
+        verdict.reason
     );
 }
 
