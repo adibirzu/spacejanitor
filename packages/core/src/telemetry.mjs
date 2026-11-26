@@ -1107,7 +1107,12 @@ function parseContainerPs(stdout, runtime) {
       image: String(obj.Image || ""),
       status,
       state,
-      sizeBytes: typeof obj.Size === "number" ? obj.Size : parseHumanSize(obj.Size),
+      sizeBytes:
+        typeof obj.Size === "number"
+          ? obj.Size
+          : obj.Size && typeof obj.Size === "object"
+            ? Number(obj.Size.rwSize) || 0
+            : parseHumanSize(obj.Size),
       stopped,
       unhealthy,
     });
@@ -1198,10 +1203,10 @@ export async function collectLinuxAudit({
 
   const [dockerDfRes, dockerPsRes, dockerImgRes, podmanDfRes, podmanPsRes, journalRes] = await Promise.all([
     runExec("docker", ["system", "df", "--format", "{{json .}}"]),
-    runExec("docker", ["ps", "-a", "--format", "{{json .}}"]),
+    runExec("docker", ["ps", "-a", "--size", "--format", "{{json .}}"]),
     runExec("docker", ["images", "--filter", "dangling=true", "--format", "{{json .}}"]),
     runExec("podman", ["system", "df", "--format", "json"]),
-    runExec("podman", ["ps", "-a", "--format", "json"]),
+    runExec("podman", ["ps", "-a", "--size", "--format", "json"]),
     platform === "linux" ? runExec("journalctl", ["--disk-usage"]) : Promise.resolve({ ok: false, stdout: "" }),
   ]);
 

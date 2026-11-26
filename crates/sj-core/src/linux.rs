@@ -567,6 +567,12 @@ pub fn parse_podman_ps(stdout: &str) -> Vec<ContainerInfo> {
             .and_then(|v| v.as_str())
             .map(parse_human_size)
             .or_else(|| obj.get("Size").and_then(|v| v.as_u64()))
+            // podman >= 4 with --size: {"rootFsSize":N,"rwSize":N}; rwSize is what `rm` frees.
+            .or_else(|| {
+                obj.get("Size")
+                    .and_then(|v| v.get("rwSize"))
+                    .and_then(|v| v.as_u64())
+            })
             .unwrap_or(0);
         let unhealthy = status.to_ascii_lowercase().contains("unhealthy");
         out.push(ContainerInfo {
@@ -1141,7 +1147,7 @@ pub fn discover_linux_audit(home_dir: &Path, tmp_dir: Option<&Path>) -> LinuxAud
     let docker_df_raw = run_cmd_capture("docker", &["system", "df", "--format", "{{json .}}"])
         .unwrap_or_default();
     let docker_ps_raw =
-        run_cmd_capture("docker", &["ps", "-a", "--format", "{{json .}}"]).unwrap_or_default();
+        run_cmd_capture("docker", &["ps", "-a", "--size", "--format", "{{json .}}"]).unwrap_or_default();
     let docker_images_raw = run_cmd_capture(
         "docker",
         &["images", "--filter", "dangling=true", "--format", "{{json .}}"],
@@ -1152,7 +1158,7 @@ pub fn discover_linux_audit(home_dir: &Path, tmp_dir: Option<&Path>) -> LinuxAud
     let podman_df_raw =
         run_cmd_capture("podman", &["system", "df", "--format", "json"]).unwrap_or_default();
     let podman_ps_raw =
-        run_cmd_capture("podman", &["ps", "-a", "--format", "json"]).unwrap_or_default();
+        run_cmd_capture("podman", &["ps", "-a", "--size", "--format", "json"]).unwrap_or_default();
     let podman = build_container_audit("podman", &podman_df_raw, &podman_ps_raw, "");
 
     let journald_raw = if cfg!(target_os = "linux") {

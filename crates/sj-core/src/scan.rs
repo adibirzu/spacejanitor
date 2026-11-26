@@ -1,4 +1,4 @@
-use crate::linux::{live_proc_mounts, statvfs_bytes, MountKind};
+use crate::linux::{live_proc_mounts, statvfs_bytes, MountInfo, MountKind};
 use crate::protect::{check_path_protection_anchored, ProtectionContext};
 use crate::{SjError, SCHEMA_STORAGE_V1};
 use jwalk::WalkDir;
@@ -106,6 +106,25 @@ pub fn scan_directory(
     ctx: &ProtectionContext,
     opts: &ScanOptions,
 ) -> Result<ScanReport, SjError> {
+    scan_directory_with_mounts(root, ctx, opts, live_proc_mounts())
+}
+
+/// Map a walked path (prefixed with the scan root exactly as the caller spelled it, possibly
+/// relative) onto the canonical root so it compares like-for-like with absolute mountpoints.
+fn canonical_walk_path(root: &Path, root_canon: &Path, p: &Path) -> std::path::PathBuf {
+    match p.strip_prefix(root) {
+        Ok(rel) => root_canon.join(rel),
+        Err(_) => p.to_path_buf(),
+    }
+}
+
+/// `scan_directory` with an explicit mount table (tests inject one; production uses /proc/mounts).
+pub fn scan_directory_with_mounts(
+    root: &Path,
+    ctx: &ProtectionContext,
+    opts: &ScanOptions,
+    mounts: Vec<MountInfo>,
+) -> Result<ScanReport, SjError> {
     if opts.max_depth == 0 {
         return Err(SjError::ExecutionGate("max_depth must be >= 1".to_string()));
     }
@@ -136,7 +155,7 @@ pub fn scan_directory(
     let fs_caps = statvfs_bytes(&root_canon);
     let root_canon_str = root_canon.to_string_lossy().into_owned();
     let skip_mount_set: Arc<HashSet<String>> = Arc::new(
-        live_proc_mounts()
+        mounts
             .into_iter()
             .filter(|m| {
                 m.mountpoint != root_canon_str
@@ -155,6 +174,8 @@ pub fn scan_directory(
     let skipped_mounts_clone = Arc::clone(&skipped_mounts);
     let skip_mount_set_clone = Arc::clone(&skip_mount_set);
     let ctx_clone = ctx.clone();
+    let walk_root = root.to_path_buf();
+    let walk_root_canon = root_canon.clone();
     let same_fs = opts.same_filesystem;
 
     let mut top_agg: BTreeMap<String, (u64, u64, String)> = BTreeMap::new();
@@ -181,7 +202,8 @@ pub fn scan_directory(
                 }
                 let p = entry.path();
                 let p_str = p.to_string_lossy();
-                if skip_mount_set_clone.contains(p_str.as_ref()) {
+                let canon_key = canonical_walk_path(&walk_root, &walk_root_canon, &p);
+                if skip_mount_set_clone.contains(canon_key.to_string_lossy().as_ref()) {
                     if let Ok(mut guard) = skipped_mounts_clone.lock() {
                         guard.push(p_str.into_owned());
                     }

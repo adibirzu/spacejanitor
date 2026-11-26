@@ -303,3 +303,36 @@ test("collectLinuxAudit never flags a /tmp directory as stale when a descendant 
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test("collectLinuxAudit asks docker/podman for container sizes (Size is empty without --size)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-size-"));
+  const calls = [];
+  const audit = await collectLinuxAudit({
+    platformOverride: "linux",
+    homeDir: home,
+    tmpDir: path.join(home, "tmp"),
+    aptArchivesDir: path.join(home, "apt"),
+    mountsRaw: "/dev/sda1 / ext4 rw 0 0",
+    execFn: async (cmd, args) => {
+      calls.push([cmd, ...args]);
+      const sized = args.includes("--size") || args.includes("-s");
+      if (cmd === "docker" && args[0] === "ps") {
+        return {
+          ok: true,
+          stdout: JSON.stringify({ ID: "c1", Names: "old", Image: "x", Status: "Exited (0) 2d ago", State: "exited", Size: sized ? "5MB (virtual 120MB)" : "" }),
+        };
+      }
+      if (cmd === "podman" && args[0] === "ps") {
+        return {
+          ok: true,
+          stdout: JSON.stringify([{ Id: "p1", Names: ["pold"], State: "exited", Status: "Exited (0) 5d ago", Size: sized ? { rootFsSize: 9e6, rwSize: 7e6 } : undefined }]),
+        };
+      }
+      return { ok: false, stdout: "" };
+    },
+  });
+  assert.ok(calls.some((c) => c[0] === "docker" && c[1] === "ps" && c.includes("--size")), JSON.stringify(calls));
+  assert.ok(calls.some((c) => c[0] === "podman" && c[1] === "ps" && c.includes("--size")), JSON.stringify(calls));
+  assert.equal(audit.docker.exitedContainers[0].sizeBytes, 5e6);
+  assert.equal(audit.podman.exitedContainers[0].sizeBytes, 7e6);
+});
