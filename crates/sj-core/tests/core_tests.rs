@@ -2991,7 +2991,11 @@ fn protect_cross_platform_posix_and_windows_roots() {
     // a drive-letter string is rejected outright on a POSIX host (main's gate), so the
     // "unprotected user path" half is only meaningful where the OS understands the path
     #[cfg(windows)]
-    let verdict = check_path_protection(Path::new("C:\\Users\\alice\\projects\\work"), &ctx);
+    let verdict = check_path_protection(
+        Path::new("C:\\Users\\alice\\projects\\work"),
+        // the user's own home: another user's `C:/Users/*` is a protected foreign home
+        &ProtectionContext::new(PathBuf::from("C:\\Users\\alice"), vec![]),
+    );
     #[cfg(windows)]
     assert!(
         !verdict.protected,
