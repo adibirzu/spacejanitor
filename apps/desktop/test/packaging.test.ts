@@ -131,3 +131,22 @@ test("packaging: release.yml verifies the bundled sj of every desktop target aft
   assert.match(matrix, /verify-packaged-sj\.cjs --platform \$\{\{ matrix\.sj_platform \}\} --arch \$\{\{ matrix\.sj_arch \}\}/);
   assert.ok(matrix.indexOf("verify-packaged-sj.cjs") > matrix.indexOf("electron-builder --config"), "verify runs after packing");
 });
+
+test("packaging: linux/win targets carry no arch lists, so each CI job packs only the arch its flag selects", () => {
+  const cfg = fs.readFileSync(path.join(repoRoot, "apps/desktop/electron-builder.yml"), "utf8");
+  const section = (name: string): string => {
+    const m = cfg.match(new RegExp(`^${name}:\\n((?:[ \\t].*\\n?|\\n)*)`, "m"));
+    assert.ok(m, `${name} section present`);
+    return m[1];
+  };
+  for (const name of ["linux", "win"]) {
+    assert.doesNotMatch(section(name), /^\s*arch:/m, `${name}: arch lists in config override the --x64/--arm64 CLI flag`);
+  }
+  // macOS keeps its explicit universal target (the lipo'd sj is staged for it).
+  assert.match(section("mac"), /- universal/);
+});
+
+test("packaging: linux executableName is a safe path component (not the scoped npm package name)", () => {
+  const cfg = fs.readFileSync(path.join(repoRoot, "apps/desktop/electron-builder.yml"), "utf8");
+  assert.match(cfg, /^linux:\n(?:[ \t].*\n)*?[ \t]+executableName:\s*spacejanitor\s*$/m);
+});
