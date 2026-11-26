@@ -21,6 +21,8 @@ jobs:
           node-version: 22
       - name: Run SpaceJanitor OSS hygiene gate
         run: node scripts/check-oss-hygiene.mjs
+      - name: Release tag script tests
+        run: node --test scripts/test/*.test.mjs
       - name: Run gitleaks
         uses: gitleaks/gitleaks-action@v2
         env:
