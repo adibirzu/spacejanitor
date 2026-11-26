@@ -13,7 +13,7 @@ const fs = require("node:fs");
 const path = require("node:path");
 
 const SCAN_CHUNK_BYTES = 8 * 1024 * 1024;
-const MARKER = /Electron\/(\d+\.\d+\.\d+)/g;
+const MARKER = /Electron\/(\d+\.\d+\.\d+)(?![\d.])/g;
 const EXACT_SEMVER = /^\d+\.\d+\.\d+$/;
 
 function parsePin(yamlText) {
@@ -71,10 +71,14 @@ function scanBinaryVersions(file) {
     let carry = 0;
     for (;;) {
       const n = fs.readSync(fd, buf, carry, SCAN_CHUNK_BYTES, null);
-      if (n === 0) break;
-      const text = buf.toString("latin1", 0, carry + n);
-      for (const m of text.matchAll(MARKER)) found.add(m[1]);
       const total = carry + n;
+      const text = buf.toString("latin1", 0, total);
+      for (const m of text.matchAll(MARKER)) {
+        // A match touching the end of a non-final read may be cut mid-version (42.11.1 of 42.11.16): the
+        // retained overlap re-reads it whole in the next round, so only record it when the file ended.
+        if (n === 0 || m.index + m[0].length < total) found.add(m[1]);
+      }
+      if (n === 0) break;
       carry = Math.min(overlap, total);
       buf.copy(buf, 0, total - carry, total);
     }

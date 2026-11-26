@@ -2,7 +2,7 @@
 /**
  * Post-pack gate: prove from the packaged binary itself (not from config) which Electron shipped, and
  * optionally start the packaged app and probe it over the DevTools protocol.
- *   node scripts/verify-packaged-electron.cjs --platform darwin|linux|win32 [--probe]
+ *   node scripts/verify-packaged-electron.cjs --platform darwin|linux|win32 [--arch x64|arm64|universal] [--probe]
  * Expected version = the electron-builder.yml pin.
  */
 const fs = require("node:fs");
@@ -30,15 +30,18 @@ function macApps() {
 }
 
 /** Binaries that carry the Electron version marker, one set per packaged app. */
-function electronBinaries(platform) {
+function electronBinaries(platform, arch) {
   if (platform === "darwin") {
     return macApps().map((app) => path.join(app, "Contents", "Frameworks", "Electron Framework.framework", "Versions", "A", "Electron Framework"));
   }
   const out = [];
   for (const e of fs.existsSync(releaseDir) ? fs.readdirSync(releaseDir, { withFileTypes: true }) : []) {
     if (!e.isDirectory() || !e.name.endsWith("-unpacked")) continue;
+    const prefix = platform === "win32" ? "win-" : "linux-";
+    if (!e.name.startsWith(prefix)) continue;
+    if (arch === "arm64" ? !e.name.includes("arm64") : arch && e.name.includes("arm64")) continue;
     const dir = path.join(releaseDir, e.name);
-    const files = fs.readdirSync(dir, { withFileTypes: true }).filter((f) => f.isFile()).map((f) => ({ p: path.join(dir, f.name), size: fs.statSync(path.join(dir, f.name)).size }));
+    const files = fs.readdirSync(dir, { withFileTypes: true }).filter((f) => f.isFile() && (platform !== "win32" || f.name.endsWith(".exe"))).map((f) => ({ p: path.join(dir, f.name), size: fs.statSync(path.join(dir, f.name)).size }));
     files.sort((a, b) => b.size - a.size);
     if (files.length && files[0].size > 50 * 1024 * 1024) out.push(files[0].p);
   }
@@ -48,9 +51,12 @@ function electronBinaries(platform) {
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 async function probe(app, expected) {
-  const exe = path.join(app, "Contents", "MacOS", fs.readdirSync(path.join(app, "Contents", "MacOS"))[0]);
+  const macosDir = path.join(app, "Contents", "MacOS");
+  const exeName = fs.readdirSync(macosDir).find((f) => !f.startsWith(".") && fs.statSync(path.join(macosDir, f)).isFile());
+  const exe = path.join(macosDir, exeName);
+  const userData = fs.mkdtempSync(path.join(require("node:os").tmpdir(), "sj-probe-"));
   const port = 9300 + Math.floor(Math.random() * 500);
-  const child = spawn(exe, [`--remote-debugging-port=${port}`], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ELECTRON_ENABLE_LOGGING: "1" } });
+  const child = spawn(exe, [`--remote-debugging-port=${port}`, `--user-data-dir=${userData}`], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ELECTRON_ENABLE_LOGGING: "1" } });
   let log = "";
   let exited = null;
   child.stdout.on("data", (d) => (log += d));
@@ -70,7 +76,7 @@ async function probe(app, expected) {
     if (!page) throw new Error(`no window created; output:\n${log}`);
     const version = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
     result.runtime = version.Browser;
-    if (!String(version["User-Agent"]).includes(`Electron/${expected}`)) throw new Error(`runtime reports ${version["User-Agent"]}, expected Electron/${expected}`);
+    if (!new RegExp(`Electron/${expected.replace(/\./g, "\\.")}(?![\\d.])`).test(String(version["User-Agent"]))) throw new Error(`runtime reports ${version["User-Agent"]}, expected Electron/${expected}`);
     const ws = new WebSocket(page.webSocketDebuggerUrl);
     await new Promise((r, j) => { ws.onopen = r; ws.onerror = j; });
     let id = 0;
@@ -92,23 +98,25 @@ async function probe(app, expected) {
     try {
       const v = await (await fetch(`http://127.0.0.1:${port}/json/version`)).json();
       const ws2 = new WebSocket(v.webSocketDebuggerUrl);
-      await new Promise((r) => (ws2.onopen = r));
+      await new Promise((r, j) => { ws2.onopen = r; ws2.onerror = j; setTimeout(j, 5000); });
       ws2.send(JSON.stringify({ id: 1, method: "Browser.close" }));
     } catch { /* already gone */ }
     for (let i = 0; i < 20 && !exited; i++) await sleep(500);
     if (!exited) child.kill("SIGKILL");
   }
   result.exit = exited;
+  if (!exited || exited.c !== 0 || exited.s !== null) throw new Error(`packaged app did not exit cleanly: ${JSON.stringify(exited)}`);
   if (/Uncaught|FATAL|Unhandled/i.test(log)) throw new Error(`uncaught error in app output:\n${log}`);
   return result;
 }
 
 async function main() {
   const platform = arg("platform");
-  if (!platform) throw new Error("usage: verify-packaged-electron.cjs --platform <p> [--probe]");
+  const arch = arg("arch");
+  if (!["darwin", "linux", "win32"].includes(platform)) throw new Error("usage: verify-packaged-electron.cjs --platform darwin|linux|win32 [--arch x64|arm64|universal] [--probe]");
   const expected = parsePin(fs.readFileSync(path.join(desktopDir, "electron-builder.yml"), "utf8"));
   if (!expected) throw new Error("no electronVersion pin in electron-builder.yml");
-  const bins = electronBinaries(platform);
+  const bins = electronBinaries(platform, arch);
   if (bins.length === 0) throw new Error(`no packaged Electron binary found under ${releaseDir} for ${platform}`);
   assertPackagedElectron(bins, expected);
   for (const b of bins) console.log(`packaged Electron ${expected} confirmed in binary: ${b}`);

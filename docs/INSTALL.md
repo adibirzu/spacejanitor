@@ -54,7 +54,7 @@ npm run desktop:build
 npm run desktop:pack                      # unpacked app under apps/desktop/ (see electron-builder.yml)
 ```
 
-`npm --workspace @spacejanitor/desktop run start` launches the built app from source. Electron 42 no longer downloads its binary on `npm install`, so `start` first runs `electron:ensure` (a no-op when the binary exists or `ELECTRON_SKIP_BINARY_DOWNLOAD` is set). `desktop:pack` builds an unpacked, unsigned app for your own OS (its `before-pack` check requires a staged `resources/bin/sj` of the right architecture) and `npm run desktop:dist` builds local installers. Nothing is signed or published; the packaging flow is exercised by the release workflow and `apps/desktop` tests, not by a published artifact.
+`npm --workspace @spacejanitor/desktop run start` launches the built app from source. Electron 42 no longer downloads its binary on `npm install`, so `start` first runs `electron:ensure` (a no-op when a matching binary exists; with `ELECTRON_SKIP_BINARY_DOWNLOAD` set it skips the download, so `start` then needs a binary you provide). `desktop:pack` builds an unpacked, unsigned app for your own OS (its `before-pack` check requires a staged `resources/bin/sj` of the right architecture) and `npm run desktop:dist` builds local installers. Nothing is signed or published; the packaging flow is exercised by the release workflow and `apps/desktop` tests, not by a published artifact.
 
 ---
 

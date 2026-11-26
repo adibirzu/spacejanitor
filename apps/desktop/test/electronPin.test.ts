@@ -63,6 +63,28 @@ test("electron pin: scanBinaryVersions finds a marker straddling the read-chunk 
   }
 });
 
+test("electron pin: a version split inside its own digits at the chunk boundary is not misread as a shorter version", () => {
+  const dir = tmp();
+  try {
+    const f = path.join(dir, "big");
+    const chunk = pin.SCAN_CHUNK_BYTES as number;
+    for (const back of [16, 15, 14, 12, 9]) {
+      const buf = Buffer.alloc(chunk * 2, 7);
+      Buffer.from("Electron/42.11.16").copy(buf, chunk - back);
+      fs.writeFileSync(f, buf);
+      assert.deepEqual(pin.scanBinaryVersions(f), ["42.11.16"], `split at -${back}`);
+    }
+    // a marker ending exactly at EOF is still found
+    fs.writeFileSync(f, Buffer.concat([Buffer.alloc(chunk - 17, 7), Buffer.from("Electron/42.11.16")]));
+    assert.deepEqual(pin.scanBinaryVersions(f), ["42.11.16"]);
+    // a longer patch number is not accepted as its prefix
+    fs.writeFileSync(f, Buffer.from("Electron/42.11.161"));
+    assert.deepEqual(pin.scanBinaryVersions(f), ["42.11.161"]);
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test("electron pin: assertPackagedElectron rejects a packaged binary of another version", () => {
   const dir = tmp();
   try {

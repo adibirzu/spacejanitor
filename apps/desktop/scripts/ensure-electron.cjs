@@ -16,7 +16,14 @@ function binaryInstalled() {
   const dir = electronDir();
   const pathTxt = path.join(dir, "path.txt");
   if (!fs.existsSync(pathTxt)) return false;
-  return fs.existsSync(path.join(dir, "dist", fs.readFileSync(pathTxt, "utf8").trim()));
+  if (!fs.existsSync(path.join(dir, "dist", fs.readFileSync(pathTxt, "utf8").trim()))) return false;
+  // A stale dist/ from an earlier Electron must be refreshed (same check as electron/install.js).
+  const want = JSON.parse(fs.readFileSync(path.join(dir, "package.json"), "utf8")).version;
+  try {
+    return fs.readFileSync(path.join(dir, "dist", "version"), "utf8").trim().replace(/^v/, "") === want;
+  } catch {
+    return false;
+  }
 }
 
 function ensureElectron({ env = process.env, run, installed = binaryInstalled } = {}) {
