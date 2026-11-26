@@ -1029,7 +1029,10 @@ export async function collectMcpAudit({ configDirs, homeDir = os.homedir(), reda
   };
 }
 
-export async function collectCleanableCaches({ homeDir = os.homedir(), isProtectedFn = isProtectedPath } = {}) {
+// Same bound as the Rust discovery (check_dir_descendants_safe(.., 50_000)): fail closed past it.
+const LINUX_DESCENDANTS = { descendants: true, maxEntries: 50_000 };
+
+export async function collectCleanableCaches({ homeDir = os.homedir(), isProtectedFn = isProtectedPath, descendants = false } = {}) {
   const knownCaches = [
     path.join(homeDir, ".cache", "npm"),
     path.join(homeDir, ".npm", "_cacache"),
@@ -1049,7 +1052,7 @@ export async function collectCleanableCaches({ homeDir = os.homedir(), isProtect
   ];
   const candidates = [];
   const present = knownCaches.filter((cachePath) => fs.existsSync(cachePath));
-  const verdicts = judgeMany(present, isProtectedFn, { homeDir });
+  const verdicts = judgeMany(present, isProtectedFn, descendants ? { homeDir, ...LINUX_DESCENDANTS } : { homeDir });
   for (const [i, cachePath] of present.entries()) {
     const prot = verdicts[i] || { protected: true };
     if (prot.protected) continue;
@@ -1308,7 +1311,7 @@ export async function collectLinuxAudit({
     }
   }
 
-  const userCaches = await collectCleanableCaches({ homeDir, isProtectedFn });
+  const userCaches = await collectCleanableCaches({ homeDir, isProtectedFn, descendants: true });
 
   const staleTmpEntries = [];
   if ((platform === "linux" || tmpDir !== "/tmp") && tmpDir && fs.existsSync(tmpDir)) {
@@ -1337,7 +1340,7 @@ export async function collectLinuxAudit({
       const verdicts = judgeMany(
         candidates.map((c) => c.full),
         isProtectedFn,
-        { homeDir }
+        { homeDir, ...LINUX_DESCENDANTS }
       );
       for (const [i, c] of candidates.entries()) {
         if (verdicts[i]?.protected !== false) continue;
@@ -1366,8 +1369,11 @@ export async function collectLinuxAudit({
   if (process.env.HF_HOME) modelRoots.push(process.env.HF_HOME);
   if (process.env.OLLAMA_MODELS) modelRoots.push(process.env.OLLAMA_MODELS);
   const modelCaches = [];
-  for (const p of [...new Set(modelRoots)]) {
-    if (!p || !fs.existsSync(p)) continue;
+  // Env-supplied roots must be absolute; every root is judged by the sj gate (with descendants).
+  const modelCandidates = [...new Set(modelRoots)].filter((p) => p && path.isAbsolute(p) && fs.existsSync(p));
+  const modelVerdicts = judgeMany(modelCandidates, isProtectedFn, { homeDir, ...LINUX_DESCENDANTS });
+  for (const [i, p] of modelCandidates.entries()) {
+    if (modelVerdicts[i]?.protected !== false) continue;
     try {
       const st = fs.lstatSync(p);
       if (st.isSymbolicLink()) continue;
@@ -1386,6 +1392,7 @@ export async function collectLinuxAudit({
 
   const oldBackups = [];
   const backupMinAgeMs = staleAgeMs === 0 ? 0 : 30 * 86_400_000;
+  const backupCandidates = [];
   for (const rel of ["backups", "backup", path.join(".local", "share", "backups")]) {
     const dir = path.join(homeDir, rel);
     if (!fs.existsSync(dir)) continue;
@@ -1396,18 +1403,27 @@ export async function collectLinuxAudit({
         const st = fs.lstatSync(full);
         const ageMs = Math.max(0, nowMs - st.mtimeMs);
         if (ageMs < backupMinAgeMs) continue;
-        oldBackups.push({
-          path: full,
-          bytes: st.isDirectory() ? dirSizeBounded(full, 2) : st.size,
-          kind: "old_backup",
-          ageDays: Math.floor(ageMs / 86_400_000),
-          manualReviewOnly: true,
-          reason: "manual_review_only:old_backup",
-        });
+        backupCandidates.push({ full, st, ageMs });
       }
     } catch {
       // ignore
     }
+  }
+  const backupVerdicts = judgeMany(
+    backupCandidates.map((c) => c.full),
+    isProtectedFn,
+    { homeDir, ...LINUX_DESCENDANTS }
+  );
+  for (const [i, c] of backupCandidates.entries()) {
+    if (backupVerdicts[i]?.protected !== false) continue;
+    oldBackups.push({
+      path: c.full,
+      bytes: c.st.isDirectory() ? dirSizeBounded(c.full, 2) : c.st.size,
+      kind: "old_backup",
+      ageDays: Math.floor(c.ageMs / 86_400_000),
+      manualReviewOnly: true,
+      reason: "manual_review_only:old_backup",
+    });
   }
 
   return {

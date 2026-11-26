@@ -1127,7 +1127,7 @@ fn discover_stale_tmp(
     out
 }
 
-fn discover_model_caches(home_dir: &Path) -> Vec<PathArtifact> {
+fn discover_model_caches(home_dir: &Path, ctx: &ProtectionContext) -> Vec<PathArtifact> {
     let mut roots: Vec<PathBuf> = vec![
         home_dir.join(".cache/huggingface/hub"),
         home_dir.join(".ollama/models"),
@@ -1153,6 +1153,14 @@ fn discover_model_caches(home_dir: &Path) -> Vec<PathArtifact> {
         if meta.file_type().is_symlink() {
             continue;
         }
+        // Env-supplied roots must be absolute, and every root passes the same protect checks as
+        // user caches before it is sized or listed.
+        if !p.is_absolute() || check_path_protection_anchored(&p, ctx).protected {
+            continue;
+        }
+        if meta.is_dir() && check_dir_descendants_safe(&p, ctx, 50_000).protected {
+            continue;
+        }
         let bytes = if meta.is_dir() {
             dir_size_bounded_no_follow(&p, 4)
         } else {
@@ -1172,7 +1180,7 @@ fn discover_model_caches(home_dir: &Path) -> Vec<PathArtifact> {
     out
 }
 
-fn discover_old_backups(home_dir: &Path, min_age_secs: u64) -> Vec<PathArtifact> {
+fn discover_old_backups(home_dir: &Path, ctx: &ProtectionContext, min_age_secs: u64) -> Vec<PathArtifact> {
     let mut out = Vec::new();
     for rel in ["backups", "backup", ".local/share/backups"] {
         let dir = home_dir.join(rel);
@@ -1185,6 +1193,12 @@ fn discover_old_backups(home_dir: &Path, min_age_secs: u64) -> Vec<PathArtifact>
                 continue;
             };
             if meta.file_type().is_symlink() {
+                continue;
+            }
+            if check_path_protection_anchored(&p, ctx).protected {
+                continue;
+            }
+            if meta.is_dir() && check_dir_descendants_safe(&p, ctx, 50_000).protected {
                 continue;
             }
             let (age_secs, age_days) = path_age_days(&meta);
@@ -1242,8 +1256,8 @@ pub fn discover_linux_audit_from_fixtures(fx: LinuxFixtures) -> LinuxAuditReport
     let user_caches = discover_user_caches(&fx.home_dir, &ctx);
     let stale_tmp_entries =
         discover_stale_tmp(&fx.tmp_dir, &active_mountpoints, &ctx, fx.stale_age_secs);
-    let model_caches = discover_model_caches(&fx.home_dir);
-    let old_backups = discover_old_backups(&fx.home_dir, fx.stale_age_secs);
+    let model_caches = discover_model_caches(&fx.home_dir, &ctx);
+    let old_backups = discover_old_backups(&fx.home_dir, &ctx, fx.stale_age_secs);
 
     let system_failed = parse_systemctl_failed(&fx.systemctl_system_raw, "system");
     let user_failed = parse_systemctl_failed(&fx.systemctl_user_raw, "user");
@@ -1338,8 +1352,8 @@ pub fn discover_linux_audit(home_dir: &Path, tmp_dir: Option<&Path>) -> LinuxAud
     } else {
         Vec::new()
     };
-    let model_caches = discover_model_caches(home_dir);
-    let old_backups = discover_old_backups(home_dir, DEFAULT_BACKUP_AGE_SECS);
+    let model_caches = discover_model_caches(home_dir, &ctx);
+    let old_backups = discover_old_backups(home_dir, &ctx, DEFAULT_BACKUP_AGE_SECS);
     let systemd = collect_systemd_audit();
 
     LinuxAuditReport {

@@ -17,6 +17,7 @@ import {
   parseProcStatusVmSwap,
   parseSystemctlUnits,
 } from "../src/index.mjs";
+import { collectLinuxAudit as collectLinuxAuditWithGate } from "../src/telemetry.mjs";
 
 test("parseProcMounts handles overlay, tmpfs, and AppImage mounts cleanly without false alerts", () => {
   const raw = [
@@ -186,8 +187,14 @@ test("collectLinuxAudit probes Docker, Podman, journald, apt, AppImage mounts, H
     } else {
       assert.equal(audit.staleTmpEntries.length, 0);
     }
-    assert.ok(audit.modelCaches.some((m) => m.path.includes("huggingface") && m.manualReviewOnly === true));
-    assert.ok(audit.oldBackups.some((b) => b.path.includes("backups") && b.manualReviewOnly === true));
+    if (activeSjBinary()) {
+      assert.ok(audit.modelCaches.some((m) => m.path.includes("huggingface") && m.manualReviewOnly === true));
+      assert.ok(audit.oldBackups.some((b) => b.path.includes("backups") && b.manualReviewOnly === true));
+    } else {
+      // No sj gate available: model caches and backups fail closed (nothing listed unjudged).
+      assert.equal(audit.modelCaches.length, 0);
+      assert.equal(audit.oldBackups.length, 0);
+    }
 
     const toon = formatToon(audit);
     assert.ok(toon.includes("spacejanitor.linux_audit.v1"));
@@ -363,4 +370,49 @@ test("container and systemd free text never reaches JSON or TOON unredacted", as
   assert.deepEqual(audit.docker.exitedContainers.map((c) => c.id).sort(), ["abc123", "ok1"]);
   assert.ok(audit.docker.exitedContainers.some((c) => c.name === "plain_name-1" && c.image === "nginx:1.27"));
   assert.ok(!audit.docker.exitedContainers.some((c) => c.id.startsWith("-")));
+});
+
+test("collectLinuxAudit sends model caches, backups, user caches and tmp through the protect gate (descendants)", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-protect-"));
+  const tmpDir = path.join(home, "tmp");
+  for (const d of [".ssh", ".kube", "backups/nested", ".cache/pip", ".cache/huggingface/hub", "tmp/sj-stale"]) fs.mkdirSync(path.join(home, d), { recursive: true });
+  fs.writeFileSync(path.join(home, ".ssh/id_rsa"), "x");
+  fs.writeFileSync(path.join(home, "backups/.env"), "K=V");
+  fs.writeFileSync(path.join(home, "backups/db.tar"), "x");
+  fs.writeFileSync(path.join(home, "backups/nested/.env"), "K=V");
+  fs.writeFileSync(path.join(home, ".cache/pip/.env"), "K=V");
+  fs.writeFileSync(path.join(home, ".cache/huggingface/hub/m.bin"), "x");
+  fs.writeFileSync(path.join(tmpDir, "sj-stale/.env"), "K=V");
+  const calls = [];
+  // Stand-in for the sj gate: protects credential dirs and, when asked for descendants, any dir holding a .env.
+  const isProtectedFn = (p, options = {}) => {
+    calls.push({ p, descendants: Boolean(options.descendants) });
+    const bad = (q) => /(^|\/)(\.ssh|\.kube|\.env|id_rsa)$/.test(q);
+    if (bad(p)) return { protected: true, reason: "credential" };
+    if (options.descendants && fs.existsSync(p) && fs.statSync(p).isDirectory()) {
+      const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).some((e) => bad(e.name) || (e.isDirectory() && walk(path.join(d, e.name))));
+      if (walk(p)) return { protected: true, reason: "protected_descendant" };
+    }
+    return { protected: false, reason: "" };
+  };
+  const old = { HF_HOME: process.env.HF_HOME, OLLAMA_MODELS: process.env.OLLAMA_MODELS };
+  process.env.HF_HOME = path.join(home, ".ssh");
+  process.env.OLLAMA_MODELS = "../relative/escape";
+  let audit;
+  try {
+    audit = await collectLinuxAuditWithGate({
+      platformOverride: "linux", homeDir: home, tmpDir, aptArchivesDir: path.join(home, "apt"), staleAgeMs: 0,
+      mountsRaw: "/dev/sda1 / ext4 rw 0 0", isProtectedFn, execFn: async () => ({ ok: false, stdout: "" }),
+    });
+  } finally {
+    for (const [k, v] of Object.entries(old)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
+  }
+  const listed = [...audit.modelCaches, ...audit.oldBackups, ...audit.packageCaches.userCaches, ...audit.staleTmpEntries].map((a) => a.path).join("\n");
+  for (const bad of [".ssh", ".kube", ".env", "id_rsa", "relative/escape", "nested", ".cache/pip", "sj-stale"]) {
+    assert.ok(!listed.includes(bad), `unsafe path listed (${bad}):\n${listed}`);
+  }
+  assert.ok(listed.includes("db.tar") && listed.includes("huggingface/hub"), listed);
+  const asked = (suffix) => calls.some((c) => c.p.endsWith(suffix));
+  assert.ok(asked("backups/db.tar") && asked("huggingface/hub"), JSON.stringify(calls));
+  assert.ok(calls.filter((c) => c.p.endsWith(".cache/pip") || c.p.endsWith("sj-stale")).every((c) => c.descendants), "directories must be judged with descendants");
 });
