@@ -823,7 +823,25 @@ fn linked_common_dir(git_dir: &Path) -> Option<PathBuf> {
         return None;
     }
     // canonical, so `wt/.git/../..` style relative pointers become the real directory
-    std::fs::canonicalize(resolve_relative_from_dir(git_dir, Path::new(rel))).ok()
+    std::fs::canonicalize(resolve_relative_from_dir(git_dir, Path::new(rel)))
+        .ok()
+        .map(strip_verbatim_prefix)
+}
+
+/// Windows `canonicalize` yields `\\?\C:\...`; git rejects that form as a `--git-dir`. Strip it for
+/// plain drive paths (UNC verbatim paths are left alone). No-op elsewhere.
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    p
 }
 
 /// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
