@@ -1,6 +1,6 @@
 # ADR-005: On-Demand Tiny Local SLM Cleanup Advisor
 
-- **Status:** Accepted
+- **Status:** Accepted; partially implemented (loopback advisor shipped; GGUF lifecycle and constrained decoding not built)
 - **Date:** 2026-11-24
 - **Drivers:** Intelligent classification and plain-language cleanup proposals for unfamiliar caches/orphans without cloud telemetry, cost, or idle RAM overhead.
 
@@ -33,3 +33,15 @@ Integrate an **optional, strictly on-demand Small Language Model (SLM) advisor**
 
 - **Positive:** Plain-English reasoning over novel disk/RAM consumers completely offline with `0 MiB` background RAM cost and strict schema safety.
 - **Negative / Mitigation:** Requires downloading a ~400 MiB–1.1 GiB GGUF file if enabled; mitigated by keeping the SLM advisor 100% opt-in and always pairing it with deterministic fallback explanations.
+
+---
+
+## Implementation Status (as of `main`)
+
+| Decision area | State |
+|---|---|
+| On-demand, off by default, `0 MiB` idle | Implemented (no resident model; user supplies a loopback endpoint) |
+| Loopback-only (`127.0.0.1`, `localhost`, `::1`) | Implemented and tested |
+| `2.5 GiB` free-RAM self-guard with deterministic fallback | Implemented |
+| Redacted input, no execution capability, re-validation by `sj protect` | Implemented |
+| Spawning/unloading GGUF via `llama.cpp`, GBNF/grammar decoding, model presets, fleet benchmark | Not implemented |

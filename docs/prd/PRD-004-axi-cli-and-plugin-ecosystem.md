@@ -1,7 +1,7 @@
 # PRD-004: AXI CLI (`spacejanitor-axi`) & Plugin Ecosystem
 
 **Version:** 1.0  
-**Status:** Draft  
+**Status:** Implemented from source (not published to npm; plugin runtime is declarative only)
 **Related ADRs:** [ADR-003](../adr/ADR-003-axi-cli-and-plugin-contract.md), [ADR-004](../adr/ADR-004-privacy-zero-leak-and-two-step-remediation.md)
 
 ---
@@ -34,3 +34,17 @@ SpaceJanitor should serve equally well as a standalone human CLI, an AI-agent AX
 
 - **M1:** CLI `doctor`, core safety unit tests, `@spacejanitor/plugin-sdk` manifest validator, and `skills/spacejanitor-axi/SKILL.md` verified in CI.
 - **M2:** Live collectors (`disk`, `memory`, `blockers`, `orphans`, `mcp-audit`) wired into CLI and consumed by both `apps/ui` and optional external exporter plugins.
+
+---
+
+## Implementation Status (as of `main`, PRs #10, #11, #15)
+
+| Requirement | State | Where |
+|---|---|---|
+| FR-4.1 Zero-install Node CLI | Implemented from a clone: `summary`, `doctor`, `disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`, `advise`. **`npx spacejanitor-axi` does not work: the package is private and unpublished** | `packages/cli/bin/spacejanitor.mjs` |
+| FR-4.2 TOON and versioned JSON | Implemented (`spacejanitor.*.v1`); collectors call `sj` and fall back to read-only Node views | `packages/core/src/toon.mjs`, `sjGate.mjs` |
+| FR-4.3 Agent skill | Implemented | `skills/spacejanitor-axi/SKILL.md` |
+| FR-4.4 Plugin SDK | Partial: manifest validation for `rule-pack`, `collector`, `widget`, `exporter`; no plugin loader or runtime | `packages/plugin-sdk` |
+| FR-4.5 Protected-target validation | Implemented: rules are checked through the Rust `sj protect` gate (no JS denylist) and fail closed | `packages/core/src/protect.mjs` |
+
+The Node CLI cannot execute removals (`--execute` fails closed); the Rust `sj` and the desktop app are the only mutation paths. **Open:** npm publication (no release or tag exists), plugin loading.

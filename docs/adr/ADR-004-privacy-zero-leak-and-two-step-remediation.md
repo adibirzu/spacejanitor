@@ -1,6 +1,6 @@
 # ADR-004: Zero-Leak Privacy & Two-Step Remediation Gate
 
-- **Status:** Accepted
+- **Status:** Accepted and implemented (selection-bound gate; Windows removal and issue #16/#17 open)
 - **Date:** 2026-11-24
 - **Drivers:** MIT open-source hygiene, defense against accidental deletion or process termination, secret safety.
 
@@ -29,3 +29,18 @@ System cleanup tools inspect sensitive locations: user home directories, git rep
 
 - **Positive:** Safe to run unattended in scheduled audits, safe to publish under MIT, and resistant to accidental secret exposure via process lists.
 - **Negative / Mitigation:** Requires two explicit clicks/flags to actually free space or kill leaked processes; this friction is intentional and documented as a core safety guarantee.
+
+---
+
+## Implementation Status (as of `main`)
+
+| Decision area | State |
+|---|---|
+| Zero telemetry; local only | Implemented |
+| Redaction before output | Implemented as a closed vocabulary (`redact.rs`, `redact_catalog.json`); applies to `mcp-audit`, `llm-audit`, `reap`, `memory`, `serve-stdio` |
+| Two-step confirmation | Implemented and **bound to the user's selection**: `selection_sha256` from `sj plan --select`, `--execute --confirm --selection-sha256`, plus desktop phrase, 5-minute TTL, single use, mutex |
+| Single protection owner | Rust `sj` only; the Node denylist was removed and callers fail closed |
+| Hygiene gates | `scripts/check-oss-hygiene.mjs` and gitleaks in CI |
+| Handle-anchored, no-follow removal | Implemented for macOS and Linux; Windows plans only |
+
+Open: [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse), [#12](https://github.com/adibirzu/spacejanitor/issues/12) (git-proof hardening).

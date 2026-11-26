@@ -1,7 +1,7 @@
 # PRD-002: True Memory Footprint & OS-Blocker Forensics
 
 **Version:** 1.0  
-**Status:** Draft  
+**Status:** Partially implemented (collectors, MCP audit and scoped reaper on `main`; owner grouping and action IDs open)
 **Related ADRs:** [ADR-002](../adr/ADR-002-cross-platform-os-telemetry-and-orphan-safety.md), [ADR-004](../adr/ADR-004-privacy-zero-leak-and-two-step-remediation.md)
 
 ---
@@ -35,3 +35,18 @@ Workstations running multiple IDEs, local LLMs, VMs, and background agent worker
 
 - **M1:** macOS and Linux collectors accurately compute logical owner footprint (`MEM`/`Pss+SwapPss`), detect saturated vnodes/`inotify`/orphan storms in fixtures, and pass secret-redaction tests.
 - **M2:** Windows CIM/PowerShell collector + cross-OS MCP config auditor pass matrix tests on `windows-latest`, `ubuntu-latest`, and `macos-15`.
+
+---
+
+## Implementation Status (as of `main`, PR #15)
+
+| Requirement | State | Where |
+|---|---|---|
+| FR-2.1 True per-process footprint | Implemented per process (top-N) on macOS, Linux, Windows collectors; **no owner-group aggregation** | `sj memory` (`memory.rs`) |
+| FR-2.2 Kernel and VFS blockers | Implemented: macOS vnodes/`fseventsd`/U-state, Linux `file-nr`/`inotify`/`D`-state, Windows handles/pagefile. Linux systemd/podman blockers are in open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18) | `sj blockers` (`blockers.rs`) |
+| FR-2.3 Orphan process storms | Implemented for `PPID=1` MCP-lineage processes of the current user, with PID, command-hash and start-time re-verification; unix-only execute. Zombie parents / walker detection not implemented | `sj reap` (`reap.rs`) |
+| FR-2.4 MCP fleet auditor | Implemented (configs plus live processes, duplicates, orphans, unused servers) plus `sj llm-audit` for plugins, skills and idle sessions (read-only, no execute) | `mcp_audit.rs`, `llm_audit.rs` |
+| FR-2.5 Redaction | Implemented as a closed vocabulary (`crates/sj-core/data/redact_catalog.json`), not pattern matching | `redact.rs` |
+| FR-2.6 Remediation action IDs (`m1-reap-*`, `m2-*`) | Not implemented as named; reaping uses `sj reap` with its own digest and confirm phrase. Daemon restart / `sudo` actions are intentionally absent | `reap.rs` |
+
+**Open items:** [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse on huge malformed input), PR #18 (Linux extension, unmerged), owner-group aggregation, FR-2.6 action IDs.

@@ -1,19 +1,18 @@
 # SpaceJanitor Architecture
 
-SpaceJanitor uses a **two-layer hybrid architecture**: a native **Rust core engine** (`sj-core` + `sj-cli`) paired with a thin, tray-first **Electron desktop shell** (`apps/desktop` + `apps/ui`, `[M5]`), an **AXI CLI & Plugin SDK** (`packages/cli`, `packages/plugin-sdk`, `[M1 doctor / M4 collectors]`), and an **optional loopback-only Local SLM Advisor** (`[M6]`).
+SpaceJanitor uses a **two-layer hybrid architecture**: a native **Rust core engine** (`crates/sj-core` + `crates/sj-cli`, binary `sj`) and a thin, tray-first **Electron desktop shell** (`apps/desktop` + `apps/ui`), plus an **AXI CLI & Plugin SDK** (`packages/cli`, `packages/core`, `packages/plugin-sdk`) and an **optional loopback-only Local SLM Advisor**. The runtime choice is recorded in [ADR-001](./adr/ADR-001-desktop-runtime-tauri-vs-electron.md) (decided: Electron plus Rust core).
 
-> **Architecture Status:**
-> - **Shipped today (`M1`):** `sj-core` + `sj-cli` (`doctor`, `scan`, `trash`, `orphans`, `plan`), `protect.rs` denylist, `redact_secrets()` helper, `spacejanitor.proposal.v1` SHA-256 execution gate, and `spacejanitor-axi doctor` (`packages/cli`).
-> - **In Progress / Planned (`M2`–`M7`):** `memory` & `blockers` (`[M2]`), `mcp-audit` & `reap` (`[M3]`), `sj serve-stdio` & AXI collector wiring (`[M4]`), Electron Desktop Tray & React UI (`[M5]`), Local SLM Advisor (`[M6]`), and release packaging (`[M7]`).
+> **State on `main`:** all components above are implemented and build from source. **No installer or npm package is published** (no release tag; the M7 release matrix has not run). Linux-specific extensions are in the still-open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18).
 
 ---
 
 ## Design Principles
 
-1. **Dry-Run Default:** Every collector and planner defaults to read-only inspection. Mutating operations require an explicit two-step execution gate bound to a deterministic SHA-256 plan digest.
-2. **Engine-Core Ownership:** All path protection, git safety proofs, secret redaction, and execution gates live in `crates/sj-core`. Neither the UI, plugins, nor an optional SLM can bypass `sj-core`.
-3. **Minimal Tray Footprint (`[M5]`):** When the Electron window is closed or minimized to the system tray, the main process destroys the `BrowserWindow` renderer—eliminating Chromium's ~150–300 MiB idle renderer footprint while keeping the Rust tray bridge lightweight.
-4. **Fail-Closed Protection (`[M1]`):** Unreadable directories, dangling symlinks, unresolvable `cwd`, or recycled PIDs (`[M3]`) cause `sj-core` to deny or abort rather than guess.
+1. **Dry-run default.** Every collector and planner is read-only. Mutating operations require a two-step gate bound to a deterministic SHA-256 digest.
+2. **Rust `sj` is the only protection gate.** Path protection, descendant walks, git proofs, redaction and execution live in `crates/sj-core`. The Node denylist was removed: `packages/core/src/protect.mjs` and the Electron main process forward every path to `sj` and treat anything unprovable as protected. If `sj` is missing, not executable, times out or returns unparseable output, every destructive action is refused while read-only views keep working.
+3. **Orphan-repo scanning is opt-in.** Anything that runs `git` inside repositories found on disk is off unless `--include-orphans` (CLI) or the confirmed desktop toggle is used. See [issue #12](https://github.com/adibirzu/spacejanitor/issues/12).
+4. **Minimal tray footprint.** Closing the window destroys the `BrowserWindow` renderer, dropping Chromium's idle renderer cost while the main process and tray stay resident.
+5. **Fail closed.** Unreadable directories, dangling symlinks, unverifiable UIDs or recycled PIDs make `sj-core` deny or abort rather than guess.
 
 ---
 
@@ -22,24 +21,24 @@ SpaceJanitor uses a **two-layer hybrid architecture**: a native **Rust core engi
 ```mermaid
 flowchart TB
   subgraph Native["Rust Native Core"]
-    SJCore["sj-core: Collectors, Git Proof, Protect Denylist, Redactor (M1-M3)"]
-    SJCli["sj-cli: Human CLI (M1) and sj serve-stdio NDJSON (M4)"]
+    SJCore["sj-core: collectors, git proof, protection gate, redactor, reaper"]
+    SJCli["sj-cli: human CLI and sj serve-stdio NDJSON"]
     SJCore --> SJCli
   end
 
-  subgraph Desktop["Electron Desktop Shell (M5 / M6)"]
-    Main["Electron Main Process and OS Tray (M5)"]
-    Preload["Typed Allowlisted Preload Bridge (M5)"]
-    UI["React and TypeScript UI (M5)"]
-    SLM["Optional Loopback Local SLM Advisor (M6)"]
+  subgraph Desktop["Electron Desktop Shell"]
+    Main["Electron Main Process and OS Tray"]
+    Preload["Typed Allowlisted Preload Bridge"]
+    UI["React and TypeScript UI"]
+    SLM["Optional Loopback Local SLM Advisor"]
     Main --> Preload
     Preload --> UI
     Main --> SLM
   end
 
-  subgraph Agent["AXI and Extensibility (M1 doctor / M4)"]
-    AXI["spacejanitor-axi CLI: TOON and JSON v1 (M1/M4)"]
-    SDK["@spacejanitor/plugin-sdk: Rules, Collectors, Widgets, Exporters (M4)"]
+  subgraph Agent["AXI and Extensibility"]
+    AXI["spacejanitor-axi CLI: TOON and JSON v1"]
+    SDK["@spacejanitor/plugin-sdk: Rules, Collectors, Widgets, Exporters"]
   end
 
   SJCli --> Main
@@ -50,56 +49,65 @@ flowchart TB
 
 ---
 
-## Two-Step SHA-256 Remediation Sequence
+## Selection-Bound Remediation Sequence
 
-Every destructive action (Trash cleanup, verified orphan worktree pruning, or `PPID=1` process reaping) follows the same deterministic two-step handshake:
+Every destructive desktop action follows the same handshake. The confirmation token is a digest of **exactly the items the user selected**, not of the whole plan, so a changed selection or a changed file invalidates it.
 
 ```mermaid
 sequenceDiagram
   participant User as Operator / UI
-  participant Bridge as Electron Main or CLI
-  participant Core as sj-core Engine
-  participant OS as Filesystem / Process Table
+  participant Main as Electron Main (session only)
+  participant Sj as sj (Rust gate)
+  participant OS as Filesystem
 
-  User->>Bridge: Request dry-run plan
-  Bridge->>Core: build_remediation_plan()
-  Core->>OS: Read-only scan + git proof + PPID check
-  Core->>Core: Filter via check_path_protection()
-  Core-->>Bridge: Plan + deterministic plan_sha256
-  Bridge-->>User: Display Step 1 targets, bytes, and SHA-256
+  User->>Main: Select candidates
+  Main->>Sj: sj protect --json (read-only annotations)
+  Main->>Sj: sj plan <root> --json --select <path>...
+  Sj->>OS: Read-only scan, protection gate, snapshot (dev/ino/size/mtime/content)
+  Sj-->>Main: selection.selection_sha256 (the token)
+  Main-->>User: Step 1: targets, bytes, digest, CONFIRM-XXXXXXXX phrase (5 min, single use)
 
-  User->>Bridge: Step 2 Execute with confirm phrase + plan_sha256 + item_id
-  Bridge->>Core: execute_plan_item(plan, ExecutionGate)
-  Core->>Core: Re-verify plan_sha256, confirm gate, and protection rules
-  Core->>OS: Re-verify git clean/pushed or PID/PPID/start-time, then execute
-  OS-->>Core: Result
-  Core-->>Bridge: Executed item report (mutated=true)
+  User->>Main: Step 2: type phrase
+  Main->>Sj: sj plan <root> --execute --confirm --selection-sha256 <token> --select <path>...
+  Sj->>Sj: Rebuild plan; refuse unless the same selection hashes to the token
+  Sj->>OS: Remove no-follow, entry by entry, re-checking at execute time
+  Sj-->>Main: Executed report
 ```
+
+CLI users run the same two steps by hand (`sj plan --select ...` then `--execute --confirm --selection-sha256 ...`), or use the single-item form (`--execute --confirm --plan-sha256 <sha> --item <id>`). `sj reap` uses its own digest and a plan-specific confirm phrase and re-verifies PID, command hash and start time at execute time.
 
 ---
 
 ## Process & IPC Boundary Model
 
-### Electron Sandbox Invariants (`apps/desktop`, `[M5]`)
+### Electron sandbox invariants (`apps/desktop`)
 - **`contextIsolation: true`**, **`nodeIntegration: false`**, **`sandbox: true`** on all renderer windows.
-- **Typed Allowlisted IPC:** `preload` exposes only explicit invoke channels (e.g., `scan`, `memory`, `blockers`, `plan`, `execute`)—never raw `fs`, `child_process`, or arbitrary shell execution.
-- **No Shell Interpolation:** Spawning `sj serve-stdio` or external git probes uses `execFile` / `spawn` with explicit argument arrays (`shell: false`).
-- **Close-to-Tray Lifecycle:** Closing the window destroys the `BrowserWindow` instance; reopening from the system tray recreates the renderer on demand.
+- **Typed, validated IPC:** `preload` exposes only explicit channels; `ipcValidation.ts` validates every payload. The orphan opt-in can only be turned on through a native confirmation dialog opened by the main process.
+- **No shell interpolation:** `sj` and git are launched with argument arrays (`shell: false`).
+- **`sj` location:** absolute path only, never `PATH` or the cwd. Packaged apps use `<resources>/bin/sj`; unpackaged dev builds accept an absolute `SPACEJANITOR_SJ_BIN` or `target/{release,debug}`. `SPACEJANITOR_NO_SJ=1` forces the fail-closed state.
+- **Close-to-tray lifecycle:** closing the window destroys the renderer; reopening from the tray recreates it.
 
-### Sidecar Protocol (`sj serve-stdio`, `[M4]`)
-- Communicates over **NDJSON JSON-RPC 2.0** on `stdin`/`stdout` between Electron Main (or external hosts) and the `sj` binary.
-- All responses conform to versioned `spacejanitor.*.v1` envelopes (`spacejanitor.storage.v1`, `spacejanitor.trash.v1`, `spacejanitor.orphans.v1`, `spacejanitor.proposal.v1` shipped in `[M1]`; `spacejanitor.memory.v1`, `spacejanitor.blockers.v1`, `spacejanitor.mcp_audit.v1`, `spacejanitor.reap.v1` planned for `[M2]` / `[M3]`).
+### Sidecar protocol (`sj serve-stdio`)
+- NDJSON JSON-RPC 2.0 on `stdin`/`stdout`. Methods: `doctor`, `scan`, `trash`, `orphans`, `memory`, `blockers`, `mcp_audit`, `llm_audit`, `plan_reap`, `execute_reap`, `plan_cleanup`, `execute_cleanup`. Notifications (no `id`) get no response.
+- Responses use versioned `spacejanitor.*.v1` envelopes (`doctor`, `storage`, `trash`, `orphans`, `proposal`, `memory`, `blockers`, `mcp_audit`, `llm_audit`, `reap`, `protect`, plus `summary`/`disk`/`plan` in the Node AXI layer).
+
+### AXI CLI
+`spacejanitor-axi` calls `sj <cmd> --json` (absolute path, bounded timeout) and falls back to read-only Node collectors. The Node path can never execute: `--execute` fails closed there and points to the desktop app or `sj`.
 
 ---
 
 ## Cross-Platform Collector Matrix
 
-| Domain | macOS (`darwin` `arm64`/`x64`) | Linux (`linux` `x64`/`arm64`) | Windows (`win32` `x64`/`arm64`) |
+| Domain | macOS (`arm64`/`x64`) | Linux (`x64`/`arm64`) | Windows (`x64`/`arm64`) |
 |---|---|---|---|
-| **Storage & Trash (`[M1]` / `[M2]`)** | `jwalk` inode-deduped scan, `~/.Trash` (`[M1]`); `df -k`, `tmutil listlocalsnapshots` (`[M2]`) | `jwalk` scan, `$XDG_DATA_HOME/Trash` (`[M1]`); `df -k` / `statvfs`, `/var/log/journal` (`[M2]`) | `jwalk` scan, `$Recycle.Bin` (`[M1]`); Win32 volume free space, `%LOCALAPPDATA%\Temp`, WSL2 `.vhdx` (`[M2]`) |
-| **True Memory Footprint (`[M2]`)** | `top -l 1` (`MEM` + `CMPRS` + `#PORTS`), `vm_stat`, `sysctl vm.swapusage` | `/proc/<pid>/smaps_rollup` (`Pss` + `SwapPss`), `/proc/meminfo`, `swapon --show` | `Win32_Process` (`WorkingSetSize`, `PrivatePageCount`, `HandleCount`), pagefile, WSL2 `Vmmem` |
-| **Kernel / VFS Blockers (`[M2]`)** | `kern.num_vnodes`/`maxvnodes`, `kern.num_files`, `fseventsd`, Mach ports, `U`-state | `fs.inotify.max_user_watches`, `/proc/sys/fs/file-nr`, `D`-state/zombies, journald | Handle spikes, NonPaged/Paged pool, Defender/Search exclusions, pagefile saturation |
-| **Orphan Work (`[M1]`) & Processes (`[M3]`)** | Recursive `.git` proof (`[M1]`); `PPID=1` + non-recursive `lsof -Fn -d cwd` (`[M3]`, never `lsof +D`) | Recursive `.git` proof (`[M1]`); `PPID=1` + `/proc/<pid>/cwd` non-blocking check (`[M3]`) | Recursive `.git` proof (`[M1]`); WMI parent PID tree + non-recursive handle CWD check (`[M3]`) |
+| **Storage & Trash** | `jwalk` inode-deduped scan, `~/.Trash` | `jwalk` scan, `$XDG_DATA_HOME/Trash` | `jwalk` scan, `$Recycle.Bin` |
+| **True memory footprint** | `top`, `vm_stat`, `sysctl vm.swapusage` | `/proc/<pid>/smaps_rollup` (`Pss` + `SwapPss`), `/proc/meminfo` | WMI/CIM process data, pagefile |
+| **Kernel / VFS blockers** | `kern.num_vnodes`/`maxvnodes`, `fseventsd`, `U`-state waits | `/proc/sys/fs/file-nr`, `fs.inotify.*`, `D`-state | handle counts, pool and pagefile pressure |
+| **Orphan work** (opt-in) | recursive `.git` proof | recursive `.git` proof | recursive `.git` proof |
+| **`PPID=1` reaper** | own-UID MCP-lineage only, non-recursive cwd checks | own-UID MCP-lineage only, `/proc` | plans only |
+| **Removal (`--execute`)** | handle-anchored, no-follow | handle-anchored, no-follow | **refused** (plan only) |
+
+Collectors never run recursive `lsof +D`. Linux systemd/podman blockers and extra Linux audit coverage are in open [PR #18](https://github.com/adibirzu/spacejanitor/pull/18).
 
 ---
 

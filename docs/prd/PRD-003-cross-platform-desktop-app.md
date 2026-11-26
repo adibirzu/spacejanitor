@@ -1,7 +1,7 @@
 # PRD-003: Cross-Platform Desktop App (macOS, Linux, Windows x64/ARM64)
 
 **Version:** 1.0  
-**Status:** Draft (Pending ADR-001 Runtime Selection)  
+**Status:** Implemented from source (no installer published; owner grouping, plugin widgets and exclusion previews open)
 **Related ADRs:** [ADR-001](../adr/ADR-001-desktop-runtime-tauri-vs-electron.md), [ADR-004](../adr/ADR-004-privacy-zero-leak-and-two-step-remediation.md)
 
 ---
@@ -35,3 +35,18 @@ Engineers want the clarity of live visual widgets—storage breakdown, resident 
 
 - **M1:** Shell-agnostic React UI (`apps/ui`) renders mock and live `spacejanitor.*.v1` fixtures with working dry-run preview and two-step confirmation flow.
 - **M2:** Desktop shell (`apps/desktop`) builds installers on all 6 target platforms via GitHub Actions CI matrix and stays within idle RAM budget.
+
+---
+
+## Implementation Status (as of `main`, PRs #10, #11)
+
+| Requirement | State | Where |
+|---|---|---|
+| FR-3.1 Overview and tray | Implemented: tray badge, Overview gauges, close-to-tray destroys the renderer. No external push services | `apps/desktop/src/main.ts`, `apps/ui/src/components/Gauges.tsx` |
+| FR-3.2 Storage / Trash / orphan view | Implemented: Disk view; orphans "not scanned (disabled by default)" until the confirmed opt-in; blocked items show reasons; caches listed read-only | `apps/ui/src/App.tsx`, `candidateAnnotations.ts`, `orphanSetting.ts` |
+| FR-3.3 Memory and blockers | Partial: gauges and a Memory tab; **no owner-group stacked chart** | `apps/ui` |
+| FR-3.4 MCP and indexer panel | Partial: MCP fleet and secret audit tab; Spotlight / Search / `inotify` exclusion previews not implemented | `apps/ui` |
+| FR-3.5 Two-step remediation | Implemented and selection-bound: digest from `sj plan --select`, `CONFIRM-XXXXXXXX` phrase, 5-minute TTL, single use, mutex; every removal runs in `sj` and fails closed without it | `remediationGate.ts`, `sjBridge.ts` |
+| FR-3.6 Plugin widgets | Not implemented in the UI | `packages/plugin-sdk` declares widgets only |
+
+**Platform notes:** removal is Unix-only (Windows plans but cannot execute). **No installer exists:** no tag has been pushed and the M7 release matrix (`release.yml`) has not run, so macOS/Linux/Windows `x64`/`arm64` artifacts and `SHA256SUMS.txt` are unverified. Unsigned until signing and notarization are enabled.

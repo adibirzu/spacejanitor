@@ -1,6 +1,6 @@
 # ADR-003: AXI CLI Output & Extensible Plugin Contract
 
-- **Status:** Accepted
+- **Status:** Accepted; partially implemented (CLI shipped from source, plugin runtime not built)
 - **Date:** 2026-11-24
 - **Drivers:** Agent-friendly token-efficient CLI (`spacejanitor-axi`), decoupled dashboard & collector plugins, long-term maintainability.
 
@@ -52,3 +52,15 @@ export interface SpaceJanitorPlugin {
 
 - **Positive:** One canonical telemetry engine powers coding agents, standalone desktop apps, and external monitoring portals without code duplication.
 - **Negative / Mitigation:** Plugin schemas must stay backward-compatible within `apiVersion: "1"`; schema contract tests run in CI on every change.
+
+---
+
+## Implementation Status (as of `main`)
+
+| Decision area | State |
+|---|---|
+| TOON default and `--json` `spacejanitor.*.v1` envelopes | Implemented |
+| Commands `summary`, `doctor`, `disk`, `memory`, `blockers`, `orphans`, `trash`, `mcp-audit`, `remediate`, `advise` | Implemented; collectors call `sj`, Node fallback is read-only; `--execute` fails closed in Node |
+| `--fail-on-alert` exit code `2` | Implemented in `spacejanitor-axi`; not a flag of `sj` |
+| Plugin manifest contract (`rule-pack`, `collector`, `widget`, `exporter`) | Manifest validation implemented; **no loader or runtime**; rule targets validated by the Rust gate |
+| Distribution via `npx` | **Not published** (`private` package, no release) |

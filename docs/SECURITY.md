@@ -2,24 +2,23 @@
 
 SpaceJanitor inspects local filesystems, git repositories, running process arguments, and kernel counters, and optionally cleans operator-approved targets. Because a workstation janitor operates on sensitive local state, security invariants are enforced deterministically in `crates/sj-core`.
 
-> **Implementation Status:**
-> - **Shipped today (`M1`):** `crates/sj-core/src/protect.rs` (Protected Never-Touch Denylist, APFS `/System/Volumes/Data` prefix stripping, symlink traversal defense, `.sj-stage-*` quarantine protection), `spacejanitor.proposal.v1` SHA-256 two-step execution gate (with handle-anchored `sj plan --execute` safe execution in `crates/sj-core/src/safe_remove.rs` **Unix-only on macOS and Linux**; non-Unix platforms return an `ExecutionGate` refusal / exit `2`, so Windows is dry-run planning only in `M1`), Trash/orphan TOCTOU re-verification, and the `redact_secrets()` helper in `crates/sj-core/src/lib.rs`.
-> - **Planned (`M2`–`M6`):** `memory` / `blockers` (`M2`), `mcp-audit` and `reap` PID + start-time re-verification (`M3`), collector integration of `redact_secrets()` (`M2` / `M3`), Electron sandbox & 2-step UI confirmation (`M5`), and Local SLM loopback guard (`M6`).
+> **Implementation status:** everything below is implemented on `main` unless marked otherwise. The root [SECURITY.md](../SECURITY.md) is the disclosure policy and the shorter threat model; this page is the detailed reference. Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12), [#16](https://github.com/adibirzu/spacejanitor/issues/16), [#17](https://github.com/adibirzu/spacejanitor/issues/17).
 
 ---
 
 ## 1. Threat Model & Core Invariants
 
-1. **Read-Only Default:** All audit commands (`doctor`, `scan`, `trash`, `orphans` in `M1`; `memory`, `blockers` in `M2`; `mcp-audit` in `M3`) and dry-run plans perform zero file deletions, zero git mutations, and zero process signals.
-2. **Two-Step Execution Gate:** Mutating actions require an explicit `--execute` flag, confirmation flag/phrase, exact `item` ID, and a matching `plan_sha256` digest bound to the dry-run plan (`spacejanitor.proposal.v1`, `M1`).
-3. **TOCTOU Re-Verification:** Before removing a Trash item or pruning a git worktree (`M1`), or signalling a `PPID=1` orphan process (`M3`), `sj-core` re-verifies protection rules and git clean/pushed state (`M1`), or PID + `PPID == 1` + command + start time (`M3`).
-4. **Zero Cloud Telemetry:** SpaceJanitor sends zero analytics, crash reports, or workstation metadata to external servers.
+1. **Read-only default.** Audit commands (`doctor`, `scan`, `trash`, `memory`, `blockers`, `mcp-audit`, `llm-audit`) and dry-run plans perform zero deletions, zero git mutations and zero signals. The one exception to "no git" is the opt-in orphan scan (section 6).
+2. **Rust `sj` is the only protection gate.** The Node denylist was removed. The desktop app and `packages/core` forward every path to `sj protect` / `sj plan --select` and treat any failure, timeout or unparseable reply as "protected". With `sj` unavailable every destructive action is refused.
+3. **Two-step, selection-bound execution.** `sj plan --select` reports a digest over exactly the selected items (path, dev/ino, size, mtime and a content snapshot). `--execute --confirm --selection-sha256` rebuilds the plan and refuses unless it hashes to that digest. The desktop session adds a typed phrase, a 5-minute TTL, single use and a mutex. `sj reap` binds execution to its own digest and re-verifies PID, command hash and start time.
+4. **Unix-only removal.** Removal is handle-anchored and no-follow (macOS, Linux). On Windows `sj` plans but refuses to execute.
+5. **Zero cloud telemetry.** No analytics, crash reports or workstation metadata leave the machine.
 
 ---
 
-## 2. Protected Never-Touch Denylist (`crates/sj-core/src/protect.rs`, Shipped `M1`)
+## 2. Protected-Path Gate (`crates/sj-core/src/protect.rs`)
 
-`check_path_protection()` enforces an immutable denylist that cannot be overridden by CLI flags, plugins, or SLM proposals:
+`check_path_protection()` (exposed as `sj protect`) enforces built-in rules that cannot be overridden by CLI flags, plugins, or SLM proposals. User rules (`--exact`, `--dynamic`, `--glob`) can only add protection:
 
 - **Protected Roots:** `/`, `$HOME`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows` (including macOS `/System/Volumes/Data` prefix stripping so APFS data volume paths cannot bypass system root checks).
 - **Credential & Agent Directories:** `.ssh`, `.gnupg`, `.aws`, `.kube`, `.claude`, `.config/gh` (checked both under `$HOME` and as any path segment, case-insensitively).
@@ -34,33 +33,49 @@ SpaceJanitor inspects local filesystems, git repositories, running process argum
 
 ---
 
-## 3. Redacted Secret Detection (`redact_secrets()`, Helper Shipped `M1`; Collector Wiring `M2` / `M3`)
+## 3. Redaction: a Closed Vocabulary, Not Pattern Matching
 
-The `redact_secrets()` helper is shipped in `crates/sj-core/src/lib.rs` and awaits collector integration as `memory` (`M2`) and `mcp-audit` (`M3`) land. Process and MCP configuration collectors will pass command lines through `redact_secrets()` **before** JSON serialization, logging, or UI rendering:
+Audit output (`mcp-audit`, `llm-audit`, `reap`, `memory`, `serve-stdio`) is built from a fixed catalog (`crates/sj-core/data/redact_catalog.json`) or reduced to a hash, rather than by guessing which text looks secret:
 
-- **CLI Secret Flags:** `--api-key`, `--token`, `--secret`, `--password`, `--auth-token`, `--auth` (both `--flag=value` and `--flag value` forms) are replaced with `<REDACTED>`.
-- **Authorization Headers:** `Bearer <token>` and `Basic <token>` values are replaced with `<REDACTED>`.
-- **URL Userinfo:** `https://user:pass@host/...` credentials are replaced with `https://<REDACTED>@host/...`.
+- Commands, launchers, clients and package ids: catalog only, otherwise `<command>` / `<package:hash8>`. Flag names: catalog only, otherwise `<flag>`; flag values are always `<REDACTED>`.
+- URLs: `http|https|ws|wss` scheme plus a dotted DNS host only; never userinfo, path or query (otherwise `<url>`).
+- Env and header key names: a fixed known-safe list; any other key is counted, never named.
+- Live-process labels: the matched config label, a catalog package or client, otherwise `unknown-<8 hex of sha256(argv)>`.
+- `secret_findings` fire only on a real signal (a secret-named flag or env key, or a known token prefix, case-insensitive).
+- Config server labels are user-chosen and are shown only if at most 32 characters of `[a-z0-9._-]` with no alphanumeric run over 12; otherwise `server-<hash8>`. Do not use a secret as a server label.
+- Config files are opened once without following symlinks and validated on the opened handle (regular file, inside the home for default discovery, never inside a protected root). **Windows does not yet open them no-follow** ([issue #16](https://github.com/adibirzu/spacejanitor/issues/16)); a huge malformed TOML config can parse slowly ([issue #17](https://github.com/adibirzu/spacejanitor/issues/17)).
 
 ---
 
-## 4. Desktop Sandbox, Process Spawning & Loopback SLM Guard *(Planned `M5` / `M6`)*
+## 4. Desktop Sandbox, Process Spawning & Loopback SLM Guard
 
-- **Electron Sandbox (`M5`):** Renderer windows run with `contextIsolation: true`, `nodeIntegration: false`, and `sandbox: true`, communicating only over a typed, allowlisted `preload` IPC bridge with a 2-step UI confirmation modal.
-- **Zero Shell Interpolation (`M1` `git` / `M4` `sj serve-stdio`):** All subprocess invocations (`git` in `M1`, `sj serve-stdio` in `M4`) use `execFile` / `spawn` / `Command::new` with argument arrays (`shell: false`), eliminating command injection via filenames or branch names.
-- **Loopback-Only Local SLM Guard (`M6`):** The optional Local SLM Advisor only connects to `127.0.0.1` / `localhost` (or a local GGUF file), receives only redacted summary metadata, and has **zero execution capability**. Every proposed target is re-validated by `sj-core`.
+- **Electron sandbox:** `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`; a typed, allowlisted preload bridge with payload validation.
+- **No shell interpolation:** `sj` and `git` run with argument arrays (`shell: false` / `Command::new`).
+- **`sj` is located by absolute path only** (bundled `resources/bin/sj` when packaged; otherwise `SPACEJANITOR_SJ_BIN` or the repo's `target/`), never `PATH` or the cwd, and must be a regular, user-owned, non-symlink executable.
+- **Loopback-only SLM advisor:** connects only to `127.0.0.1` / `localhost` / `::1`, receives redacted summary metadata only, has no execution capability, and refuses to run below `2.5 GiB` free RAM. Suggestions are annotations; execution still goes through the gate.
 
 ---
 
 ## 5. Repository Hygiene Gate
 
 Every pull request runs:
-- `node scripts/check-oss-hygiene.mjs` — blocks non-placeholder `/Users/<name>`, `/home/<name>`, `C:\Users\<name>`, RFC1918/CGNAT IPs, and credential prefixes.
+- `node scripts/check-oss-hygiene.mjs` blocks non-placeholder home paths, private IP ranges and credential prefixes.
 - `gitleaks` — scans git history and working tree for leaked secrets.
 
 ---
 
-## 6. Vulnerability Reporting (Responsible Disclosure)
+## 6. Known limitations (opt-in orphan scanning)
+
+Orphan-repo scanning is **off by default** because it runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk. Open findings tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12):
+- **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
+- **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
+- **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+
+Opt in only for repositories you trust (`--include-orphans` or the confirmed desktop toggle).
+
+---
+
+## 7. Vulnerability Reporting (Responsible Disclosure)
 
 Please report security vulnerabilities **privately** via **GitHub Security Advisories** (`https://github.com/adibirzu/spacejanitor/security/advisories/new`) rather than opening a public issue with exploit details. Include:
 - Affected OS and architecture (`macOS`/`Linux`/`Windows`, `x64`/`arm64`)

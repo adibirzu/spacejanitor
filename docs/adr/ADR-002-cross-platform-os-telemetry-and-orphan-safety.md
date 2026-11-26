@@ -1,6 +1,6 @@
 # ADR-002: Cross-Platform OS Telemetry & Orphan Work Safety Model
 
-- **Status:** Accepted
+- **Status:** Accepted; partially implemented (orphan proof opt-in pending issue #12)
 - **Date:** 2026-11-24
 - **Drivers:** Accurate compressed/swapped memory attribution, VFS lock avoidance, zero accidental loss of uncommitted/unpushed developer work.
 
@@ -48,3 +48,16 @@ Every collector emits normalized DTOs conforming to `spacejanitor.*.v1` contract
 
 - **Positive:** Accurate memory attribution across all 3 OS families, zero VFS stalls induced by the scanner itself, and deterministic protection against deleting unpushed developer work.
 - **Negative / Mitigation:** Gathering per-process `smaps_rollup` on Linux or `top` on macOS takes ~0.5–1.5s; SpaceJanitor caches snapshots briefly and runs scans asynchronously off the UI thread.
+
+---
+
+## Implementation Status (as of `main`)
+
+| Decision area | State |
+|---|---|
+| Per-OS collectors (macOS, Linux, Windows) for memory and blockers | Implemented (`memory.rs`, `blockers.rs`); Linux systemd/podman in open PR #18 |
+| Never `lsof +D`; bounded checks | Implemented |
+| Recursive git clean/pushed proof (7 gates, nested repos) | Implemented in `orphans.rs`, **off by default** because it runs git in repositories found on disk. Hardening tracked in [#12](https://github.com/adibirzu/spacejanitor/issues/12) (B35 submodule filter, B36 proxy credential leak, B37 timeouts) |
+| `PPID=1` reaper with PID, command-hash and start-time re-verification | Implemented, narrowed to own-UID MCP-lineage processes (`reap.rs`) |
+| Idle-age and active-CWD conditions for orphan worktrees | Not implemented |
+| Windows | Collectors implemented; removal and reaping refuse to execute; config reads not yet no-follow ([#16](https://github.com/adibirzu/spacejanitor/issues/16)); slow malformed-TOML parse ([#17](https://github.com/adibirzu/spacejanitor/issues/17)) |

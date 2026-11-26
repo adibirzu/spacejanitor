@@ -13,9 +13,7 @@
 
 ---
 
-> **Project Status (M1 Shipped vs. M2–M7 Planned):**
-> - **Shipped today (`M1`):** Rust core engine (`sj-core`) and CLI (`sj-cli`: `doctor`, `scan`, `trash`, `orphans`, `plan`), deterministic SHA-256 `spacejanitor.proposal.v1` execution gate, `protect.rs` denylist, and `spacejanitor-axi doctor` (from source).
-> - **In Progress / Planned (`M2`–`M7`):** `sj memory` and `sj blockers` (`M2`), `sj mcp-audit` and `sj reap` (`M3`), `sj serve-stdio` and full `spacejanitor-axi` collectors (`M4`), Electron Desktop Tray App (`M5`), Local SLM Advisor (`M6`), and signed/checksum-verified GitHub Releases (`M7`).
+> **Project status:** the Rust core, all collectors, the AXI CLI, the SLM advisor and the Electron desktop app are on `main` and build from source. **No installer or npm package is published yet** (no release tag; the M7 release matrix has not run). See [Status](#status) and [Known limitations](#known-limitations).
 
 ## Why SpaceJanitor?
 
@@ -23,26 +21,29 @@ Standard utilities like `df` and `ps` mislead developers and AI-workstation user
 
 | What `df` / `ps` Show | What Is Actually Happening | How SpaceJanitor Fixes It |
 |---|---|---|
-| `ps` reports modest `RSS` per process | Tens of GiB sit in **compressed RAM and swap** across IDE, browser, and agent clusters | Measures **True Memory Footprint** (`Resident + Compressed + Swap`) grouped by owner |
-| Disk looks "fine" or `du` crawls | **Orphan git worktrees**, stale `target/`/`node_modules`, OS Trash, and APFS local snapshots eat SSD headroom | Runs bounded parallel scans with **recursive git clean/pushed proofs** |
+| `ps` reports modest `RSS` per process | Tens of GiB sit in **compressed RAM and swap** across IDE, browser, and agent clusters | Measures **True Memory Footprint** (`Resident + Compressed + Swap`) per process |
+| Disk looks "fine" or `du` crawls | **Orphan git worktrees**, stale `target/`/`node_modules`, OS Trash, and APFS local snapshots eat SSD headroom | Runs bounded parallel scans; an **opt-in** recursive git clean/pushed proof marks safe orphan worktrees |
 | Terminals & SSH hang with free CPU | **Kernel/VFS blockers** saturate macOS vnodes, `fseventsd`, Linux `inotify` watches, or Windows handles | Audits OS kernel/VFS tables **without** ever running recursive `lsof +D` |
-| Dozens of background `node`/`python` PIDs | **Duplicated stdio MCP servers** multiply per editor/CLI session and leak tokens in CLI args | Groups MCP fleets by parent agent and **automatically redacts inline secrets** |
-| Orphan `PPID=1` agent scripts linger | `pkill`/`killall` risks killing active work | Re-verifies exact PID, command, and start time before gated `SIGTERM` |
+| Dozens of background `node`/`python` PIDs | **Duplicated stdio MCP servers** multiply per editor/CLI session and leak tokens in CLI args | Audits MCP configs and live processes and **never prints inline secrets** |
+| Orphan `PPID=1` agent scripts linger | `pkill`/`killall` risks killing active work | Re-verifies exact PID, command hash, and start time before gated `SIGTERM` (own-UID MCP-lineage processes only) |
 
 ---
 
 ## Key Capabilities
 
-| Capability | Description | Target |
+| Capability | Description | Status on `main` |
 |---|---|---|
-| **Storage & Orphan Hygiene** | Bounded parallel disk scans, OS Trash / Recycle Bin audit, and recursive `.git` clean/pushed proof for abandoned worktrees | M1 (shipped) |
-| **True Memory Footprint** | Attributes Resident + Compressed + Swap memory by logical owner group (`MCP Fleet`, `VMs`, `Agent CLIs`, `OS Daemons`) | M2 |
-| **Kernel & VFS Blockers** | Inspects macOS vnodes/`fseventsd`/Mach ports, Linux `file-nr`/`inotify`/`D`-state, and Windows handles/pagefile | M2 |
-| **MCP Fleet & Secret Audit** | Detects duplicated stdio MCP servers across agent configs and redacts inline `--api-key`, bearer, and URL credentials | M3 |
-| **Safe `PPID=1` Reaper** | Identifies orphaned `PPID=1` processes and stages dry-run reaping with exact PID + start-time re-verification | M3 |
-| **AXI CLI for AI Agents** | `spacejanitor-axi` (`npx spacejanitor-axi` once published to npm; `doctor` shipped in M1, collectors in M4) emits compact TOON output by default and versioned `spacejanitor.*.v1` JSON with `--json` | M1 (`doctor`) / M4 / M7 |
-| **Optional Local SLM Advisor** | On-demand `127.0.0.1`-only local LLM (0.5B–1.5B GGUF / Ollama) for plain-English plan explanations (`0 MiB` idle) | M6 |
-| **Multi-OS Desktop Tray App** | Electron tray utility (`macOS`, `Linux`, `Windows` on `x64` & `arm64`) that destroys `BrowserWindow` on close | M5 / M7 |
+| **Storage, Trash & Orphan Hygiene** | Bounded parallel disk scans (`sj scan`), OS Trash / Recycle Bin audit (`sj trash`), and a recursive `.git` clean/pushed proof for abandoned worktrees (`sj orphans`, **opt-in**) | Shipped |
+| **True Memory Footprint** | `sj memory` reports Resident + Compressed + Swap per process (top-N) with system pressure on macOS, Linux and Windows collectors | Shipped |
+| **Kernel & VFS Blockers** | `sj blockers` inspects macOS vnodes/`fseventsd`/uninterruptible waits, Linux `file-nr`/`inotify`/`D`-state, and Windows handles/pagefile | Shipped |
+| **MCP Fleet & Secret Audit** | `sj mcp-audit` finds duplicated stdio MCP servers across agent configs and live processes; output uses a closed vocabulary so inline secrets are never printed | Shipped |
+| **LLM Plugin / Skill Audit** | `sj llm-audit` is a read-only inventory of unused plugins, skills, MCP servers and idle MCP sessions (no execute path) | Shipped |
+| **Scoped `PPID=1` Reaper** | `sj reap` plans (dry-run) and executes termination of orphaned MCP-lineage processes owned by you, re-verifying PID, command hash and start time | Shipped (Unix) |
+| **Rust protection gate** | `sj protect` and `sj plan --select` are the **only** protected-path decision point; the desktop app and Node CLI contain no copy of it and fail closed without `sj` | Shipped |
+| **AXI CLI for AI Agents** | `spacejanitor-axi` emits compact TOON (default) or versioned `spacejanitor.*.v1` JSON; collectors call `sj` and fall back to read-only Node views | Shipped (from source) |
+| **Sidecar protocol** | `sj serve-stdio` speaks newline-delimited JSON-RPC 2.0 for GUI hosts | Shipped |
+| **Optional Local SLM Advisor** | On-demand, loopback-only advisor (`spacejanitor-axi advise --slm-url`, desktop drawer); no execution capability | Shipped |
+| **Electron Desktop App** | Tray-first app with two-step confirmation; every removal goes through `sj` | Shipped (build from source; **no installer published yet**) |
 
 ---
 
@@ -59,14 +60,14 @@ flowchart LR
   Confirm --> Execute["Verified Staged Execution"]
 ```
 
-> **Immutable Protected Never-Touch Denylist**
+> **Protected-path gate (Rust only)**
 >
-> Enforced in Rust (`crates/sj-core/src/protect.rs`) across all built-in rules, plugins, and optional SLM suggestions:
-> - **Credential & Agent Stores:** `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`, `.env`, `.env.*`, `*.env`, `*.private.*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa`, `id_rsa.*`, `id_ed25519`, `id_ed25519.*`, `id_ecdsa`, `id_ecdsa.*`, `id_dsa`, `id_dsa.*`
->   *(Note: custom suffix names without a dot, such as `id_rsa_work` or `.envrc`, are not matched by the default filename rule unless placed inside a protected directory such as `~/.ssh`.)*
+> Enforced in `crates/sj-core/src/protect.rs` and exposed as `sj protect`. There is **no JavaScript denylist**: the desktop app and `packages/core` forward every path to `sj` and treat anything they cannot prove as protected.
+> - **Credential & Agent Stores:** `~/.ssh`, `~/.gnupg`, `~/.aws`, `~/.kube`, `~/.claude`, `~/.config/gh`, `.env*`, `*.pem`, `*.key`, `*.p12`, `*.pfx`, `id_rsa*`, `id_ed25519*`
 > - **VM & Disk Images:** `*.vmdk`, `*.qcow2`, `*.vhdx`, `*.vdi`, `*.raw`, `*.img`
 > - **OS System Roots & Home:** `/`, `/System`, `/usr`, `/bin`, `/sbin`, `/etc`, `/Library`, `/private/etc`, `/private/var/db`, `/Windows`, `C:\Windows`, and `$HOME`
-> - **Symlink & Traversal Defense:** Canonicalizes ancestors and fails closed on dangling symlinks or symlinks pointing into protected targets.
+> - **Symlink & Traversal Defense:** canonicalizes ancestors and fails closed on dangling symlinks or symlinks pointing into protected targets. Extra user rules (`--exact`, `--dynamic`, `--glob`) can only add protection.
+> - **Selection-bound confirmation:** `sj plan --select <path>...` reports a `selection_sha256` over exactly the chosen items (including their size/mtime/content snapshot). `--execute --confirm --selection-sha256 <digest>` rebuilds the plan and refuses unless the same selection hashes to the confirmed digest.
 
 ---
 
@@ -74,12 +75,12 @@ flowchart LR
 
 | Scenario | Read-Only Entry Point | Guide |
 |---|---|---|
-| **1. Runaway Disk Exhaustion** | `sj scan` / `sj orphans` / `sj trash` | [Use Case 1](./docs/USE_CASES.md#1-runaway-disk-exhaustion) |
-| **2. Hidden Memory & Swap Thrashing** *(M2)* | `sj memory --top 15` | [Use Case 2](./docs/USE_CASES.md#2-hidden-memory--swap-thrashing) |
-| **3. Kernel & VFS OS Blockers** *(M2)* | `sj blockers` | [Use Case 3](./docs/USE_CASES.md#3-kernel--vfs-os-blockers) |
-| **4. AI Agent MCP Sprawl & Inline Secret Leaks** *(M3)* | `sj mcp-audit` | [Use Case 4](./docs/USE_CASES.md#4-ai-agent-mcp-server-sprawl--inline-secret-leaks) |
-| **5. Safe `PPID=1` Orphan Process Reaping** *(M3)* | `sj reap --dry-run` | [Use Case 5](./docs/USE_CASES.md#5-safe-ppid1-orphan-process-reaping) |
-| **6. Agent-First Automation (AXI) & Local SLM Advisor** *(M1 `doctor` / M4 / M6)* | `node packages/cli/bin/spacejanitor.mjs doctor` *(or `spacejanitor-axi summary` once M4 + npm publish land)* | [Use Case 6](./docs/USE_CASES.md#6-agent-first-automation-axi--optional-local-slm-advisor) |
+| **1. Runaway Disk Exhaustion** | `sj scan` / `sj trash` / `sj orphans --include-orphans` (opt-in) | [Use Case 1](./docs/USE_CASES.md#1-runaway-disk-exhaustion) |
+| **2. Hidden Memory & Swap Thrashing** | `sj memory --top 15` | [Use Case 2](./docs/USE_CASES.md#2-hidden-memory--swap-thrashing) |
+| **3. Kernel & VFS OS Blockers** | `sj blockers` | [Use Case 3](./docs/USE_CASES.md#3-kernel--vfs-os-blockers) |
+| **4. AI Agent MCP Sprawl & Inline Secret Leaks** | `sj mcp-audit` | [Use Case 4](./docs/USE_CASES.md#4-ai-agent-mcp-server-sprawl--inline-secret-leaks) |
+| **5. Safe `PPID=1` Orphan Process Reaping** | `sj reap` (dry-run default) | [Use Case 5](./docs/USE_CASES.md#5-safe-ppid1-orphan-process-reaping) |
+| **6. Agent-First Automation (AXI) & Local SLM Advisor** | `node packages/cli/bin/spacejanitor.mjs summary` | [Use Case 6](./docs/USE_CASES.md#6-agent-first-automation-axi--optional-local-slm-advisor) |
 
 ---
 
@@ -92,6 +93,7 @@ flowchart TB
   Electron --> UI["React Desktop UI"]
   Electron --> SLM["Optional Loopback Local SLM Advisor"]
   Cli --> AXI["spacejanitor-axi CLI and Plugin SDK"]
+  Cli --> Gate["sj protect / sj plan --select: the only protection gate"]
 ```
 
 For process boundaries, IPC allowlists, and the cross-platform collector matrix, see [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md).
@@ -100,41 +102,49 @@ For process boundaries, IPC allowlists, and the cross-platform collector matrix,
 
 ## Quick Installation & Quick Start
 
-### Desktop App (GitHub Releases — M5 / M7)
+> **No installer is published yet.** No release tag exists and the M7 release matrix (`.dmg`, `.AppImage`, `.deb`, `.exe`, `.msi`, `SHA256SUMS.txt`) has not been run, so GitHub Releases is empty. Build from source today. See [docs/INSTALL.md](./docs/INSTALL.md).
 
-Download checksum-verified installers (unsigned until code signing & notarization are enabled; Planned M7) from [GitHub Releases](https://github.com/adibirzu/spacejanitor/releases):
-
-- **macOS Universal (`arm64` + `x64`):** `.dmg`, `.zip`
-- **Linux (`x64` & `arm64`):** `.AppImage`, `.deb`
-- **Windows (`x64` & `arm64`):** `.exe` (NSIS installer), `.msi`
-
-### Rust `sj` CLI (From Source — M1 Ready Today)
+### Rust `sj` CLI (from source)
 
 ```bash
 git clone https://github.com/adibirzu/spacejanitor.git
 cd spacejanitor
 cargo build --release --workspace
 
-# Run read-only diagnostics
-./target/release/sj doctor --json
+# Read-only diagnostics
+./target/release/sj doctor
 ./target/release/sj scan ~/dev --depth 3
 ./target/release/sj trash
-./target/release/sj orphans ~/dev --depth 4
-./target/release/sj plan ~/dev --include-trash --include-orphans
+./target/release/sj memory --top 15
+./target/release/sj blockers
+./target/release/sj mcp-audit
+./target/release/sj llm-audit
+
+# Orphan worktrees are OFF by default; opt in only for repositories you trust
+./target/release/sj orphans ~/dev --depth 4 --include-orphans
+
+# Dry-run plan (add --include-orphans only if you opted in)
+./target/release/sj plan ~/dev --include-trash
 ```
 
-### AXI CLI & Agent Skill (`spacejanitor-axi`)
+### AXI CLI & Agent Skill (`spacejanitor-axi`, from source)
 
 ```bash
-# Run from source today (M1: doctor is live; other collectors return scaffold until M4)
-node packages/cli/bin/spacejanitor.mjs doctor
+node packages/cli/bin/spacejanitor.mjs summary
 node packages/cli/bin/spacejanitor.mjs doctor --json
-
-# Compact TOON output via npx (once published to npm)
-npx spacejanitor-axi doctor
 ```
 
-See [docs/INSTALL.md](./docs/INSTALL.md) for checksum verification and platform-specific notes, and [docs/USAGE.md](./docs/USAGE.md) for the full command reference.
+The package is not published to npm yet, so `npx spacejanitor-axi` does not work today. Collectors call the built `sj` when it can be found (see [docs/INSTALL.md](./docs/INSTALL.md)) and otherwise fall back to read-only Node views; the Node CLI never executes a remediation.
+
+### Desktop app (from source)
+
+```bash
+npm install
+cargo build --release -p sj-cli
+npm run desktop:build
+```
+
+See [docs/USAGE.md](./docs/USAGE.md) for the full command reference.
 
 ---
 
@@ -142,32 +152,49 @@ See [docs/INSTALL.md](./docs/INSTALL.md) for checksum verification and platform-
 
 | Document | Contents |
 |---|---|
-| [docs/USE_CASES.md](./docs/USE_CASES.md) | Step-by-step walkthroughs for all 6 workstation failure modes |
-| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Component diagram, 2-step SHA-256 sequence, IPC sandbox, OS collector matrix |
-| [docs/INSTALL.md](./docs/INSTALL.md) | Desktop installers, `SHA256SUMS.txt` verification, Rust CLI, AXI skill, Local SLM |
-| [docs/USAGE.md](./docs/USAGE.md) | Complete `sj` & `spacejanitor-axi` CLI reference, Desktop Tray UI guide, FAQ |
-| [docs/SECURITY.md](./docs/SECURITY.md) | Threat model, Protected Denylist, secret redaction, sandbox & disclosure policy |
-| [docs/adr/](./docs/adr/ADR-001-desktop-runtime-tauri-vs-electron.md) | Architecture Decision Records (ADR-001 through ADR-005) |
-| [docs/prd/](./docs/prd/PRD-001-core-storage-and-orphan-work-engine.md) | Product Requirements Documents (PRD-001 through PRD-005) |
+| [docs/USE_CASES.md](./docs/USE_CASES.md) | Walkthroughs for the six workstation failure modes |
+| [docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md) | Components, selection-bound confirmation sequence, IPC boundary, collector matrix |
+| [docs/INSTALL.md](./docs/INSTALL.md) | Build from source; planned installers and checksum verification |
+| [docs/USAGE.md](./docs/USAGE.md) | `sj` and `spacejanitor-axi` reference, desktop guide, FAQ |
+| [docs/SECURITY.md](./docs/SECURITY.md) | Threat model, protection gate, redaction vocabulary, open hardening items |
+| [docs/adr/](./docs/adr/ADR-001-desktop-runtime-tauri-vs-electron.md) | Architecture Decision Records (ADR-001 to ADR-005) with implementation status |
+| [docs/prd/](./docs/prd/PRD-001-core-storage-and-orphan-work-engine.md) | Product Requirements (PRD-001 to PRD-005) with per-requirement status |
 
 ---
 
-## Roadmap
+## Status
 
-| Milestone | Scope | Status |
+| Milestone | Scope | State on `main` |
 |---|---|---|
-| **M1** | Rust Core (`sj-core`, `sj-cli`): protection denylist, `scan`, `trash`, `orphans`, `plan`, `doctor` | Shipped |
-| **M2** | True Memory Footprint (`sj memory`), Kernel/VFS Blockers (`sj blockers`) | In Progress |
-| **M3** | MCP Fleet & Secret Audit (`sj mcp-audit`), Safe `PPID=1` Orphan Process Reaper (`sj reap`) with PID + start-time re-verification | Planned |
-| **M4** | NDJSON JSON-RPC 2.0 sidecar (`sj serve-stdio`) & full `spacejanitor-axi` collector wiring | Planned |
-| **M5** | Electron Desktop Tray App (`apps/desktop`, `apps/ui`) for macOS, Linux, Windows (`x64` + `arm64`) | Planned |
-| **M6** | Optional Loopback Local SLM Advisor (`0.5B`–`1.5B` GGUF / Ollama) with grammar constraints | Planned |
-| **M7** | Automated GitHub Releases (`.dmg`, `.zip`, `.AppImage`, `.deb`, `.exe`, `.msi`, `SHA256SUMS.txt`) | Planned |
+| **M1** | `sj-core` / `sj-cli`: protection gate, `scan`, `trash`, `orphans`, `plan`, `doctor` | Shipped |
+| **M2** | `sj memory`, `sj blockers`, `sj mcp-audit`, `sj llm-audit` | Shipped (PR #15) |
+| **M3** | Scoped `PPID=1` reaper (`sj reap`) | Shipped, Unix only (PR #15) |
+| **M4** | `sj serve-stdio`, AXI collector wiring | Shipped (PR #10) |
+| **M5** | Electron desktop app (`apps/desktop`, `apps/ui`), all removals through `sj` | Shipped from source (PR #10, #11) |
+| **M6** | Optional loopback local SLM advisor | Shipped (PR #10) |
+| **M7** | Release pipeline (`.github/workflows/release.yml`) | Workflow exists; **never run, no tag, no published artifacts** |
+| Linux extension | Linux audit, systemd/podman blockers, memory, gated remediation | Open in [PR #18](https://github.com/adibirzu/spacejanitor/pull/18), not merged |
+
+Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12) (git-proof hardening), [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse on huge malformed input).
+
+---
+
+## Known limitations
+
+- **Orphan-repo scanning is OFF by default (experimental).** Finding and pruning orphan git worktrees runs `git` (status, ls-remote, config reads, worktree remove) inside repositories found on disk, including repositories SpaceJanitor did not create. An independent review showed a repository's own configuration can still steer that git in ways our proofs do not yet block:
+  - **B35:** a clean filter in a submodule's own config can still run during the read-only status proof.
+  - **B36:** repository `http.<url>.proxy` plus disabled TLS verification can redirect `ls-remote` credentials.
+  - **B37:** timeouts and budgets are not a hard contract (a stalled remote or a FIFO at `.git/config` can hang a scan).
+
+  Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). By default no git command touches any repository (`doctor` only runs `git --version`). Opt in only for repositories you trust: `sj orphans --include-orphans`, `sj plan --include-orphans`, `spacejanitor-axi orphans --include-orphans`, or the explicit toggle in the desktop app (Disk view). When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash cleanup, the confirmation gate, the protection gate, redaction, MCP audit and the SLM advisor are unaffected.
+- **Removal is Unix-only.** `sj plan --execute` and `sj reap --execute` run on macOS and Linux; on Windows they plan and refuse to execute.
+- **Windows config reads** do not yet open MCP config files no-follow (issue #16), and a huge malformed TOML config can parse slowly (issue #17).
+- **No signed installers.** Nothing is published; when releases start they will be unsigned until code signing and notarization are enabled.
 
 ---
 
 ## Contributing & License
 
-Contributions are welcome! Please read [CONTRIBUTING.md](./CONTRIBUTING.md) before opening a pull request. Every PR runs `cargo test --workspace`, `npm test`, `npm run hygiene` (`scripts/check-oss-hygiene.mjs`), and `gitleaks`.
+Contributions are welcome. Read [CONTRIBUTING.md](./CONTRIBUTING.md) first. Every PR runs `cargo test --workspace`, `npm test`, the desktop tests, `npm run hygiene` (`scripts/check-oss-hygiene.mjs`) and `gitleaks`.
 
 Licensed under the [MIT License](./LICENSE).
