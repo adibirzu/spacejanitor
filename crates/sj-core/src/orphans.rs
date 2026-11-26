@@ -234,6 +234,43 @@ fn empty_home_dir() -> PathBuf {
     .clone()
 }
 
+/// Non-executable user settings that change how git SEES the working tree (line endings). Without
+/// them every clean checkout made with `core.autocrlf=true` (the Git for Windows default) would
+/// look modified. Copied by value into a private file that replaces the user's global config, so
+/// no other user key (credential helpers, proxies, filters, aliases) is ever honoured.
+const USER_CONFIG_ALLOWLIST: &[&str] = &["core.autocrlf", "core.eol", "core.safecrlf"];
+
+fn sanitized_user_config() -> PathBuf {
+    static FILE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+    FILE.get_or_init(|| {
+        let home = empty_home_dir();
+        let path = home.join("gitconfig");
+        let mut body = String::from("[core]\n");
+        for key in USER_CONFIG_ALLOWLIST {
+            let mut cmd = Command::new("git");
+            cmd.current_dir(&home)
+                .args(["config", "--get", key])
+                .env_remove("GIT_DIR")
+                .env_remove("GIT_WORK_TREE")
+                .stdin(Stdio::null())
+                .stderr(Stdio::null());
+            if let Ok(out) = cmd.output() {
+                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                let simple = !val.is_empty()
+                    && val.len() < 16
+                    && val.chars().all(|c| c.is_ascii_alphanumeric());
+                if out.status.success() && simple {
+                    let name = key.trim_start_matches("core.");
+                    body.push_str(&format!("\t{name} = {val}\n"));
+                }
+            }
+        }
+        let _ = std::fs::write(&path, body);
+        path
+    })
+    .clone()
+}
+
 const NULL_DEVICE: &str = if cfg!(windows) { "NUL" } else { "/dev/null" };
 
 /// A `git` command with a SCRUBBED environment and config: nothing is inherited except the few
@@ -256,7 +293,7 @@ fn scrubbed_git() -> Command {
             cmd.env(key, v);
         }
     }
-    cmd.env("GIT_CONFIG_GLOBAL", NULL_DEVICE)
+    cmd.env("GIT_CONFIG_GLOBAL", sanitized_user_config())
         .env("GIT_CONFIG_SYSTEM", NULL_DEVICE)
         .env("GIT_CONFIG_NOSYSTEM", "1")
         .env("GIT_TERMINAL_PROMPT", "0")
@@ -431,15 +468,8 @@ fn run_with_timeout(
     }
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let dbg_cmd = format!("{cmd:?}");
+        .stderr(Stdio::null());
     let mut child = cmd.spawn()?;
-    let mut se = child.stderr.take();
-    let dbg_err = std::thread::spawn(move || {
-        let mut b = Vec::new();
-        if let Some(se) = se.as_mut() { let _ = se.read_to_end(&mut b); }
-        b
-    }); // TEMP-DEBUG
     let pgid = child.id();
     if let (Some(data), Some(mut si)) = (input, child.stdin.take()) {
         std::thread::spawn(move || {
@@ -462,7 +492,6 @@ fn run_with_timeout(
             Some(status) => {
                 // git is gone; reap anything it left holding our pipes so the join cannot block
                 kill_process_group(pgid);
-                if !status.success() { eprintln!("TEMPDBG {} => {}", dbg_cmd, String::from_utf8_lossy(&dbg_err.join().unwrap_or_default())); } // TEMP-DEBUG
                 // bounded: a descendant that escaped the group (setsid) may still hold the pipe
                 let left = deadline.saturating_duration_since(Instant::now());
                 let out = out_rx

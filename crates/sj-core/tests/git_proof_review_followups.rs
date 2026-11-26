@@ -166,3 +166,37 @@ fn repo_protocol_allow_cannot_reenable_a_remote_helper() {
         .iter()
         .all(|c| !c.path.ends_with("/protoallow")));
 }
+
+/// The scrubbed config must still honour the user's line-ending settings, otherwise every clean
+/// checkout made with core.autocrlf=true (the Git for Windows default) looks "dirty".
+#[test]
+fn users_autocrlf_setting_does_not_make_clean_repos_look_dirty() {
+    let _g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    let cfg = root.join("user.gitconfig");
+    fs::write(&cfg, "[core]\n\tautocrlf = true\n").unwrap();
+    std::env::set_var("GIT_CONFIG_GLOBAL", &cfg);
+    let repo = clean_pushed_repo(root, "crlf");
+    fs::write(repo.join("lines.txt"), "a\nb\n").unwrap();
+    git(&repo, &["add", "lines.txt"]);
+    git(&repo, &["commit", "-m", "lines"]);
+    git(&repo, &["push", "origin", "HEAD"]);
+    // re-materialise the file so the worktree copy has CRLF endings per the user's setting
+    fs::remove_file(repo.join("lines.txt")).unwrap();
+    git(&repo, &["checkout", "--", "lines.txt"]);
+    assert!(fs::read(repo.join("lines.txt"))
+        .unwrap()
+        .windows(2)
+        .any(|w| w == b"\r\n"));
+    let (report, _) = scan(root, 10);
+    std::env::remove_var("GIT_CONFIG_GLOBAL");
+    assert!(
+        report
+            .safe_to_prune
+            .iter()
+            .any(|c| c.path.ends_with("/crlf")),
+        "clean autocrlf checkout reported unsafe: {:?}",
+        report.blocked
+    );
+}
