@@ -29,6 +29,7 @@ fn lim(call: u64, scan: u64) -> ProofLimits {
         call_timeout: Duration::from_secs(call),
         repo_budget: Duration::from_secs(60),
         scan_budget: Duration::from_secs(scan),
+        ..ProofLimits::default()
     }
 }
 

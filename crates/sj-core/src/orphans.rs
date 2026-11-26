@@ -19,6 +19,10 @@ const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 const REPO_PROOF_BUDGET: Duration = Duration::from_secs(90);
 /// Wall-clock cap for a whole scan (all repositories together).
 const SCAN_BUDGET: Duration = Duration::from_secs(300);
+/// Most distinct tag/worktree-ref/reflog commits one repository may carry before the proof refuses
+/// with `too_many_local_commits_to_verify` (checked in batches, so this is a memory bound, not an
+/// accuracy trade-off).
+const MAX_EXTRA_COMMITS: usize = 200_000;
 
 /// Time limits for git proofs. Every git call is bounded, every repository is bounded, and the
 /// whole scan is bounded; anything that cannot finish in time fails closed (never "safe").
@@ -27,6 +31,7 @@ pub struct ProofLimits {
     pub call_timeout: Duration,
     pub repo_budget: Duration,
     pub scan_budget: Duration,
+    pub max_extra_commits: usize,
 }
 
 impl Default for ProofLimits {
@@ -35,6 +40,7 @@ impl Default for ProofLimits {
             call_timeout: GIT_CALL_TIMEOUT,
             repo_budget: REPO_PROOF_BUDGET,
             scan_budget: SCAN_BUDGET,
+            max_extra_commits: MAX_EXTRA_COMMITS,
         }
     }
 }
@@ -1664,5 +1670,84 @@ mod tests {
         // Absolute rel is returned unchanged.
         let resolved_abs = resolve_relative_from_dir(&existing_base, &shared);
         assert_eq!(resolved_abs, shared);
+    }
+
+    // ---- process-tree kill (all platforms; the Windows leg runs on windows-latest CI) ----------
+
+    /// Re-entry point: the timeout test re-executes THIS test binary with SJ_TREE_ROLE set. As the
+    /// `parent` it spawns a `grandchild` (a second copy of this binary) and records its pid, then both
+    /// sleep. Without the env var it is a no-op, so a normal `cargo test` run is unaffected.
+    #[test]
+    fn tree_kill_helper_role() {
+        let Ok(role) = std::env::var("SJ_TREE_ROLE") else {
+            return;
+        };
+        let pidfile = std::env::var("SJ_TREE_PIDFILE").expect("pidfile");
+        if role == "parent" {
+            let exe = std::env::current_exe().unwrap();
+            let child = std::process::Command::new(exe)
+                .args(["--exact", "orphans::tests::tree_kill_helper_role", "--nocapture"])
+                .env("SJ_TREE_ROLE", "grandchild")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn grandchild");
+            std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    fn pid_is_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only checks existence.
+            unsafe { libc::kill(pid as libc::pid_t, 0) == 0 }
+        }
+        #[cfg(windows)]
+        {
+            let out = Command::new("tasklist")
+                .args(["/NH", "/FI", &format!("PID eq {pid}")])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        }
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_tree_not_just_the_direct_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("grandchild.pid");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "orphans::tests::tree_kill_helper_role", "--nocapture"])
+            .env("SJ_TREE_ROLE", "parent")
+            .env("SJ_TREE_PIDFILE", &pidfile);
+        let started = Instant::now();
+        let res = run_with_timeout(cmd, None, Duration::from_secs(4));
+        assert!(
+            matches!(&res, Err(SjError::Git(r)) if r == "git_timeout"),
+            "expected git_timeout, got {res:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30), "timeout did not bound the call");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the parent never recorded its grandchild; probe is not exercising the tree")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_is_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let alive = pid_is_alive(pid);
+        if alive {
+            #[cfg(unix)]
+            // SAFETY: cleanup of the probe's own leaked process.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        assert!(!alive, "grandchild {pid} survived the timeout: only the direct child was killed");
     }
 }
