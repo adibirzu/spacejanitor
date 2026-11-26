@@ -155,7 +155,7 @@ export function parseHumanSize(raw) {
                     : unit === "ti" || unit === "tib"
                       ? 1024 ** 4
                       : 1;
-  return Math.round(val * mult);
+  return Math.min(Number.MAX_SAFE_INTEGER, Math.round(val * mult));
 }
 
 function dirSizeBounded(dirPath, maxDepth = 2, depth = 0) {
@@ -562,7 +562,9 @@ function hash8(raw) {
 
 export function safeName(raw, prefix) {
   const v = String(raw ?? "");
-  return /^[A-Za-z0-9][A-Za-z0-9_.:@\\-]{0,95}$/.test(v) ? v : `${prefix}-${hash8(v)}`;
+  // `-.mount` / `-.slice` are the systemd root units; no ":" so user:secret@host can never pass.
+  const probe = v.startsWith("-.") ? `x.${v.slice(2)}` : v;
+  return v.length <= 96 && /^[A-Za-z0-9][A-Za-z0-9_.@\\-]*$/.test(probe) ? v : `${prefix}-${hash8(v)}`;
 }
 
 export function safeImage(raw) {
@@ -574,10 +576,11 @@ export function safeImage(raw) {
   return ok ? v : `image-${hash8(v)}`;
 }
 
-const STATUS_OPEN = new Set(["up", "exited", "created", "dead", "paused", "restarting", "removing", "running"]);
+const STATUS_OPEN = new Set(["up", "exited", "created", "dead", "paused", "restarting", "removing", "running", "removal"]);
 const STATUS_VOCAB = new Set([
   "about", "an", "a", "less", "than", "second", "seconds", "minute", "minutes", "hour", "hours", "day", "days",
-  "week", "weeks", "month", "months", "year", "years", "ago", "healthy", "unhealthy", "starting", "paused", "health:",
+  "week", "weeks", "month", "months", "year", "years", "ago", "healthy", "unhealthy", "starting", "paused",
+  "health", "in", "progress", "stopped",
 ]);
 export function safeStatus(raw) {
   const v = String(raw ?? "");
@@ -585,11 +588,11 @@ export function safeStatus(raw) {
   const words = v.toLowerCase().split(/\s+/).filter(Boolean);
   const ok =
     v.length <= 80 &&
-    /^[A-Za-z0-9 ()]+$/.test(v) &&
+    /^[A-Za-z0-9 ():-]+$/.test(v) &&
     STATUS_OPEN.has(words[0]) &&
     words.slice(1).every((w) => {
-      const t = w.replace(/^\(+|\)+$/g, "");
-      return t === "" || /^\d+$/.test(t) || STATUS_VOCAB.has(t);
+      const t = w.replace(/^[():]+|[():]+$/g, "");
+      return t === "" || /^-?\d+$/.test(t) || (t.length <= 4 && /^\d+[a-z]*$/.test(t)) || STATUS_VOCAB.has(t);
     });
   return ok ? v : "<redacted>";
 }
@@ -602,6 +605,16 @@ export function safeState(raw) {
 
 function safeToken(raw) {
   return /^[a-z-]{1,24}$/.test(String(raw ?? "")) ? String(raw) : "unknown";
+}
+
+export function safeImageId(raw) {
+  const hex = String(raw ?? "").replace(/^sha256:/, "");
+  return /^[0-9a-fA-F]{1,71}$/.test(hex);
+}
+
+function safeDanglingTag(raw) {
+  const v = String(raw ?? "");
+  return v === "<none>" || /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(v) ? v : `tag-${hash8(v)}`;
 }
 
 export function safeContainerId(raw) {
@@ -1242,6 +1255,8 @@ export async function collectLinuxAudit({
   execFn = null,
   isProtectedFn = isProtectedPath,
 } = {}) {
+  // A relative home would make the sj gate anchor ~/Documents etc. at "/"; resolve it first.
+  homeDir = path.resolve(homeDir);
   const platform = platformOverride || os.platform();
   const runExec = execFn || safeExecResult;
   const nowMs = Date.now();
@@ -1276,11 +1291,12 @@ export async function collectLinuxAudit({
     for (const line of dockerImgRes.stdout.split(/\r?\n/)) {
       try {
         const obj = JSON.parse(line.trim());
-        if (obj?.ID) {
+        if (obj?.ID && safeImageId(obj.ID)) {
+          const repo = String(obj.Repository || "<none>");
           dockerDangling.push({
             id: String(obj.ID),
-            repository: String(obj.Repository || "<none>"),
-            tag: String(obj.Tag || "<none>"),
+            repository: repo === "<none>" ? repo : safeImage(repo),
+            tag: safeDanglingTag(obj.Tag || "<none>"),
             sizeBytes: parseHumanSize(obj.Size),
           });
         }

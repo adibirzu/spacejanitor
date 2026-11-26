@@ -158,7 +158,7 @@ test("collectLinuxAudit probes Docker, Podman, journald, apt, AppImage mounts, H
           };
         }
         if (cmd === "docker" && args[0] === "images") {
-          return { ok: true, stdout: JSON.stringify({ ID: "img1", Repository: "<none>", Tag: "<none>", Size: "2.5GB" }) };
+          return { ok: true, stdout: JSON.stringify({ ID: "sha256:abcd1234", Repository: "<none>", Tag: "<none>", Size: "2.5GB" }) };
         }
         if (cmd === "podman" && args[0] === "ps") {
           return { ok: true, stdout: JSON.stringify([{ Id: "p1", Names: ["old-pod"], State: "exited", Status: "Exited (0) 5d ago" }]) };
@@ -387,7 +387,7 @@ test("collectLinuxAudit sends model caches, backups, user caches and tmp through
   // Stand-in for the sj gate: protects credential dirs and, when asked for descendants, any dir holding a .env.
   const isProtectedFn = (p, options = {}) => {
     calls.push({ p, descendants: Boolean(options.descendants) });
-    const bad = (q) => /(^|\/)(\.ssh|\.kube|\.env|id_rsa)$/.test(q);
+    const bad = (q) => /(^|\/)(\.ssh|\.kube|\.env|id_rsa)$/.test(q.replace(/\\/g, "/"));
     if (bad(p)) return { protected: true, reason: "credential" };
     if (options.descendants && fs.existsSync(p) && fs.statSync(p).isDirectory()) {
       const walk = (d) => fs.readdirSync(d, { withFileTypes: true }).some((e) => bad(e.name) || (e.isDirectory() && walk(path.join(d, e.name))));
@@ -407,12 +407,83 @@ test("collectLinuxAudit sends model caches, backups, user caches and tmp through
   } finally {
     for (const [k, v] of Object.entries(old)) if (v === undefined) delete process.env[k]; else process.env[k] = v;
   }
-  const listed = [...audit.modelCaches, ...audit.oldBackups, ...audit.packageCaches.userCaches, ...audit.staleTmpEntries].map((a) => a.path).join("\n");
+  const listed = [...audit.modelCaches, ...audit.oldBackups, ...audit.packageCaches.userCaches, ...audit.staleTmpEntries].map((a) => a.path.replace(/\\/g, "/")).join("\n");
   for (const bad of [".ssh", ".kube", ".env", "id_rsa", "relative/escape", "nested", ".cache/pip", "sj-stale"]) {
     assert.ok(!listed.includes(bad), `unsafe path listed (${bad}):\n${listed}`);
   }
   assert.ok(listed.includes("db.tar") && listed.includes("huggingface/hub"), listed);
-  const asked = (suffix) => calls.some((c) => c.p.endsWith(suffix));
+  const asked = (suffix) => calls.some((c) => c.p.replace(/\\/g, "/").endsWith(suffix));
   assert.ok(asked("backups/db.tar") && asked("huggingface/hub"), JSON.stringify(calls));
-  assert.ok(calls.filter((c) => c.p.endsWith(".cache/pip") || c.p.endsWith("sj-stale")).every((c) => c.descendants), "directories must be judged with descendants");
+  assert.ok(calls.filter((c) => /(\.cache.pip|sj-stale)$/.test(c.p)).every((c) => c.descendants), "directories must be judged with descendants");
+});
+
+test("dangling images, userinfo-shaped names and legit statuses follow the closed vocabulary", async () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), "sj-vocab-"));
+  const secrets = ["PROBE_IMAGE_SECRET", "PROBE_TAG_SECRET", "PROBE_NAME_SECRET", "PROBE_UNIT_NAME_SECRET"];
+  const execFn = async (cmd, args) => {
+    if (cmd === "docker" && args[0] === "images") {
+      return {
+        ok: true,
+        stdout: [
+          JSON.stringify({ ID: "-f", Repository: "https://user:PROBE_IMAGE_SECRET@evil.example/app", Tag: "--token=PROBE_TAG_SECRET", Size: "15MB" }),
+          JSON.stringify({ ID: "sha256:deadbeef", Repository: "https://user:PROBE_IMAGE_SECRET@evil.example/app", Tag: "--token=PROBE_TAG_SECRET", Size: "15MB" }),
+          JSON.stringify({ ID: "sha256:cafe0123", Repository: "<none>", Tag: "<none>", Size: "2MB" }),
+        ].join("\n"),
+      };
+    }
+    if (cmd === "docker" && args[0] === "ps") {
+      return {
+        ok: true,
+        stdout: [
+          { ID: "c1", Names: "user:PROBE_NAME_SECRET@host", Image: "nginx:1.27", Status: "Exited (0) 1 day ago", State: "exited" },
+          { ID: "c2", Names: "my.app_v1-prod", Image: "ghcr.io/org/app:1.2@sha256:0123456789abcdef", Status: "Up 12 seconds (health: starting)", State: "running" },
+          { ID: "c3", Names: "n3", Image: "x", Status: "Exited (-1) 2 days ago", State: "exited" },
+          { ID: "c4", Names: "n4", Image: "x", Status: "Exited (0) 5d ago", State: "exited" },
+          { ID: "c5", Names: "n5", Image: "x", Status: "Removal In Progress", State: "removing" },
+          { ID: "c6", Names: "n6", Image: "repo@sha256:", Status: "Exited (137) About an hour ago", State: "exited" },
+        ].map((o) => JSON.stringify(o)).join("\n"),
+      };
+    }
+    if (cmd === "systemctl") {
+      return { ok: true, stdout: "-.mount loaded failed failed Root\nuser:PROBE_UNIT_NAME_SECRET@h.service loaded failed failed x\nuser@1000.service loaded failed failed U\n" };
+    }
+    return { ok: false, stdout: "" };
+  };
+  const audit = await collectLinuxAudit({ platformOverride: "linux", homeDir: home, tmpDir: path.join(home, "tmp"), aptArchivesDir: path.join(home, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", execFn });
+  const blockers = await collectBlockers({ platformOverride: "linux", execFn });
+  const text = JSON.stringify(audit) + JSON.stringify(blockers) + formatToon(blockers);
+  for (const s of secrets) assert.ok(!text.includes(s), `leaked ${s}`);
+  assert.ok(audit.docker.danglingImages.every((i) => !i.id.startsWith("-")));
+  assert.ok(audit.docker.danglingImages.some((i) => i.id === "sha256:cafe0123" && i.repository === "<none>" && i.tag === "<none>"));
+  const all = [...audit.docker.exitedContainers, ...audit.docker.unhealthyContainers, ...(audit.docker.runningContainers || [])];
+  const status = (id) => all.find((c) => c.id === id)?.status;
+  assert.equal(status("c3"), "Exited (-1) 2 days ago");
+  assert.equal(status("c4"), "Exited (0) 5d ago");
+  assert.equal(status("c6"), "Exited (137) About an hour ago");
+  assert.equal(all.find((c) => c.id === "c6").image.startsWith("image-"), true);
+  const units = (blockers.systemd?.systemFailed || []).map((u) => u.unit);
+  assert.ok(units.includes("-.mount") && units.includes("user@1000.service"), JSON.stringify(units));
+});
+
+test("a relative homeDir is resolved so protected home subpaths stay anchored", async () => {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "sj-relhome-"));
+  const myhome = path.join(base, "myhome");
+  fs.mkdirSync(path.join(myhome, "Documents"), { recursive: true });
+  fs.writeFileSync(path.join(myhome, "Documents", "secret.txt"), "secret!");
+  const seen = [];
+  const isProtectedFn = (p, o = {}) => {
+    seen.push(o.homeDir);
+    return { protected: false, reason: "" };
+  };
+  const cwd = process.cwd();
+  const oldHf = process.env.HF_HOME;
+  process.chdir(myhome);
+  process.env.HF_HOME = path.join(myhome, "Documents");
+  try {
+    await collectLinuxAuditWithGate({ platformOverride: "linux", homeDir: ".", tmpDir: path.join(base, "tmp"), aptArchivesDir: path.join(base, "apt"), mountsRaw: "/dev/sda1 / ext4 rw 0 0", isProtectedFn, execFn: async () => ({ ok: false, stdout: "" }) });
+  } finally {
+    process.chdir(cwd);
+    if (oldHf === undefined) delete process.env.HF_HOME; else process.env.HF_HOME = oldHf;
+  }
+  assert.ok(seen.length > 0 && seen.every((h) => path.isAbsolute(h)), `gate saw relative homeDir: ${JSON.stringify(seen)}`);
 });

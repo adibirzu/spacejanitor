@@ -427,14 +427,20 @@ fn short_hash(raw: &str) -> String {
     crate::redact::hash8(raw)
 }
 
-/// Container or unit identifier safe to print and to embed in a plan ref: `[A-Za-z0-9][A-Za-z0-9_.:@\\-]*`.
+/// Container or unit identifier safe to print and to embed in a plan ref:
+/// `[A-Za-z0-9][A-Za-z0-9_.@\\-]*` (docker names, systemd units incl. `user@1000.service`), plus the
+/// systemd root units `-.mount` / `-.slice`. No `:`, so `user:secret@host` can never pass.
 fn safe_name(raw: &str, prefix: &str) -> String {
+    let probe = match raw.strip_prefix("-.") {
+        Some(rest) => format!("x.{rest}"),
+        None => raw.to_string(),
+    };
     let ok = !raw.is_empty()
         && raw.len() <= 96
-        && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
-        && raw
+        && probe.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+        && probe
             .chars()
-            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ':' | '@' | '\\'));
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | '@' | '\\'));
     if ok {
         raw.to_string()
     } else {
@@ -445,7 +451,10 @@ fn safe_name(raw: &str, prefix: &str) -> String {
 /// Image reference: `repo[:tag]` or `repo@sha256:...`. No userinfo, no whitespace.
 fn safe_image(raw: &str) -> String {
     let (body, digest_ok) = match raw.split_once('@') {
-        Some((b, d)) => (b, d.starts_with("sha256:") && d[7..].chars().all(|c| c.is_ascii_hexdigit())),
+        Some((b, d)) => (
+            b,
+            d.starts_with("sha256:") && d.len() > 7 && d[7..].chars().all(|c| c.is_ascii_hexdigit()),
+        ),
         None => (raw, true),
     };
     let ok = digest_ok
@@ -465,38 +474,68 @@ fn safe_image(raw: &str) -> String {
     }
 }
 
-/// Runtime status text ("Exited (0) 2 days ago", "Up 3 hours (unhealthy)"): words, digits,
-/// parentheses only, and it must open with a known state word.
+/// Runtime status text ("Exited (0) 2 days ago", "Up 3 hours (health: starting)"): it must open
+/// with a known state phrase and every later word must be a number, a short duration like `5d`,
+/// or come from the status vocabulary. Anything else is withheld.
 fn safe_status(raw: &str) -> String {
-    const OPEN: [&str; 8] = ["up", "exited", "created", "dead", "paused", "restarting", "removing", "running"];
-    let low = raw.to_ascii_lowercase();
-    let first = low.split_whitespace().next().unwrap_or("");
-    let words_ok = raw
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || c == ' ' || c == '(' || c == ')')
-        && raw.len() <= 80;
-    // Every word after the opener must come from the status vocabulary or be numeric.
-    const VOCAB: [&str; 22] = [
+    const OPEN: [&str; 9] = [
+        "up", "exited", "created", "dead", "paused", "restarting", "removing", "running", "removal",
+    ];
+    const VOCAB: [&str; 28] = [
         "about", "an", "a", "less", "than", "second", "seconds", "minute", "minutes", "hour",
         "hours", "day", "days", "week", "weeks", "month", "months", "year", "years", "ago",
-        "healthy", "unhealthy",
+        "healthy", "unhealthy", "starting", "paused", "health", "in", "progress", "stopped",
     ];
-    let vocab_ok = low
-        .split_whitespace()
-        .skip(1)
-        .map(|w| w.trim_matches(|c| c == '(' || c == ')'))
-        .all(|w| {
-            w.is_empty()
-                || w.chars().all(|c| c.is_ascii_digit())
-                || VOCAB.contains(&w)
-                || matches!(w, "starting" | "paused" | "health:")
-        });
-    if OPEN.contains(&first) && words_ok && vocab_ok {
+    if raw.is_empty() {
+        return String::new();
+    }
+    let chars_ok = raw.len() <= 80
+        && raw
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '(' | ')' | ':' | '-'));
+    let low = raw.to_ascii_lowercase();
+    let mut words = low.split_whitespace();
+    let open_ok = words.next().is_some_and(|w| OPEN.contains(&w));
+    let rest_ok = words.all(|w| {
+        let t = w.trim_matches(|c| c == '(' || c == ')' || c == ':');
+        t.is_empty()
+            || t.strip_prefix('-').unwrap_or(t).chars().all(|c| c.is_ascii_digit())
+            || (t.len() <= 4
+                && t.chars().next().is_some_and(|c| c.is_ascii_digit())
+                && t.chars().skip_while(|c| c.is_ascii_digit()).all(|c| c.is_ascii_lowercase()))
+            || VOCAB.contains(&t)
+    });
+    if chars_ok && open_ok && rest_ok {
         raw.to_string()
-    } else if raw.is_empty() {
-        String::new()
     } else {
         "<redacted>".to_string()
+    }
+}
+
+/// Image ids: `sha256:<hex>` or bare hex, never flag-like.
+fn safe_image_id(raw: &str) -> bool {
+    let hex = raw.strip_prefix("sha256:").unwrap_or(raw);
+    !hex.is_empty() && hex.len() <= 71 && hex.chars().all(|c| c.is_ascii_hexdigit())
+}
+
+fn safe_dangling_repo(raw: &str) -> String {
+    if raw == "<none>" {
+        raw.to_string()
+    } else {
+        safe_image(raw)
+    }
+}
+
+fn safe_dangling_tag(raw: &str) -> String {
+    let ok = raw == "<none>"
+        || (!raw.is_empty()
+            && raw.len() <= 128
+            && raw.chars().next().is_some_and(|c| c.is_ascii_alphanumeric())
+            && raw.chars().all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')));
+    if ok {
+        raw.to_string()
+    } else {
+        format!("tag-{}", short_hash(raw))
     }
 }
 
@@ -614,21 +653,15 @@ pub fn parse_docker_dangling_images(stdout: &str) -> Vec<DanglingImage> {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
-        if id.is_empty() {
+        if !safe_image_id(&id) {
             continue;
         }
         out.push(DanglingImage {
             id,
-            repository: obj
-                .get("Repository")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<none>")
-                .to_string(),
-            tag: obj
-                .get("Tag")
-                .and_then(|v| v.as_str())
-                .unwrap_or("<none>")
-                .to_string(),
+            repository: safe_dangling_repo(
+                obj.get("Repository").and_then(|v| v.as_str()).unwrap_or("<none>"),
+            ),
+            tag: safe_dangling_tag(obj.get("Tag").and_then(|v| v.as_str()).unwrap_or("<none>")),
             size_bytes: obj
                 .get("Size")
                 .and_then(|v| v.as_str())
@@ -1224,7 +1257,18 @@ fn discover_old_backups(home_dir: &Path, ctx: &ProtectionContext, min_age_secs: 
     out
 }
 
-pub fn discover_linux_audit_from_fixtures(fx: LinuxFixtures) -> LinuxAuditReport {
+/// A relative home would make the protect layer anchor `~/Documents` etc. at `/`; resolve it first.
+fn absolutize(p: &Path) -> PathBuf {
+    if p.is_absolute() {
+        return p.to_path_buf();
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(p))
+        .unwrap_or_else(|_| p.to_path_buf())
+}
+
+pub fn discover_linux_audit_from_fixtures(mut fx: LinuxFixtures) -> LinuxAuditReport {
+    fx.home_dir = absolutize(&fx.home_dir);
     let ctx = ProtectionContext::new(fx.home_dir.clone(), vec![]);
     let mounts = parse_proc_mounts(&fx.mounts_raw);
     let appimage_mounts: Vec<MountInfo> = mounts
@@ -1295,6 +1339,7 @@ pub fn discover_linux_audit_from_fixtures(fx: LinuxFixtures) -> LinuxAuditReport
 }
 
 pub fn discover_linux_audit(home_dir: &Path, tmp_dir: Option<&Path>) -> LinuxAuditReport {
+    let home_dir = &absolutize(home_dir);
     let ctx = ProtectionContext::new(home_dir.to_path_buf(), vec![]);
     let mounts = live_proc_mounts();
     let appimage_mounts: Vec<MountInfo> = mounts

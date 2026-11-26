@@ -136,3 +136,68 @@ esac"#,
     assert_eq!(audit.docker.exited_containers.len(), 1);
     assert_no_secrets("audit json", &serde_json::to_string(&audit).unwrap());
 }
+
+/// Final-diff probe review: dangling images, userinfo-shaped names, legit status strings.
+#[test]
+fn dangling_images_names_and_statuses_follow_the_closed_vocabulary() {
+    let imgs = [
+        r#"{"ID":"-f","Repository":"https://user:PROBE_IMAGE_SECRET@evil.example/app","Tag":"--token=PROBE_STATE_SECRET","Size":"15MB"}"#,
+        r#"{"ID":"sha256:deadbeef","Repository":"https://user:PROBE_IMAGE_SECRET@evil.example/app","Tag":"--token=PROBE_STATE_SECRET","Size":"15MB"}"#,
+        r#"{"ID":"sha256:cafe0123","Repository":"<none>","Tag":"<none>","Size":"2MB"}"#,
+    ]
+    .join("\n");
+    let d = sj_core::linux::parse_docker_dangling_images(&imgs);
+    let json = serde_json::to_string(&d).unwrap();
+    assert_no_secrets("dangling", &json);
+    assert!(d.iter().all(|i| !i.id.starts_with('-')), "flag-like image id kept: {json}");
+    assert!(d.iter().any(|i| i.id == "sha256:cafe0123" && i.repository == "<none>" && i.tag == "<none>"));
+
+    let rows = [
+        r#"{"ID":"c1","Names":"user:PROBE_NAME_SECRET@host","Image":"nginx:1.27","Status":"Exited (0) 1 day ago","State":"exited"}"#,
+        r#"{"ID":"c2","Names":"my.app_v1-prod","Image":"ghcr.io/org/app:1.2@sha256:0123456789abcdef","Status":"Up 12 seconds (health: starting)","State":"running"}"#,
+        r#"{"ID":"c3","Names":"n3","Image":"x","Status":"Exited (-1) 2 days ago","State":"exited"}"#,
+        r#"{"ID":"c4","Names":"n4","Image":"x","Status":"Exited (0) 5d ago","State":"exited"}"#,
+        r#"{"ID":"c5","Names":"n5","Image":"x","Status":"Removal In Progress","State":"removing"}"#,
+        r#"{"ID":"c6","Names":"n6","Image":"x","Status":"Exited (137) About an hour ago","State":"exited"}"#,
+    ]
+    .join("\n");
+    let c = sj_core::linux::parse_docker_containers(&rows);
+    assert_no_secrets("names", &serde_json::to_string(&c).unwrap());
+    let by = |id: &str| c.iter().find(|x| x.id == id).unwrap_or_else(|| panic!("{id} missing"));
+    assert_eq!(by("c2").name, "my.app_v1-prod");
+    assert_eq!(by("c2").image, "ghcr.io/org/app:1.2@sha256:0123456789abcdef");
+    for (id, status) in [
+        ("c2", "Up 12 seconds (health: starting)"),
+        ("c3", "Exited (-1) 2 days ago"),
+        ("c4", "Exited (0) 5d ago"),
+        ("c5", "Removal In Progress"),
+        ("c6", "Exited (137) About an hour ago"),
+    ] {
+        assert_eq!(by(id).status, status, "legit status for {id} must survive");
+    }
+
+    let units = "-.mount loaded failed failed Root Mount\nuser:PROBE_UNIT_NAME_SECRET@h.service loaded failed failed x\nuser@1000.service loaded failed failed User\n";
+    let u = sj_core::linux::parse_systemctl_failed(units, "system");
+    assert_no_secrets("units", &serde_json::to_string(&u).unwrap());
+    assert!(u.iter().any(|x| x.unit == "-.mount"));
+    assert!(u.iter().any(|x| x.unit == "user@1000.service"));
+}
+
+/// A relative home must not anchor protected subpaths at "/" (`--path .`).
+#[test]
+fn relative_home_dir_keeps_protected_home_subpaths_protected() {
+    let td = tempfile::tempdir().unwrap();
+    let base = fs::canonicalize(td.path()).unwrap();
+    let myhome = base.join("myhome");
+    fs::create_dir_all(myhome.join("Documents")).unwrap();
+    fs::write(myhome.join("Documents/secret.txt"), b"secret!").unwrap();
+    let tmp = base.join("tmp");
+    fs::create_dir_all(&tmp).unwrap();
+    let _g = SHIM_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    std::env::set_var("HF_HOME", myhome.join("Documents"));
+    std::env::set_current_dir(&myhome).unwrap();
+    let audit = sj_core::linux::discover_linux_audit(std::path::Path::new("."), Some(&tmp));
+    std::env::remove_var("HF_HOME");
+    let listed: Vec<_> = audit.model_caches.iter().map(|m| m.path.clone()).collect();
+    assert!(listed.iter().all(|p| !p.contains("Documents")), "Documents listed via relative home: {listed:?}");
+}
