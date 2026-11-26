@@ -1054,7 +1054,17 @@ pub fn audit_mcp_fleet(opts: &McpAuditOptions) -> Result<McpAuditReport, SjError
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tempfile::tempdir;
+    use tempfile::TempDir;
+
+    /// Temp dir outside protected home subtrees; on Windows the default sits under `AppData`,
+    /// which the protect list refuses, so the audit would scan nothing.
+    fn tempdir() -> std::io::Result<TempDir> {
+        if cfg!(windows) {
+            tempfile::Builder::new().tempdir_in(env!("CARGO_MANIFEST_DIR"))
+        } else {
+            tempfile::tempdir()
+        }
+    }
 
     #[test]
     fn mcp_audit_scans_json_and_toml_redacts_secrets_and_flags_duplicates_and_orphans() {
