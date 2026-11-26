@@ -1,19 +1,26 @@
 use clap::{Parser, Subcommand};
 use sj_core::{
-    linux::{collect_blockers_report, collect_memory_report, discover_linux_audit},
+    blockers::collect_blockers_report,
+    linux::discover_linux_audit,
+    llm_audit::{audit_llm_fleet, AuditPolicy, LlmAuditOptions, SCHEMA_LLM_AUDIT_V1},
+    mcp_audit::{audit_mcp_fleet, McpAuditOptions},
+    memory::{collect_memory_report, MemoryOptions},
     orphans::{inspect_orphans, OrphanOptions},
     plan::{
-        build_remediation_plan_with_linux, execute_plan_item, execute_selection, select_by_paths,
-        selection_sha256 as selection_sha256_fn, ExecutionGate, LinuxPlanOptions, PlanOptions,
-        SelectionGate,
+        build_remediation_plan, build_remediation_plan_with_linux, execute_plan_item,
+        execute_selection, select_by_paths, selection_sha256 as selection_sha256_fn,
+        ExecutionGate, LinuxPlanOptions, PlanOptions, SelectionGate,
     },
     protect::{check_dir_descendants_safe, check_path_protection, ProtectionContext},
+    reap::{build_reap_plan, execute_reap_plan, ReapExecutionGate},
     scan::{scan_directory, ScanOptions},
     trash::{default_trash_paths, discover_trash_at},
-    SjError, SCHEMA_BLOCKERS_V1, SCHEMA_LINUX_AUDIT_V1, SCHEMA_MEMORY_V1, SCHEMA_ORPHANS_V1,
-    SCHEMA_PROPOSAL_V1, SCHEMA_PROTECT_V1, SCHEMA_STORAGE_V1, SCHEMA_TRASH_V1,
+    SjError, SCHEMA_BLOCKERS_V1, SCHEMA_LINUX_AUDIT_V1, SCHEMA_MCP_AUDIT_V1, SCHEMA_MEMORY_V1,
+    SCHEMA_ORPHANS_V1, SCHEMA_PROPOSAL_V1, SCHEMA_PROTECT_V1, SCHEMA_REAP_V1, SCHEMA_STORAGE_V1,
+    SCHEMA_TRASH_V1,
 };
 use std::env;
+use std::io::{BufRead, Write};
 use std::path::PathBuf;
 
 const ORPHAN_SCAN_WARNING: &str = "warning: orphan scanning runs git inside repositories found on disk and is unreviewed, experimental behavior (see docs: Known limitations). Only use it on repositories you trust.";
@@ -67,6 +74,76 @@ enum Commands {
         /// Opt in to scanning: runs git inside repositories found on disk (unreviewed, experimental)
         #[arg(long, default_value_t = false)]
         include_orphans: bool,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Collect system memory totals and per-process true memory footprint
+    Memory {
+        /// Maximum number of top processes to return
+        #[arg(long, default_value_t = 20)]
+        top: usize,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Collect kernel, VFS, and OS resource pressure blockers
+    Blockers {
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Audit MCP server configurations, duplicate/orphan processes, and inline secrets
+    McpAudit {
+        /// Override MCP configuration directories to scan
+        #[arg(long = "config-dir")]
+        config_dir: Vec<PathBuf>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Read-only audit of unused LLM plugins/skills, unused MCP servers and idle MCP sessions
+    /// (dry-run only: there is no execute path in this release)
+    LlmAudit {
+        /// Home directory to inventory (defaults to $HOME / %USERPROFILE%)
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Idle-session threshold in hours
+        #[arg(long, default_value_t = 2.0)]
+        idle_hours: f64,
+        /// Skill staleness threshold in days
+        #[arg(long, default_value_t = 30)]
+        unused_skill_days: u64,
+        /// Additional plugin ids to keep enabled (repeatable)
+        #[arg(long = "keep-plugin")]
+        keep_plugin: Vec<String>,
+        /// Additional skill names to keep (repeatable)
+        #[arg(long = "keep-skill")]
+        keep_skill: Vec<String>,
+        /// Additional MCP server names to keep (repeatable)
+        #[arg(long = "keep-mcp")]
+        keep_mcp: Vec<String>,
+        /// Emit versioned JSON output
+        #[arg(long, default_value_t = false)]
+        json: bool,
+    },
+    /// Plan or execute safe PPID=1 orphan process reaping (dry-run by default)
+    Reap {
+        /// Minimum process age in minutes before eligibility
+        #[arg(long, default_value_t = 30)]
+        min_age_mins: u64,
+        /// Explicitly request dry-run preview (default)
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
+        /// Execute termination (requires --confirm and --plan-sha256)
+        #[arg(long, default_value_t = false)]
+        execute: bool,
+        /// Exact confirmation phrase from the dry-run plan
+        #[arg(long)]
+        confirm: Option<String>,
+        /// Expected plan SHA-256 digest from the dry-run plan
+        #[arg(long)]
+        plan_sha256: Option<String>,
         /// Emit versioned JSON output
         #[arg(long, default_value_t = false)]
         json: bool,
@@ -167,21 +244,8 @@ enum Commands {
         #[arg(long, default_value_t = false)]
         json: bool,
     },
-    /// Detect kernel/VFS blockers and systemd / podman healthcheck unit failures
-    Blockers {
-        /// Emit versioned JSON output
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
-    /// Audit true memory footprint (RAM + swap) across processes
-    Memory {
-        /// Maximum number of processes to include
-        #[arg(long, default_value_t = 15)]
-        top: usize,
-        /// Emit versioned JSON output
-        #[arg(long, default_value_t = false)]
-        json: bool,
-    },
+    /// Serve newline-delimited JSON-RPC 2.0 over stdin/stdout
+    ServeStdio,
 }
 
 enum CliError {
@@ -195,7 +259,7 @@ impl From<SjError> for CliError {
     }
 }
 
-fn print_doctor(json_mode: bool) -> Result<(), CliError> {
+fn build_doctor_json() -> serde_json::Value {
     let git_probe = Command::new("git").arg("--version").output();
     let (git_available, git_version) = match git_probe {
         Ok(out) if out.status.success() => (
@@ -223,43 +287,416 @@ fn print_doctor(json_mode: bool) -> Result<(), CliError> {
         SCHEMA_ORPHANS_V1,
         SCHEMA_PROPOSAL_V1,
         SCHEMA_LINUX_AUDIT_V1,
+        SCHEMA_MCP_AUDIT_V1,
+        SCHEMA_REAP_V1,
+        SCHEMA_LLM_AUDIT_V1,
     ];
 
+    serde_json::json!({
+        "schema": "spacejanitor.doctor.v1",
+        "engine": "rust",
+        "version": version,
+        "os": os,
+        "arch": arch,
+        "schemas": schemas,
+        "git_available": git_available,
+        "git_version": git_version,
+        "home_dir_resolved": home_dir_resolved,
+        "ready": ready,
+    })
+}
+
+fn print_doctor(json_mode: bool) -> Result<(), CliError> {
+    let report = build_doctor_json();
     if json_mode {
-        let report = serde_json::json!({
-            "schema": "spacejanitor.doctor.v1",
-            "engine": "rust",
-            "version": version,
-            "os": os,
-            "arch": arch,
-            "schemas": schemas,
-            "git_available": git_available,
-            "git_version": git_version,
-            "home_dir_resolved": home_dir_resolved,
-            "ready": ready,
-        });
         println!(
             "{}",
             serde_json::to_string_pretty(&report).map_err(SjError::from)?
         );
     } else {
-        println!("sj (Rust core) v{version} — {os}/{arch}");
+        println!(
+            "sj (Rust core) v{} — {}/{}",
+            report["version"].as_str().unwrap_or(""),
+            report["os"].as_str().unwrap_or(""),
+            report["arch"].as_str().unwrap_or("")
+        );
+        let schemas: Vec<&str> = report["schemas"]
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+            .unwrap_or_default();
         println!("schemas: {}", schemas.join(", "));
         println!(
             "git: {} ({})",
-            if git_available { "ok" } else { "missing" },
-            git_version.as_deref().unwrap_or("unavailable")
+            if report["git_available"].as_bool().unwrap_or(false) {
+                "ok"
+            } else {
+                "missing"
+            },
+            report["git_version"].as_str().unwrap_or("unavailable")
         );
         println!(
             "home_dir: {}",
-            if home_dir_resolved {
+            if report["home_dir_resolved"].as_bool().unwrap_or(false) {
                 "ok"
             } else {
                 "unresolved"
             }
         );
-        println!("status: {}", if ready { "READY" } else { "NOT_READY" });
+        println!(
+            "status: {}",
+            if report["ready"].as_bool().unwrap_or(false) {
+                "READY"
+            } else {
+                "NOT_READY"
+            }
+        );
     }
+    Ok(())
+}
+
+fn jsonrpc_error(id: serde_json::Value, code: i64, message: &str) -> serde_json::Value {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        }
+    })
+}
+
+fn dispatch_rpc_method(
+    method: &str,
+    params: &serde_json::Value,
+    ctx: &ProtectionContext,
+) -> Result<serde_json::Value, (i64, String)> {
+    match method {
+        "doctor" => Ok(build_doctor_json()),
+        "scan" => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(4) as usize;
+            let top = params.get("top").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+            let same_fs = params
+                .get("same_fs")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let opts = ScanOptions {
+                max_depth: depth,
+                top_n: top,
+                same_filesystem: same_fs,
+                ..Default::default()
+            };
+            let report = scan_directory(&path, ctx, &opts).map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "trash" => {
+            let target = match params.get("path").and_then(|v| v.as_str()) {
+                Some(p) => PathBuf::from(p),
+                None => default_trash_paths(&ctx.home_dir)
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| (-32000, "no default trash path for platform".to_string()))?,
+            };
+            let report = discover_trash_at(&target, ctx).map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "orphans" => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let depth = params.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            if params.get("include_orphans").and_then(|v| v.as_bool()) != Some(true) {
+                return Ok(serde_json::json!({
+                    "schema": SCHEMA_ORPHANS_V1,
+                    "root": path.to_string_lossy(),
+                    "scanned": false,
+                    "not_scanned_reason": "orphan_scan_disabled_by_default",
+                    "message": ORPHAN_SCAN_DISABLED_MESSAGE,
+                    "candidates_scanned": 0,
+                    "safe_to_prune": [],
+                    "blocked": [],
+                }));
+            }
+            let report = inspect_orphans(&path, ctx, &OrphanOptions { max_depth: depth })
+                .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "memory" => {
+            let top_n = params.get("top").and_then(|v| v.as_u64()).unwrap_or(20) as usize;
+            let report = collect_memory_report(&MemoryOptions { top_n })
+                .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "blockers" => {
+            let report = collect_blockers_report().map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "linux_audit" => {
+            let home = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.home_dir.clone());
+            let tmp_path = params.get("tmp_path").and_then(|v| v.as_str()).map(PathBuf::from);
+            let report = discover_linux_audit(&home, tmp_path.as_deref());
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "mcp_audit" => {
+            let config_dirs = params
+                .get("config_dirs")
+                .and_then(|v| v.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(PathBuf::from))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let report = audit_mcp_fleet(&McpAuditOptions {
+                config_dirs,
+                home_dir: None,
+            })
+            .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "llm_audit" => {
+            let home_dir = params
+                .get("home")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| ctx.home_dir.clone());
+            let mut policy = AuditPolicy::default();
+            if let Some(h) = params.get("idle_hours").and_then(|v| v.as_f64()) {
+                policy.idle_session_hours = h;
+            }
+            if let Some(d) = params.get("unused_skill_days").and_then(|v| v.as_u64()) {
+                policy.unused_skill_days = d;
+            }
+            let names = |key: &str| -> Vec<String> {
+                params
+                    .get(key)
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.iter().filter_map(|x| x.as_str().map(String::from)).collect())
+                    .unwrap_or_default()
+            };
+            policy.keep_enabled_plugins.extend(names("keep_plugin"));
+            policy.keep_enabled_skills.extend(names("keep_skill"));
+            policy.keep_enabled_mcps.extend(names("keep_mcp"));
+            let report = audit_llm_fleet(&LlmAuditOptions {
+                home_dir,
+                policy,
+                now_epoch_secs: None,
+            })
+            .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "plan_reap" => {
+            let min_age_mins = params
+                .get("min_age_mins")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30);
+            let plan = build_reap_plan(min_age_mins).map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(plan).map_err(|e| (-32000, e.to_string()))
+        }
+        "execute_reap" => {
+            let min_age_mins = params
+                .get("min_age_mins")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(30);
+            let confirm_phrase = params
+                .get("confirm")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let plan_sha256 = params
+                .get("plan_sha256")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let plan = build_reap_plan(min_age_mins).map_err(|e| (-32000, e.to_string()))?;
+            let report = execute_reap_plan(
+                &plan,
+                &ReapExecutionGate {
+                    execute: true,
+                    confirm_phrase,
+                    plan_sha256,
+                },
+            )
+            .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(report).map_err(|e| (-32000, e.to_string()))
+        }
+        "plan_cleanup" => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let include_trash = params
+                .get("include_trash")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            // Orphan scanning runs git inside repos found on disk: off unless explicitly requested.
+            let include_orphans = params
+                .get("include_orphans")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let trash_path_override = params
+                .get("trash_path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from);
+            let orphan_max_depth =
+                params.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            let plan = build_remediation_plan(
+                &path,
+                ctx,
+                &PlanOptions {
+                    include_trash,
+                    include_orphans,
+                    trash_path_override,
+                    orphan_max_depth,
+                },
+            )
+            .map_err(|e| (-32000, e.to_string()))?;
+            serde_json::to_value(plan).map_err(|e| (-32000, e.to_string()))
+        }
+        "execute_cleanup" => {
+            let path = params
+                .get("path")
+                .and_then(|v| v.as_str())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from("."));
+            let include_trash = params
+                .get("include_trash")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
+            // Orphan scanning runs git inside repos found on disk: off unless explicitly requested.
+            let include_orphans = params
+                .get("include_orphans")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let orphan_max_depth =
+                params.get("depth").and_then(|v| v.as_u64()).unwrap_or(5) as usize;
+            let confirm = params
+                .get("confirm")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            let plan_sha256 = params
+                .get("plan_sha256")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let item_id = params
+                .get("item")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let plan = build_remediation_plan(
+                &path,
+                ctx,
+                &PlanOptions {
+                    include_trash,
+                    include_orphans,
+                    trash_path_override: None,
+                    orphan_max_depth,
+                },
+            )
+            .map_err(|e| (-32000, e.to_string()))?;
+            let removed = execute_plan_item(
+                &plan,
+                &ExecutionGate {
+                    execute: true,
+                    confirm,
+                    plan_sha256,
+                    item_id,
+                },
+                ctx,
+            )
+            .map_err(|e| (-32000, e.to_string()))?;
+            Ok(serde_json::json!({
+                "schema": SCHEMA_PROPOSAL_V1,
+                "mode": "executed",
+                "mutated": true,
+                "plan_sha256": plan.plan_sha256,
+                "executed_item": removed,
+            }))
+        }
+        _ => Err((-32601, "method not found".to_string())),
+    }
+}
+
+fn run_serve_stdio(ctx: &ProtectionContext) -> Result<(), CliError> {
+    let stdin = std::io::stdin();
+    let mut lock = stdin.lock();
+    let mut stdout = std::io::stdout();
+    let mut buf = Vec::new();
+
+    loop {
+        buf.clear();
+        let n = lock.read_until(b'\n', &mut buf).map_err(SjError::from)?;
+        if n == 0 {
+            break;
+        }
+        let resp_opt = match std::str::from_utf8(&buf) {
+            Err(err) => Some(jsonrpc_error(
+                serde_json::Value::Null,
+                -32700,
+                &format!("parse error: invalid utf-8: {err}"),
+            )),
+            Ok(line) => {
+                let trimmed = line.trim();
+                if trimmed.is_empty() {
+                    continue;
+                }
+                match serde_json::from_str::<serde_json::Value>(trimmed) {
+                    Err(err) => Some(jsonrpc_error(
+                        serde_json::Value::Null,
+                        -32700,
+                        &format!("parse error: {err}"),
+                    )),
+                    Ok(req) => {
+                        let has_id = req.is_object() && req.get("id").is_some();
+                        let id = req.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                        let method = req.get("method").and_then(|v| v.as_str());
+                        let params = req
+                            .get("params")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        if !has_id {
+                            if let Some(m) = method {
+                                let _ = dispatch_rpc_method(m, &params, ctx);
+                            }
+                            None
+                        } else {
+                            Some(match method {
+                                None => {
+                                    jsonrpc_error(id, -32600, "invalid request: missing method")
+                                }
+                                Some(m) => match dispatch_rpc_method(m, &params, ctx) {
+                                    Ok(result) => serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": id,
+                                        "result": result,
+                                    }),
+                                    Err((code, msg)) => jsonrpc_error(id, code, &msg),
+                                },
+                            })
+                        }
+                    }
+                }
+            }
+        };
+        if let Some(resp) = resp_opt {
+            let encoded = serde_json::to_string(&resp).map_err(SjError::from)?;
+            writeln!(stdout, "{encoded}").map_err(SjError::from)?;
+            stdout.flush().map_err(SjError::from)?;
+        }
+    }
+
     Ok(())
 }
 
@@ -296,38 +733,6 @@ fn run() -> Result<(), CliError> {
                     report.package_caches.apt_archives_bytes,
                     report.systemd.system_failed.len(),
                     report.systemd.user_failed.len(),
-                );
-            }
-        }
-        Commands::Blockers { json } => {
-            let report = collect_blockers_report();
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
-                );
-            } else {
-                println!("blockers: status={} counters={}", report.status, report.counters.len());
-                for c in &report.counters {
-                    println!("  {}: {}/{} ({}%) [{}]", c.name, c.current, c.max, c.percent, c.status);
-                }
-            }
-        }
-        Commands::Memory { top, json } => {
-            let report = collect_memory_report(top);
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
-                );
-            } else {
-                println!(
-                    "memory: status={} free={}B total={}B swap_used={}B procs={}",
-                    report.status,
-                    report.free_bytes,
-                    report.total_bytes,
-                    report.swap_used_bytes,
-                    report.processes.len()
                 );
             }
         }
@@ -487,6 +892,164 @@ fn run() -> Result<(), CliError> {
                 }
             }
         }
+        Commands::Memory { top, json } => {
+            let report = collect_memory_report(&MemoryOptions { top_n: top })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "memory ({}): total={}B used={}B compressed={}B swap_used={}B pressure={}",
+                    report.os,
+                    report.system.total_bytes,
+                    report.system.used_bytes,
+                    report.system.compressed_bytes,
+                    report.system.swap_used_bytes,
+                    report.system.pressure_state
+                );
+                for p in &report.processes {
+                    println!(
+                        "  pid={:<6} ppid={:<6} footprint={}B  {}",
+                        p.pid, p.ppid, p.true_footprint_bytes, p.command
+                    );
+                }
+            }
+        }
+        Commands::Blockers { json } => {
+            let report = collect_blockers_report()?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "blockers ({}): status={} count={}",
+                    report.os,
+                    report.status,
+                    report.blockers.len()
+                );
+                for b in &report.blockers {
+                    println!("  [{}] {}: {} — {}", b.severity, b.id, b.title, b.detail);
+                }
+            }
+        }
+        Commands::McpAudit { config_dir, json } => {
+            let report = audit_mcp_fleet(&McpAuditOptions {
+                config_dirs: config_dir,
+                home_dir: None,
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "mcp-audit: files={} servers={} running={} duplicates={} orphans={} secret_findings={}",
+                    report.scanned_files.len(),
+                    report.configured_servers.len(),
+                    report.running_processes.len(),
+                    report.duplicate_groups.len(),
+                    report.orphan_processes.len(),
+                    report.secret_findings.len()
+                );
+            }
+        }
+        Commands::LlmAudit {
+            home,
+            idle_hours,
+            unused_skill_days,
+            keep_plugin,
+            keep_skill,
+            keep_mcp,
+            json,
+        } => {
+            let mut policy = AuditPolicy {
+                idle_session_hours: idle_hours,
+                unused_skill_days,
+                ..AuditPolicy::default()
+            };
+            policy.keep_enabled_plugins.extend(keep_plugin);
+            policy.keep_enabled_skills.extend(keep_skill);
+            policy.keep_enabled_mcps.extend(keep_mcp);
+            let home_dir = home.unwrap_or_else(|| ctx.home_dir.clone());
+            let report = audit_llm_fleet(&LlmAuditOptions {
+                home_dir,
+                policy,
+                now_epoch_secs: None,
+            })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "llm-audit (dry-run): plugins={} stale_plugin_caches={} stale_skills={} broken_symlinks={} duplicate_skills={} unused_mcp={} idle_sessions={} planned_actions={}",
+                    report.plugins.len(),
+                    report.stale_plugin_caches.len(),
+                    report.stale_skills.len(),
+                    report.broken_skill_symlinks.len(),
+                    report.duplicate_skill_dirs.len(),
+                    report.unused_mcp_servers.len(),
+                    report.idle_sessions.len(),
+                    report.planned_actions.len()
+                );
+            }
+        }
+        Commands::Reap {
+            min_age_mins,
+            dry_run,
+            execute,
+            confirm,
+            plan_sha256,
+            json,
+        } => {
+            if dry_run && execute {
+                return Err(CliError::Usage(
+                    "cannot combine --dry-run and --execute".to_string(),
+                ));
+            }
+            let plan = build_reap_plan(min_age_mins)?;
+            if execute {
+                let gate = ReapExecutionGate {
+                    execute: true,
+                    confirm_phrase: confirm.unwrap_or_default(),
+                    plan_sha256: plan_sha256.unwrap_or_default(),
+                };
+                let report = execute_reap_plan(&plan, &gate)?;
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&report).map_err(SjError::from)?
+                    );
+                } else {
+                    println!(
+                        "reap executed: terminated={} skipped={} sha256={}",
+                        report.terminated_count, report.skipped_count, report.plan_sha256
+                    );
+                }
+            } else if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&plan).map_err(SjError::from)?
+                );
+            } else {
+                println!(
+                    "reap (dry-run): targets={} excluded={} sha256={} confirm=\"{}\"",
+                    plan.targets.len(),
+                    plan.excluded.len(),
+                    plan.plan_sha256,
+                    plan.confirm_phrase
+                );
+                for t in &plan.targets {
+                    println!("  pid={:<6} age={}s {}", t.pid, t.elapsed_secs, t.command);
+                }
+            }
+        }
         Commands::Plan {
             path,
             include_trash,
@@ -616,6 +1179,9 @@ fn run() -> Result<(), CliError> {
                     println!("  {} [{}] {} ({}B)", it.id, it.tier, it.path, it.bytes);
                 }
             }
+        }
+        Commands::ServeStdio => {
+            run_serve_stdio(&ctx)?;
         }
     }
 

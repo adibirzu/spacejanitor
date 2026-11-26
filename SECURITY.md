@@ -20,6 +20,18 @@ SpaceJanitor inspects local filesystems, git worktrees, running process argument
 
   Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). By default no git command touches any repository (`doctor` only runs `git --version`). Until that is fixed, opt in only for repositories you trust: `spacejanitor orphans --include-orphans`, `sj orphans --include-orphans`, `sj plan --include-orphans`, or the explicit toggle in the desktop app (Disk view). Every opt-in prints or shows a warning. When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash and cache cleanup, the two-step confirmation gate, the protected-path denylist, redaction, MCP audit and the SLM advisor are unaffected.
 
+## Audit Output Vocabulary (mcp-audit, llm-audit, reap, memory, serve-stdio)
+
+Audit output is built from a closed vocabulary, not from judging whether text looks secret. Free text from process lists and config files never reaches the output unless it is in a fixed catalog (`crates/sj-core/data/redact_catalog.json`) or reduced to a hash:
+
+- Commands, launchers and clients: catalog only, otherwise `<command>`. Package ids after a launcher: catalog only, otherwise `<package:hash8>`. Flag names: catalog only, otherwise `<flag>`; flag values are always `<REDACTED>`.
+- URLs: `http|https|ws|wss` scheme plus a dotted DNS host only; never userinfo, path or query. Anything else is `<url>`.
+- Env and header key names: fixed known-safe list only; every other key is counted, never named.
+- Live-process labels (`server_name`, `owning_client`): the label of a config entry the process matches, a catalog package or client, otherwise `unknown-<first 8 hex of sha256(argv)>`. Never a substring of argv.
+- `secret_findings` are emitted only for a real secret signal (a secret-named flag or env key, or a known token prefix, case-insensitive), not for every redacted value.
+- **Config server labels are user-chosen and are shown.** A label is displayed only if it is at most 32 characters, `[a-z0-9._-]`, with no alphanumeric run over 12; otherwise it becomes `server-<hash8>`. Do not use a secret, token or key as a server label: a short, plain value would be displayed as written.
+- Config files are opened once without following symlinks, validated on the opened handle (regular file, inside the home for default discovery, never inside a protected root), and read from that handle. `--config-dir` on a protected root yields a single `protected_target` warning and no listing.
+
 ## Reporting a Vulnerability
 
 Please report security issues privately via GitHub Security Advisories rather than opening a public issue with exploit details. Include reproduction steps, affected OS/architecture, and potential impact.

@@ -67,7 +67,7 @@ pub(crate) fn hash_dir_tree_records(records: &[DirTreeRecord]) -> String {
 
 #[cfg(unix)]
 #[allow(clippy::unnecessary_cast)]
-mod unix_impl {
+pub(crate) mod unix_impl {
     use super::*;
     use crate::orphans::{verify_orphan_safe_to_remove, verify_orphan_safe_to_remove_staged};
     use crate::protect::QUARANTINE_STAGE_PREFIX;
@@ -299,6 +299,99 @@ mod unix_impl {
             }
         }
         Ok(cur)
+    }
+
+    /// Kind of a directory entry, taken from `fstatat(AT_SYMLINK_NOFOLLOW)` on the handle.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(crate) enum HandleEntryKind {
+        Dir,
+        File,
+        Symlink,
+        Other,
+    }
+
+    /// A directory opened component-by-component without following any symlink, anchored at
+    /// the canonical path it was opened for. Listing and child opens go through the fd only.
+    pub(crate) struct NofollowDir {
+        fd: OwnedFd,
+        canon: PathBuf,
+    }
+
+    impl NofollowDir {
+        /// Opens `canon_dir` (an absolute, already canonicalised path) from `/` with
+        /// `O_NOFOLLOW | O_DIRECTORY` on every component.
+        pub(crate) fn open_canonical(canon_dir: &Path) -> Result<Self, SjError> {
+            Ok(Self {
+                fd: open_dir_nofollow_from_root(canon_dir)?,
+                canon: canon_dir.to_path_buf(),
+            })
+        }
+
+        /// True when the held fd is the directory currently at the canonical path
+        /// (`(st_dev, st_ino)` bound).
+        pub(crate) fn matches_canonical_path(&self) -> bool {
+            match (fstat_fd(&self.fd), lstat_path(&self.canon)) {
+                (Ok(a), Ok(b)) => stat_matches_dev_ino(&a, &b),
+                _ => false,
+            }
+        }
+
+        pub(crate) fn canonical_path(&self) -> &Path {
+            &self.canon
+        }
+
+        /// Opens a child directory relative to this handle, never following a symlink.
+        pub(crate) fn open_child(&self, name: &str) -> Result<Self, SjError> {
+            let c = to_cstring(name)?;
+            let fd = openat_nofollow(
+                self.fd.as_raw_fd(),
+                &c,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            )?;
+            Ok(Self {
+                fd,
+                canon: self.canon.join(name),
+            })
+        }
+
+        /// Lists the entries through the handle. Non-UTF-8 names are skipped.
+        pub(crate) fn entries(&self) -> Result<Vec<(String, HandleEntryKind)>, SjError> {
+            let guard = fd_to_dir(&self.fd)?;
+            let mut names: Vec<(String, CString)> = Vec::new();
+            loop {
+                set_errno(0);
+                let dent = unsafe { libc::readdir(guard.0) };
+                if dent.is_null() {
+                    let err = get_errno();
+                    if err != 0 {
+                        return Err(SjError::Io(std::io::Error::from_raw_os_error(err)));
+                    }
+                    break;
+                }
+                let name_c = unsafe { CStr::from_ptr((*dent).d_name.as_ptr()) };
+                let Ok(name) = name_c.to_str() else { continue };
+                if name == "." || name == ".." {
+                    continue;
+                }
+                names.push((name.to_string(), name_c.to_owned()));
+            }
+            drop(guard);
+            let mut out = Vec::with_capacity(names.len());
+            for (name, c) in names {
+                // the entry may vanish between readdir and fstatat: skip it
+                let Ok(st) = fstatat_nofollow(&self.fd, &c) else {
+                    continue;
+                };
+                let kind = match st.st_mode & libc::S_IFMT {
+                    libc::S_IFDIR => HandleEntryKind::Dir,
+                    libc::S_IFREG => HandleEntryKind::File,
+                    libc::S_IFLNK => HandleEntryKind::Symlink,
+                    _ => HandleEntryKind::Other,
+                };
+                out.push((name, kind));
+            }
+            Ok(out)
+        }
     }
 
     pub(super) struct ManifestFile {

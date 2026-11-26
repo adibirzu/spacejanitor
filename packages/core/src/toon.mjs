@@ -34,6 +34,9 @@ export function formatToon(rawReport) {
     for (const c of report.counters || []) {
       lines.push(`  - ${c.name}: ${c.current}/${c.max} (${c.percent}%) [${c.status}]`);
     }
+    for (const b of report.blockers || []) {
+      lines.push(`  - [${b.severity}] ${b.title}: ${b.detail}`);
+    }
     if (report.systemd) {
       for (const u of report.systemd.systemFailed || []) {
         lines.push(`  - systemd[system]: ${u.unit} (${u.active}/${u.sub})`);
@@ -42,7 +45,11 @@ export function formatToon(rawReport) {
         lines.push(`  - systemd[user]: ${u.unit} (${u.active}/${u.sub})${u.isPodmanHealthcheck ? " [PODMAN_HEALTHCHECK]" : ""}`);
       }
     }
-    if ((report.counters || []).length === 0 && !(report.systemd?.systemFailed?.length || report.systemd?.userFailed?.length)) {
+    if (
+      (report.counters || []).length === 0 &&
+      (report.blockers || []).length === 0 &&
+      !(report.systemd?.systemFailed?.length || report.systemd?.userFailed?.length)
+    ) {
       lines.push("  - no_kernel_blockers_detected");
     }
   } else if (report.schema === "spacejanitor.linux_audit.v1") {

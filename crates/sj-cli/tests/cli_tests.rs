@@ -1,7 +1,22 @@
 use std::fs;
 use std::path::Path;
 use std::process::Command;
-use tempfile::tempdir;
+use tempfile::TempDir;
+
+/// Temp dir outside protected home subtrees. On Windows the default temp dir sits under
+/// `%USERPROFILE%\AppData`, which the protect list refuses, so audits would see nothing.
+fn safe_tempdir() -> TempDir {
+    if cfg!(windows) {
+        tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
+
+#[path = "../../sj-core/tests/common/probe.rs"]
+mod probe;
 
 fn sj_bin() -> &'static str {
     env!("CARGO_BIN_EXE_sj")
@@ -41,7 +56,7 @@ fn cli_help_and_invalid_usage_exit_codes() {
 
 #[test]
 fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = tmp.path();
     let trash_dir = root.join("Trash");
     fs::create_dir_all(&trash_dir).unwrap();
@@ -173,7 +188,7 @@ fn cli_doctor_scan_trash_orphans_plan_end_to_end() {
 
 #[test]
 fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let remote = home.join("origin.git");
     let ws = home.join("ws");
@@ -301,7 +316,7 @@ fn cli_orphans_and_plan_accept_default_dot_relative_and_absolute_paths() {
 #[cfg(unix)]
 #[test]
 fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let remote = home.join("origin.git");
     let real_dir = home.join("real");
@@ -423,7 +438,7 @@ fn cli_orphans_and_plan_preserve_symlink_parent_path_semantics() {
 #[cfg(unix)]
 #[test]
 fn cli_plan_preview_and_execute_preserve_relative_remote_with_symlink_parent() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = tmp.path();
     let real_dir = home.join("real");
     let sub = real_dir.join("sub");
@@ -655,7 +670,7 @@ fn git_shim(dir: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
 #[cfg(unix)]
 #[test]
 fn orphan_scanning_is_off_by_default_and_never_spawns_git() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = tmp.path();
     let home = root.join("home");
     let ws = root.join("ws");
@@ -748,7 +763,7 @@ fn cli_protect_reports_per_path_verdicts_from_the_rust_gate() {
 
 #[test]
 fn cli_protect_descendants_blocks_a_tree_holding_a_protected_entry() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     // the synthetic home contains the work dirs: on Windows the temp dir lives under C:\Users, which
     // is another account's home to the gate unless it is inside the home being judged
     let home = tmp.path().to_path_buf();
@@ -798,7 +813,7 @@ fn cli_plan_excludes_keepass_vaults_and_key_material_in_trash() {
     // (Credential-NAMED files inside ~/.Trash, e.g. ~/.Trash/.netrc, were never covered by the JS
     // denylist either: its home rules are anchored at ~/.netrc itself. The home-anchored cases are pinned
     // by the shared protect vectors.)
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -853,7 +868,7 @@ fn cli_protect_honours_custom_exact_dynamic_and_glob_rules() {
 #[cfg(unix)]
 #[test]
 fn cli_selection_token_for_one_item_cannot_execute_another_selection() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -913,7 +928,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
     let v: serde_json::Value = serde_json::from_str(include_str!("../../sj-core/tests/fixtures/protect_vectors.json")).unwrap();
     for case in v["fs_cases"].as_array().unwrap() {
         let name = case["name"].as_str().unwrap();
-        let root = fs::canonicalize(tempdir().unwrap().keep()).unwrap();
+        let root = fs::canonicalize(safe_tempdir().keep()).unwrap();
         let abs = |rel: &str| -> std::path::PathBuf {
             if Path::new(rel).is_absolute() { Path::new(rel).to_path_buf() } else { root.join(rel) }
         };
@@ -925,7 +940,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
                 symlink(abs(step["target"].as_str().unwrap()), abs(l)).unwrap();
             }
         }
-        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(|c| abs(c)).unwrap_or_else(|| root.clone());
+        let cwd = case.get("cwd").and_then(|c| c.as_str()).map(abs).unwrap_or_else(|| root.clone());
         fs::create_dir_all(&cwd).unwrap();
         let home = abs(case["home"].as_str().unwrap());
         let list = |k: &str| -> Vec<String> {
@@ -961,7 +976,7 @@ fn cli_protect_runs_every_shared_fs_vector_including_relative_custom_rules() {
 fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_rules() {
     // cross-family review R3 blocker 1: both shapes were planned (and deletable) at 8f61e92
     use std::os::unix::fs::symlink;
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -1006,7 +1021,7 @@ fn cli_plan_excludes_trash_items_covered_by_symlink_dotdot_and_relative_custom_r
 #[test]
 fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it() {
     // cross-family review R3 blocker 2: callers must pass --include-trash next to --include-orphans
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let trash = if cfg!(target_os = "macos") {
         home.join(".Trash")
@@ -1037,7 +1052,7 @@ fn cli_plan_include_orphans_alone_replaces_trash_but_with_include_trash_keeps_it
 
 #[test]
 fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let cache = home.join(".cache").join("pip");
     fs::create_dir_all(&cache).unwrap();
@@ -1114,6 +1129,7 @@ fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
             &plan_sha,
             "--item",
             &item_id,
+            "--json",
         ])
         .output()
         .unwrap();
@@ -1145,3 +1161,777 @@ fn cli_linux_audit_blockers_memory_and_plan_include_linux() {
     assert!(!cache.exists());
 }
 
+#[test]
+fn cli_memory_blockers_mcp_audit_and_reap_end_to_end() {
+    let tmp = safe_tempdir();
+    let cfg_dir = tmp.path().join("mcp-configs");
+    fs::create_dir_all(&cfg_dir).unwrap();
+    fs::write(
+        cfg_dir.join("mcp.json"),
+        r#"{"mcpServers":{"sample-mcp":{"command":"npx","args":["-y","sample-mcp"]}}}"#,
+    )
+    .unwrap();
+
+    // memory --top 5 --json
+    let mem = Command::new(sj_bin())
+        .args(["memory", "--top", "5", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(mem.status.code(), Some(0));
+    let mem_json: serde_json::Value = serde_json::from_slice(&mem.stdout).unwrap();
+    assert_eq!(mem_json["schema"], "spacejanitor.memory.v1");
+
+    // blockers --json
+    let blk = Command::new(sj_bin())
+        .args(["blockers", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(blk.status.code(), Some(0));
+    let blk_json: serde_json::Value = serde_json::from_slice(&blk.stdout).unwrap();
+    assert_eq!(blk_json["schema"], "spacejanitor.blockers.v1");
+
+    // mcp-audit --config-dir <dir> --json
+    let mcp = Command::new(sj_bin())
+        .args([
+            "mcp-audit",
+            "--config-dir",
+            cfg_dir.to_str().unwrap(),
+            "--json",
+        ])
+        .output()
+        .unwrap();
+    assert_eq!(mcp.status.code(), Some(0));
+    let mcp_json: serde_json::Value = serde_json::from_slice(&mcp.stdout).unwrap();
+    assert_eq!(mcp_json["schema"], "spacejanitor.mcp_audit.v1");
+    assert_eq!(mcp_json["configured_servers"].as_array().unwrap().len(), 1);
+
+    // reap --dry-run --json
+    let reap_dry = Command::new(sj_bin())
+        .args(["reap", "--dry-run", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(reap_dry.status.code(), Some(0));
+    let reap_json: serde_json::Value = serde_json::from_slice(&reap_dry.stdout).unwrap();
+    assert_eq!(reap_json["schema"], "spacejanitor.reap.v1");
+    assert_eq!(reap_json["mode"], "dry-run");
+    assert_eq!(reap_json["mutated"], false);
+
+    // reap --execute without confirm/plan-sha256 must fail closed with exit code 2
+    let reap_bad = Command::new(sj_bin())
+        .args(["reap", "--execute", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(reap_bad.status.code(), Some(2));
+}
+
+#[test]
+fn cli_serve_stdio_json_rpc_round_trip_and_error_handling() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":1,"method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":2,"method":"memory","params":{{"top":3}}}}"#
+        )
+        .unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":3,"method":"blockers","params":{{}}}}"#
+        )
+        .unwrap();
+        writeln!(stdin, r#"{{not-valid-json"#).unwrap();
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":"req-unknown","method":"no_such_method","params":{{}}}}"#
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(
+        lines.len(),
+        5,
+        "expected 5 JSON-RPC responses, got: {stdout}"
+    );
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(r1["id"], 1);
+    assert_eq!(r1["result"]["schema"], "spacejanitor.doctor.v1");
+
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["id"], 2);
+    assert_eq!(r2["result"]["schema"], "spacejanitor.memory.v1");
+
+    let r3: serde_json::Value = serde_json::from_str(lines[2]).unwrap();
+    assert_eq!(r3["id"], 3);
+    assert_eq!(r3["result"]["schema"], "spacejanitor.blockers.v1");
+
+    let r4: serde_json::Value = serde_json::from_str(lines[3]).unwrap();
+    assert_eq!(r4["id"], serde_json::Value::Null);
+    assert_eq!(r4["error"]["code"], -32700);
+
+    let r5: serde_json::Value = serde_json::from_str(lines[4]).unwrap();
+    assert_eq!(r5["id"], "req-unknown");
+    assert_eq!(r5["error"]["code"], -32601);
+}
+
+#[test]
+fn cli_serve_stdio_omits_notification_responses_and_handles_invalid_utf8() {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        // JSON-RPC 2.0 notification (no id) must produce no response
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+        // Invalid UTF-8 line must return -32700 instead of crashing
+        stdin.write_all(b"\xff\xfe\xfd\n").unwrap();
+        // Subsequent valid request must still succeed
+        writeln!(
+            stdin,
+            r#"{{"jsonrpc":"2.0","id":9,"method":"doctor","params":{{}}}}"#
+        )
+        .unwrap();
+    }
+
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 2, "expected 2 responses, got: {stdout}");
+
+    let r1: serde_json::Value = serde_json::from_str(lines[0]).unwrap();
+    assert_eq!(r1["id"], serde_json::Value::Null);
+    assert_eq!(r1["error"]["code"], -32700);
+
+    let r2: serde_json::Value = serde_json::from_str(lines[1]).unwrap();
+    assert_eq!(r2["id"], 9);
+    assert_eq!(r2["result"]["schema"], "spacejanitor.doctor.v1");
+}
+
+#[cfg(unix)]
+#[test]
+fn cli_llm_audit_is_read_only_secret_safe_and_has_no_execute_path() {
+    let tmp = safe_tempdir();
+    let h = tmp.path();
+    fs::create_dir_all(h.join(".codex/skills")).unwrap();
+    fs::create_dir_all(h.join(".agents/skills/stale-skill")).unwrap();
+    fs::write(h.join(".agents/skills/stale-skill/SKILL.md"), "x").unwrap();
+    let old = std::time::SystemTime::now() - std::time::Duration::from_secs(90 * 86_400);
+    for p in [
+        h.join(".agents/skills/stale-skill/SKILL.md"),
+        h.join(".agents/skills/stale-skill"),
+    ] {
+        let _ = fs::File::open(&p).unwrap().set_modified(old);
+    }
+    // `.codex` is a protected credential root on main (read-only for the audit), so the
+    // removable-symlink fixture lives in an unprotected client root.
+    std::os::unix::fs::symlink("/nonexistent-sj-cli-fixture", h.join(".agents/skills/dead"))
+        .unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"extra@mkt\"]\nenabled = true\n[mcp_servers.sj-fixture-unused]\ncommand = \"npx\"\nargs = [\"sjfixture-unused-mcp-x\", \"--token\", \"CLI_TOK_SECRET\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        h.join(".claude.json"),
+        "{\"mcpServers\":{\"CLI_CLAUDE_MARKER\":{\"command\":\"x\"}}}",
+    )
+    .unwrap();
+
+    let out = Command::new(sj_bin())
+        .args(["llm-audit", "--home"])
+        .arg(h)
+        .arg("--json")
+        .output()
+        .unwrap();
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(v["schema"], "spacejanitor.llm_audit.v1");
+    assert_eq!(v["mode"], "dry-run");
+    assert_eq!(v["mutated"], false);
+    assert_eq!(v["stale_skills"][0]["name"], "stale-skill");
+    assert_eq!(v["broken_skill_symlinks"][0]["name"], "dead");
+    assert_eq!(
+        v["unused_mcp_servers"][0]["server_name"], "sj-fixture-unused",
+        "{text}"
+    );
+    assert!(v["plugins"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|p| p["plugin_id"] == "extra@mkt" && p["disable_candidate"] == true));
+    assert!(!text.contains("CLI_TOK_SECRET") && !text.contains("CLI_CLAUDE_MARKER"));
+    // nothing moved
+    assert!(h.join(".agents/skills/stale-skill").is_dir());
+    assert!(fs::symlink_metadata(h.join(".agents/skills/dead")).is_ok());
+
+    // no execute path exists
+    let ex = Command::new(sj_bin())
+        .args(["llm-audit", "--execute"])
+        .output()
+        .unwrap();
+    assert_ne!(ex.status.code(), Some(0));
+}
+
+// ---- R3 blocker regressions (item 70): every probe must stay out of CLI output ----
+
+fn run_sj(args: &[&str], home: Option<&Path>) -> String {
+    let mut cmd = Command::new(sj_bin());
+    cmd.args(args);
+    if let Some(h) = home {
+        cmd.env("HOME", h);
+    }
+    let out = cmd.output().unwrap();
+    format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    )
+}
+
+#[test]
+fn r3_b1_redaction_is_allowlist_based_and_leaks_no_probe() {
+    let tmp = safe_tempdir();
+    fs::write(
+        tmp.path().join("mcp.json"),
+        r#"{"mcpServers":{"probe":{
+ "command":"bash -lc 'npx some-mcp --token PROBE_SHELL_CMD'",
+ "args":["OPTS=-pPROBE_OPTS_P","JAVA_OPTS=-Dapi.key=PROBE_JAVA_OPTS",
+ "-c","sh -c 'npx mcp --token PROBE_SHELL_INNER'",
+ "--token:PROBE_COLON_B64=","--header=Authorization:Bearer","PROBE_HDR_EQ_SPLIT"]}}}"#,
+    )
+    .unwrap();
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            tmp.path().to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    assert!(out.contains("\"probe\""), "{out}");
+    assert!(!out.contains("PROBE_"), "leak: {out}");
+}
+
+#[test]
+fn r3_b2_split_bearer_and_authorization_args_leak_nothing() {
+    let tmp = safe_tempdir();
+    fs::write(
+        tmp.path().join("mcp.json"),
+        r#"{"mcpServers":{"split":{"command":"npx","args":[
+ "--header","Authorization:","Bearer","PROBE_HDR_SPLIT3",
+ "--auth","Bearer","PROBE_AUTH_BEARER3","Bearer","PROBE_BEARER_PAIR"]}}}"#,
+    )
+    .unwrap();
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            tmp.path().to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    assert!(out.contains("\"split\""), "{out}");
+    assert!(!out.contains("PROBE_"), "leak: {out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b3_symlinked_home_cannot_bypass_protection() {
+    use std::os::unix::fs::symlink;
+    let tmp = safe_tempdir();
+    let real = tmp.path().join("real");
+    fs::create_dir_all(real.join(".cursor")).unwrap();
+    fs::create_dir_all(real.join("Library/Application Support/Claude/Local Storage")).unwrap();
+    fs::write(
+        real.join(".claude.json"),
+        r#"{"mcpServers":{"srv-inside-claude-json":{"command":"npx","args":["srv-x"]}}}"#,
+    )
+    .unwrap();
+    symlink(real.join(".claude.json"), real.join(".mcp.json")).unwrap();
+    symlink(
+        real.join("Library/Application Support/Claude"),
+        real.join(".cursor/skills"),
+    )
+    .unwrap();
+    // non-canonical home: reach `real` through a symlink
+    let link_home = tmp.path().join("homelink");
+    symlink(&real, &link_home).unwrap();
+    let out = run_sj(&["mcp-audit", "--json"], Some(&link_home));
+    assert!(!out.contains("srv-inside-claude-json"), "{out}");
+    let out = run_sj(
+        &["llm-audit", "--home", link_home.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("Local Storage"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r3_b4_llm_audit_never_descends_through_symlinked_roots() {
+    use std::os::unix::fs::symlink;
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".ssh/SecretSubDir")).unwrap();
+    fs::create_dir_all(h.join(".gemini")).unwrap();
+    fs::create_dir_all(h.join(".cursor")).unwrap();
+    symlink(h.join(".ssh"), h.join(".gemini/extensions")).unwrap();
+    symlink(h.join(".ssh"), h.join(".cursor/skills")).unwrap();
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("SecretSubDir"), "{out}");
+    let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+    assert!(v["skills_by_client"].get("cursor").is_none(), "{out}");
+    let roots = v["symlinked_roots"].as_array().unwrap();
+    assert!(
+        roots
+            .iter()
+            .any(|r| r["client"] == "cursor" && r["target_protected"] == true),
+        "{out}"
+    );
+}
+
+#[test]
+fn r3_b5_codex_toml_subtables_are_not_phantom_servers() {
+    let tmp = safe_tempdir();
+    let h = tmp.path();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[mcp_servers.multillm]\nurl = \"https://example.com/mcp\"\n[mcp_servers.multillm.http_headers]\nAuthorization = \"Bearer SECRET_HDR\"\n",
+    )
+    .unwrap();
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    assert!(!out.contains("multillm.http_headers"), "{out}");
+    assert!(!out.contains("SECRET_HDR"), "{out}");
+}
+
+// ---- R4 blocker B3 regressions: symlinked ANCESTORS must never be traversed ----
+
+#[cfg(unix)]
+fn r4_home() -> (tempfile::TempDir, std::path::PathBuf) {
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".claude/plugins/SecretClaudePlugin")).unwrap();
+    fs::create_dir_all(h.join(".claude/skills/SecretClaudeSkill")).unwrap();
+    fs::create_dir_all(
+        h.join("Library/Application Support/Claude/Cache/SecretCacheMkt/SecretCachePlug"),
+    )
+    .unwrap();
+    fs::create_dir_all(h.join(".gemini")).unwrap();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    (tmp, h)
+}
+
+#[cfg(unix)]
+fn llm_json(h: &Path) -> (String, serde_json::Value) {
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    (out, v)
+}
+
+#[cfg(unix)]
+fn has_refused_root(v: &serde_json::Value, reason: &str) -> bool {
+    v["symlinked_roots"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|r| r["reason"] == reason)
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_symlinked_gemini_config_ancestor_into_claude_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(h.join(".claude"), h.join(".gemini/config")).unwrap();
+    let (out, v) = llm_json(&h);
+    // the explicit read-only `claude` client may still list its own names; no other client may
+    assert!(
+        v["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|p| p["client"] == "claude" || p["plugin_id"] != "SecretClaudePlugin"),
+        "{out}"
+    );
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(target_os = "macos")] // `Library/Application Support/Claude` is a protected root on macOS only
+#[test]
+fn r4_b3_symlinked_codex_plugins_ancestor_into_claude_app_support_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(
+        h.join("Library/Application Support/Claude"),
+        h.join(".codex/plugins"),
+    )
+    .unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"SecretCachePlug@SecretCacheMkt\"]\nenabled = false\n",
+    )
+    .unwrap();
+    let (out, v) = llm_json(&h);
+    assert!(
+        v["stale_plugin_caches"].as_array().unwrap().is_empty(),
+        "{out}"
+    );
+    assert!(!out.contains("SecretCacheMkt/SecretCachePlug"), "{out}");
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_symlinked_cursor_ancestor_into_claude_is_refused() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    symlink(h.join(".claude"), h.join(".cursor")).unwrap();
+    let (out, v) = llm_json(&h);
+    assert!(v["skills_by_client"].get("cursor").is_none(), "{out}");
+    assert!(has_refused_root(&v, "protected_target"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_ancestor_symlink_outside_home_is_refused_at_every_root() {
+    use std::os::unix::fs::symlink;
+    let (_t, h) = r4_home();
+    let outside = safe_tempdir();
+    let o = outside.path().canonicalize().unwrap();
+    for d in [
+        "skills/OutsideSkill",
+        "plugins/OutsidePlugin",
+        "plugins/cache/OutMkt/OutPlug",
+        "extensions/OutsideExt",
+        "config/plugins/OutsideGem",
+    ] {
+        fs::create_dir_all(o.join(d)).unwrap();
+    }
+    // whole client dirs are symlinks to outside the home
+    symlink(&o, h.join(".cursor")).unwrap();
+    symlink(&o, h.join(".agents")).unwrap();
+    symlink(&o, h.join(".gemini_x")).unwrap();
+    fs::remove_dir_all(h.join(".gemini")).unwrap();
+    symlink(&o, h.join(".gemini")).unwrap();
+    fs::remove_dir_all(h.join(".codex")).unwrap();
+    symlink(&o, h.join(".codex")).unwrap();
+    let (out, v) = llm_json(&h);
+    for leak in [
+        "OutsideSkill",
+        "OutsidePlugin",
+        "OutPlug",
+        "OutsideExt",
+        "OutsideGem",
+    ] {
+        assert!(!out.contains(leak), "{leak} leaked: {out}");
+    }
+    assert!(has_refused_root(&v, "symlinked_root"), "{out}");
+}
+
+#[cfg(unix)]
+#[test]
+fn r4_b3_safe_in_home_roots_still_listed() {
+    let (_t, h) = r4_home();
+    fs::create_dir_all(h.join(".codex/skills/PlainSkill")).unwrap();
+    let (out, v) = llm_json(&h);
+    assert_eq!(v["skills_by_client"]["codex"]["total"], 1, "{out}");
+}
+
+// ---- R5: walk every JSON string of every CLI surface against the shared PROBE fixture ----
+
+#[test]
+fn r5_cli_mcp_audit_and_llm_audit_walk_every_string_against_probe_fixture() {
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    probe::write_fixture_home(&h);
+    fs::create_dir_all(h.join(".cursor/skills/some-skill")).unwrap();
+
+    let out = run_sj(
+        &[
+            "mcp-audit",
+            "--config-dir",
+            h.join(".cursor").to_str().unwrap(),
+            "--config-dir",
+            h.join(".codex").to_str().unwrap(),
+            "--json",
+        ],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    assert!(
+        v["configured_servers"].as_array().unwrap().len() >= 3,
+        "{out}"
+    );
+    probe::assert_no_needles("sj mcp-audit", &v);
+
+    // default discovery from a fixture HOME (reads ~/.cursor/mcp.json and ~/.codex/config.toml)
+    let out = run_sj(&["mcp-audit", "--json"], Some(&h));
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    probe::assert_no_needles("sj mcp-audit (home)", &v);
+
+    let out = run_sj(
+        &["llm-audit", "--home", h.to_str().unwrap(), "--json"],
+        None,
+    );
+    let v: serde_json::Value = serde_json::from_str(&out).expect(&out);
+    probe::assert_no_needles("sj llm-audit", &v);
+}
+
+#[test]
+fn r5_cli_serve_stdio_mcp_and_llm_audit_walk_every_string() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    probe::write_fixture_home(&h);
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("HOME", &h)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let reqs = [
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"mcp_audit","params":{
+            "config_dirs":[h.join(".cursor").to_str().unwrap(), h.join(".codex").to_str().unwrap()]}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"llm_audit","params":{"home":h.to_str().unwrap()}}),
+    ];
+    {
+        let stdin = child.stdin.as_mut().unwrap();
+        for r in &reqs {
+            writeln!(stdin, "{r}").unwrap();
+        }
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 2, "{text}");
+    for (i, line) in lines.iter().enumerate() {
+        let v: serde_json::Value = serde_json::from_str(line).expect(line);
+        assert!(v.get("result").is_some(), "{line}");
+        probe::assert_no_needles(&format!("serve-stdio[{i}]"), &v);
+    }
+}
+
+#[test]
+fn serve_stdio_llm_audit_honours_keep_and_threshold_params() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".codex")).unwrap();
+    fs::write(
+        h.join(".codex/config.toml"),
+        "[plugins.\"KeepMePlug@KeepMeMkt\"]\nenabled = true\n",
+    )
+    .unwrap();
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("HOME", &h)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let base = serde_json::json!({"home": h.to_str().unwrap()});
+    let mut kept = base.clone();
+    kept["keep_plugin"] = serde_json::json!(["KeepMePlug@KeepMeMkt"]);
+    kept["idle_hours"] = serde_json::json!(0.5);
+    kept["unused_skill_days"] = serde_json::json!(7);
+    for (id, p) in [(1, base), (2, kept)] {
+        writeln!(
+            child.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::json!({"jsonrpc":"2.0","id":id,"method":"llm_audit","params":p})
+        )
+        .unwrap();
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).into_owned();
+    let rows: Vec<serde_json::Value> = text.lines().map(|l| serde_json::from_str(l).unwrap()).collect();
+    let flag = |v: &serde_json::Value| {
+        v["result"]["plugins"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|p| p["plugin_id"] == "KeepMePlug@KeepMeMkt")
+            .map(|p| p["kept_by_policy"].as_bool().unwrap())
+    };
+    assert_eq!(flag(&rows[0]), Some(false), "{text}");
+    assert_eq!(flag(&rows[1]), Some(true), "keep_plugin param ignored: {text}");
+}
+
+#[cfg(unix)]
+fn serve_stdio_with_spy_git(requests: &[serde_json::Value]) -> (String, bool) {
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Stdio;
+    let tmp = safe_tempdir();
+    let root = tmp.path().canonicalize().unwrap();
+    let repo = root.join("work/repo");
+    fs::create_dir_all(repo.join(".git")).unwrap();
+    fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n").unwrap();
+    let bin = root.join("spybin");
+    fs::create_dir_all(&bin).unwrap();
+    let marker = root.join("git-was-spawned");
+    let spy = bin.join("git");
+    fs::write(&spy, format!("#!/bin/sh\necho spawned >> '{}'\nexit 1\n", marker.display())).unwrap();
+    fs::set_permissions(&spy, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap_or_default());
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .env("PATH", path)
+        .env("HOME", &root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    for r in requests {
+        let mut r = r.clone();
+        r["params"]["path"] = serde_json::json!(root.join("work").to_str().unwrap());
+        writeln!(child.stdin.as_mut().unwrap(), "{r}").unwrap();
+    }
+    drop(child.stdin.take());
+    let out = child.wait_with_output().unwrap();
+    (String::from_utf8_lossy(&out.stdout).into_owned(), marker.exists())
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_stdio_never_spawns_git_by_default() {
+    let (text, spawned) = serve_stdio_with_spy_git(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"plan_cleanup","params":{}}),
+        serde_json::json!({"jsonrpc":"2.0","id":2,"method":"execute_cleanup","params":{"item":"x"}}),
+        serde_json::json!({"jsonrpc":"2.0","id":3,"method":"orphans","params":{}}),
+    ]);
+    assert!(!spawned, "git was spawned over serve-stdio without opt-in: {text}");
+}
+
+#[cfg(unix)]
+#[test]
+fn serve_stdio_include_orphans_true_is_the_explicit_opt_in() {
+    let (text, spawned) = serve_stdio_with_spy_git(&[
+        serde_json::json!({"jsonrpc":"2.0","id":1,"method":"plan_cleanup","params":{"include_orphans":true}}),
+    ]);
+    assert!(spawned, "explicit opt-in should still scan: {text}");
+}
+
+#[test]
+fn r5_serve_stdio_unknown_method_never_echoes_the_method() {
+    use std::io::Write;
+    use std::process::Stdio;
+    let mut child = Command::new(sj_bin())
+        .arg("serve-stdio")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    writeln!(
+        child.stdin.as_mut().unwrap(),
+        r#"{{"jsonrpc":"2.0","id":1,"method":"PROBE_UNKNOWN_METHOD","params":{{"k":"PROBE_PARAM"}}}}"#
+    )
+    .unwrap();
+    let out = child.wait_with_output().unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    let v: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+    assert_eq!(v["error"]["code"], -32601);
+    assert_eq!(v["error"]["message"], "method not found");
+    assert!(!text.to_ascii_lowercase().contains("probe"), "{text}");
+}
+
+#[test]
+fn r5_doctor_lists_the_llm_audit_schema() {
+    let out = Command::new(sj_bin())
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let schemas = v["schemas"].as_array().unwrap();
+    assert!(
+        schemas.iter().any(|s| s == "spacejanitor.llm_audit.v1"),
+        "{schemas:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn r5_mcp_audit_config_dir_on_dot_claude_emits_only_protected_target() {
+    let tmp = safe_tempdir();
+    let h = tmp.path().canonicalize().unwrap();
+    fs::create_dir_all(h.join(".claude/projects/SecretClaudeProj")).unwrap();
+    fs::write(
+        h.join(".claude/projects/SecretClaudeProj/SecretSession.json"),
+        "{}",
+    )
+    .unwrap();
+    let out = Command::new(sj_bin())
+        .env("HOME", &h)
+        .args(["mcp-audit", "--config-dir"])
+        .arg(h.join(".claude"))
+        .arg("--json")
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        !text.contains("SecretSession") && !text.contains("SecretClaudeProj"),
+        "{text}"
+    );
+    let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let warnings = v["warnings"].as_array().unwrap();
+    let ours: Vec<_> = warnings
+        .iter()
+        .filter(|w| w.as_str().unwrap_or("").starts_with("protected_target"))
+        .collect();
+    assert_eq!(ours.len(), 1, "{warnings:?}");
+}

@@ -1492,35 +1492,84 @@ export function normalizeReportEnvelope(raw) {
     };
   }
 
-  if (schema === SCHEMA_VERSIONS_EXT.blockers && raw.systemd) {
-    const sd = raw.systemd;
-    const normUnit = (u) => ({
-      unit: u.unit,
-      scope: u.scope,
-      load: u.load,
-      active: u.active,
-      sub: u.sub,
-      description: u.description,
-      isPodmanHealthcheck: Boolean(u.isPodmanHealthcheck ?? u.is_podman_healthcheck),
-    });
+  if (schema === SCHEMA_VERSIONS_EXT.memory && raw.system) {
+    const sys = raw.system || {};
+    const totalBytes = Number(sys.total_bytes || 0);
+    const usedBytes = Number(sys.used_bytes || 0);
+    const freeBytes = Math.max(0, totalBytes - usedBytes);
+    const pState = String(sys.pressure_state || "normal").toUpperCase();
+    const status = pState === "CRITICAL" ? "CRITICAL" : pState === "WARN" ? "ALERT" : "OK";
+    const processes = (raw.processes || []).map((p) => ({
+      pid: Number(p.pid || 0),
+      ppid: Number(p.ppid || 0),
+      rssBytes: Number(p.resident_bytes ?? p.rssBytes ?? 0),
+      trueFootprintBytes: Number(p.true_footprint_bytes ?? p.trueFootprintBytes ?? 0),
+      command: String(p.command || ""),
+      isOrphanPpid1: Number(p.ppid || 0) === 1,
+    }));
     return {
       ...raw,
-      systemd: {
+      status: raw.status || status,
+      totalBytes,
+      freeBytes,
+      usedBytes,
+      swapTotalBytes: Number(sys.swap_total_bytes || 0),
+      swapUsedBytes: Number(sys.swap_used_bytes || 0),
+      processes,
+    };
+  }
+
+  if (schema === SCHEMA_VERSIONS_EXT.blockers) {
+    const out = { ...raw };
+    if (!Array.isArray(out.counters)) {
+      const m = out.metrics || {};
+      const counters = [];
+      const addRatio = (name, cur, max) => {
+        if (typeof cur === "number" && typeof max === "number" && max > 0) {
+          const percent = Math.round((cur / max) * 100);
+          const status = percent >= 90 ? "CRITICAL" : percent >= 75 ? "WARN" : "OK";
+          counters.push({ name, current: cur, max, percent, status });
+        }
+      };
+      addRatio("kern.vnodes", m.vnodes_used, m.vnodes_max);
+      addRatio("fs.file-nr", m.files_used, m.files_max);
+      addRatio("fs.inotify.watches", m.inotify_watches_used, m.inotify_watches_max);
+      out.counters = counters;
+    }
+    if (out.systemd) {
+      const sd = out.systemd;
+      const normUnit = (u) => ({
+        unit: u.unit,
+        scope: u.scope,
+        load: u.load,
+        active: u.active,
+        sub: u.sub,
+        description: u.description,
+        isPodmanHealthcheck: Boolean(u.isPodmanHealthcheck ?? u.is_podman_healthcheck),
+      });
+      out.systemd = {
         available: Boolean(sd.available),
         userBusAvailable: Boolean(sd.userBusAvailable ?? sd.user_bus_available),
         systemFailed: (sd.systemFailed ?? sd.system_failed ?? []).map(normUnit),
         userFailed: (sd.userFailed ?? sd.user_failed ?? []).map(normUnit),
         podmanHealthcheckIssues: (sd.podmanHealthcheckIssues ?? sd.podman_healthcheck_issues ?? []).map(normUnit),
-      },
-    };
+      };
+    }
+    return out;
   }
 
-  if (schema === SCHEMA_VERSIONS_EXT.linuxAudit && raw.package_caches) {
+  if (schema === SCHEMA_VERSIONS_EXT.linuxAudit && (raw.package_caches || raw.packageCaches)) {
     const dk = raw.docker || {};
     const dkDf = dk.df || {};
     const pm = raw.podman || {};
     const pmDf = pm.df || {};
-    const pc = raw.package_caches || {};
+    const pc = raw.packageCaches ?? raw.package_caches ?? {};
+    const dkImagesBytes =
+      dkDf.imagesReclaimableBytes ?? dkDf.images_reclaimable_bytes ?? dk.imagesReclaimableBytes ?? 0;
+    const dkBuildBytes =
+      dkDf.buildCacheReclaimableBytes ?? dkDf.build_cache_reclaimable_bytes ?? dk.buildCacheReclaimableBytes ?? 0;
+    const pmImagesBytes = pmDf.imagesReclaimableBytes ?? pmDf.images_reclaimable_bytes ?? 0;
+    const pmVolumesBytes = pmDf.volumesReclaimableBytes ?? pmDf.volumes_reclaimable_bytes ?? 0;
     return {
       ...raw,
       appimageMounts: raw.appimageMounts ?? raw.appimage_mounts ?? [],
@@ -1528,30 +1577,30 @@ export function normalizeReportEnvelope(raw) {
         available: Boolean(dk.available),
         df: {
           available: Boolean(dkDf.available),
-          imagesReclaimableBytes: dkDf.images_reclaimable_bytes ?? 0,
-          buildCacheReclaimableBytes: dkDf.build_cache_reclaimable_bytes ?? 0,
+          imagesReclaimableBytes: dkImagesBytes,
+          buildCacheReclaimableBytes: dkBuildBytes,
         },
-        buildCacheReclaimableBytes: dkDf.build_cache_reclaimable_bytes ?? 0,
-        imagesReclaimableBytes: dkDf.images_reclaimable_bytes ?? 0,
-        exitedContainers: dk.exited_containers ?? [],
-        unhealthyContainers: dk.unhealthy_containers ?? [],
-        danglingImages: dk.dangling_images ?? [],
+        buildCacheReclaimableBytes: dkBuildBytes,
+        imagesReclaimableBytes: dkImagesBytes,
+        exitedContainers: dk.exitedContainers ?? dk.exited_containers ?? [],
+        unhealthyContainers: dk.unhealthyContainers ?? dk.unhealthy_containers ?? [],
+        danglingImages: dk.danglingImages ?? dk.dangling_images ?? [],
       },
       podman: {
         available: Boolean(pm.available),
         df: {
           available: Boolean(pmDf.available),
-          imagesReclaimableBytes: pmDf.images_reclaimable_bytes ?? 0,
-          volumesReclaimableBytes: pmDf.volumes_reclaimable_bytes ?? 0,
+          imagesReclaimableBytes: pmImagesBytes,
+          volumesReclaimableBytes: pmVolumesBytes,
         },
-        exitedContainers: pm.exited_containers ?? [],
-        unhealthyContainers: pm.unhealthy_containers ?? [],
-        danglingImages: pm.dangling_images ?? [],
+        exitedContainers: pm.exitedContainers ?? pm.exited_containers ?? [],
+        unhealthyContainers: pm.unhealthyContainers ?? pm.unhealthy_containers ?? [],
+        danglingImages: pm.danglingImages ?? pm.dangling_images ?? [],
       },
       packageCaches: {
-        aptArchivesPath: pc.apt_archives_path ?? "/var/cache/apt/archives",
-        aptArchivesBytes: pc.apt_archives_bytes ?? 0,
-        userCaches: pc.user_caches ?? [],
+        aptArchivesPath: pc.aptArchivesPath ?? pc.apt_archives_path ?? "/var/cache/apt/archives",
+        aptArchivesBytes: pc.aptArchivesBytes ?? pc.apt_archives_bytes ?? 0,
+        userCaches: pc.userCaches ?? pc.user_caches ?? [],
       },
       staleTmpEntries: raw.staleTmpEntries ?? raw.stale_tmp_entries ?? [],
       modelCaches: raw.modelCaches ?? raw.model_caches ?? [],

@@ -1,8 +1,9 @@
 use sj_core::linux::{
-    classify_mount, discover_linux_audit_from_fixtures, parse_docker_containers,
-    parse_docker_dangling_images, parse_docker_system_df, parse_human_size,
-    parse_journald_disk_usage, parse_podman_ps, parse_proc_meminfo, parse_proc_mounts,
-    parse_proc_status_vm_swap, parse_systemctl_failed, LinuxFixtures, MountKind,
+    check_linux_command_platform_gate, classify_mount, discover_linux_audit_from_fixtures,
+    parse_docker_containers, parse_docker_dangling_images, parse_docker_system_df,
+    parse_human_size, parse_journald_disk_usage, parse_podman_ps, parse_proc_meminfo,
+    parse_proc_mounts, parse_proc_status_vm_swap, parse_systemctl_failed, LinuxFixtures,
+    MountKind,
 };
 use sj_core::plan::{
     build_remediation_plan_with_linux, execute_plan_item_with_linux, ExecutionGate,
@@ -12,7 +13,19 @@ use sj_core::protect::{check_path_protection, ProtectionContext};
 use sj_core::scan::{scan_directory, ScanOptions};
 use std::fs;
 use std::path::PathBuf;
-use tempfile::tempdir;
+use tempfile::TempDir;
+
+/// Temp dir outside protected home subtrees. On Windows the default temp dir sits under
+/// `%USERPROFILE%\AppData`, which the protect list refuses.
+fn safe_tempdir() -> TempDir {
+    if cfg!(windows) {
+        tempfile::Builder::new()
+            .tempdir_in(env!("CARGO_TARGET_TMPDIR"))
+            .unwrap()
+    } else {
+        tempfile::tempdir().unwrap()
+    }
+}
 
 #[test]
 fn linux_protected_system_and_container_roots_always_fail_closed() {
@@ -145,7 +158,7 @@ SwapFree:        6291456 kB
 
 #[test]
 fn linux_plan_is_dry_run_by_default_gates_execution_and_keeps_models_backups_manual_review_only() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let home = fs::canonicalize(tmp.path()).unwrap().join("home");
     let pip_cache = home.join(".cache").join("pip");
     let hf_cache = home.join(".cache").join("huggingface").join("hub");
@@ -256,7 +269,7 @@ fn linux_plan_is_dry_run_by_default_gates_execution_and_keeps_models_backups_man
 
 #[test]
 fn scan_directory_records_fs_capacity_and_filters_nested_mountpoints() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = tmp.path();
     fs::create_dir_all(root.join("logs")).unwrap();
     fs::write(root.join("logs/app.log"), vec![1u8; 512]).unwrap();
@@ -266,9 +279,10 @@ fn scan_directory_records_fs_capacity_and_filters_nested_mountpoints() {
     assert!(report.fs_free_bytes.is_some());
 }
 
+#[cfg(unix)]
 #[test]
 fn stale_tmp_discovery_checks_newest_descendant_mtime_not_just_dir_mtime() {
-    let tmp = tempdir().unwrap();
+    let tmp = safe_tempdir();
     let root = fs::canonicalize(tmp.path()).unwrap();
     let home = root.join("home");
     let tmp_dir = root.join("tmp");
@@ -315,4 +329,104 @@ fn stale_tmp_discovery_checks_newest_descendant_mtime_not_just_dir_mtime() {
         "directory with fresh descendant file must NOT be marked stale: {:?}",
         audit.stale_tmp_entries
     );
+}
+
+#[test]
+fn blockers_apply_systemd_audit_surfaces_failed_units_and_podman_healthchecks() {
+    use sj_core::blockers::{apply_systemd_audit, evaluate_linux_blockers};
+    use sj_core::linux::SystemdAudit;
+
+    let mut report = evaluate_linux_blockers(Some(100), Some(10000), Some(0), Some(10), Some(524288), vec![]);
+    assert_eq!(report.status, "OK");
+
+    let sys_failed = parse_systemctl_failed(
+        "project-status.service loaded failed failed Project status\npaperclip-backup.service loaded failed failed Backup\n",
+        "system",
+    );
+    let user_failed = parse_systemctl_failed(
+        "no-mistakes-daemon.service loaded failed failed Daemon\npodman-999-healthcheck.service loaded failed failed Podman healthcheck\n",
+        "user",
+    );
+    let podman_hc = user_failed
+        .iter()
+        .filter(|u| u.is_podman_healthcheck)
+        .cloned()
+        .collect();
+
+    apply_systemd_audit(
+        &mut report,
+        SystemdAudit {
+            available: true,
+            user_bus_available: true,
+            system_failed: sys_failed,
+            user_failed,
+            podman_healthcheck_issues: podman_hc,
+        },
+    );
+    assert_eq!(report.status, "WARN");
+    assert!(report.blockers.iter().any(|b| b.id == "linux-systemd-system-failed"));
+    assert!(report.blockers.iter().any(|b| b.id == "linux-systemd-user-failed"));
+    assert!(report.blockers.iter().any(|b| b.id == "linux-podman-healthcheck-failed"));
+}
+
+#[test]
+fn non_unix_linux_command_execution_fails_closed() {
+    let err = check_linux_command_platform_gate(false).unwrap_err();
+    assert!(matches!(err, sj_core::SjError::ExecutionGate(_)));
+    assert!(check_linux_command_platform_gate(true).is_ok());
+
+    #[cfg(not(unix))]
+    {
+        let tmp = safe_tempdir();
+        let home = tmp.path().join("home");
+        let tmp_root = tmp.path().join("tmp");
+        fs::create_dir_all(&home).unwrap();
+        fs::create_dir_all(&tmp_root).unwrap();
+        let audit = discover_linux_audit_from_fixtures(LinuxFixtures {
+            home_dir: home.clone(),
+            tmp_dir: tmp_root.clone(),
+            apt_archives_dir: None,
+            mounts_raw: String::new(),
+            docker_df_raw: String::new(),
+            docker_ps_raw: r#"{"ID":"deadbeef01","Names":"old-runner","Image":"vllm:latest","Status":"Exited (0) 3 days ago","State":"exited","Size":"1.5GB"}"#.to_string(),
+            docker_images_raw: String::new(),
+            podman_df_raw: String::new(),
+            podman_ps_raw: String::new(),
+            journald_usage_raw: String::new(),
+            systemctl_system_raw: String::new(),
+            systemctl_user_raw: String::new(),
+            stale_age_secs: 0,
+        });
+        let ctx = ProtectionContext::new(home.clone(), vec![]);
+        let plan = build_remediation_plan_with_linux(
+            &home,
+            &ctx,
+            &PlanOptions::default(),
+            &LinuxPlanOptions {
+                include_linux: true,
+                audit_override: Some(audit),
+                tmp_root_override: Some(tmp_root.clone()),
+            },
+        )
+        .unwrap();
+        let item = plan
+            .items
+            .iter()
+            .find(|i| i.kind == "docker_exited_container")
+            .unwrap()
+            .clone();
+        let err = execute_plan_item_with_linux(
+            &plan,
+            &ExecutionGate {
+                execute: true,
+                confirm: true,
+                plan_sha256: plan.plan_sha256.clone(),
+                item_id: item.id.clone(),
+            },
+            &ctx,
+            &[tmp_root],
+        )
+        .unwrap_err();
+        assert!(matches!(err, sj_core::SjError::ExecutionGate(_)));
+    }
 }

@@ -190,10 +190,64 @@ test("collectLinuxAudit probes Docker, Podman, journald, apt, AppImage mounts, H
     const toon = formatToon(audit);
     assert.ok(toon.includes("spacejanitor.linux_audit.v1"));
     assert.ok(toon.includes("docker_build_cache"));
+    assert.ok(toon.includes("docker: exited=1 unhealthy=1 dangling_imgs=1"));
+    assert.ok(!toon.includes("docker_build_cache_gib=0.00"));
+    assert.ok(toon.includes("podman: exited=1 unhealthy=0"));
     assert.ok(toon.includes("appimage_mounts: 2"));
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
+});
+
+test("formatToon and normalizeReportEnvelope preserve Docker/Podman stats across double normalization of Rust snake_case JSON", async () => {
+  const { normalizeReportEnvelope } = await import("../src/index.mjs");
+  const rustJson = {
+    schema: SCHEMA_VERSIONS.linuxAudit,
+    os: "linux",
+    arch: "aarch64",
+    mounts: [],
+    appimage_mounts: [{ mount_point: "/tmp/.mount_Orca-1", source: "Orca.AppImage" }],
+    docker: {
+      available: true,
+      df: {
+        available: true,
+        images_reclaimable_bytes: 2 * 1024 ** 3,
+        build_cache_reclaimable_bytes: 1024 ** 3,
+      },
+      exited_containers: [{ id: "abc123", name: "old-vllm" }],
+      unhealthy_containers: [{ id: "def456", name: "cadvisor" }],
+      dangling_images: [{ id: "sha256:999" }],
+    },
+    podman: {
+      available: true,
+      df: {
+        available: true,
+        images_reclaimable_bytes: 512 * 1024 ** 2,
+        volumes_reclaimable_bytes: 0,
+      },
+      exited_containers: [{ id: "pod1", name: "stale-pod" }],
+      unhealthy_containers: [],
+      dangling_images: [],
+    },
+    journald: { bytes: 100 * 1024 ** 2 },
+    package_caches: {
+      apt_archives_path: "/var/cache/apt/archives",
+      apt_archives_bytes: 50 * 1024 ** 2,
+      user_caches: [],
+    },
+    stale_tmp_entries: [],
+    model_caches: [],
+    old_backups: [],
+  };
+
+  const norm1 = normalizeReportEnvelope(rustJson);
+  const norm2 = normalizeReportEnvelope(norm1);
+  assert.deepEqual(norm2.docker, norm1.docker);
+  assert.deepEqual(norm2.podman, norm1.podman);
+
+  const toon = formatToon(norm1);
+  assert.ok(toon.includes("docker: exited=1 unhealthy=1 dangling_imgs=1 img_reclaim_gib=2.00 docker_build_cache_gib=1.00"), toon);
+  assert.ok(toon.includes("podman: exited=1 unhealthy=0"), toon);
 });
 
 test("collectDisk evaluates percentage thresholds cleanly for both 96 GiB and 3.7 TB disks", async () => {
