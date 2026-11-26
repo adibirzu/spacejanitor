@@ -42,6 +42,8 @@ test("CLI exits non-zero with a message on a bad tag and prints prerelease on a 
   const bad = spawnSync("node", [script, "v0.1.0-beta", "--package-version", "0.1.0"], { encoding: "utf8" });
   assert.notEqual(bad.status, 0);
   assert.match(bad.stderr, /ERROR/);
+  const noValue = spawnSync("node", [script, "v0.1.0", "--package-version"], { encoding: "utf8" });
+  assert.notEqual(noValue.status, 0, "--package-version without a value must not silently pass");
   assert.notEqual(spawnSync("node", [script, "v0.2.0", "--package-version", "0.1.0"], { encoding: "utf8" }).status, 0);
 });
 

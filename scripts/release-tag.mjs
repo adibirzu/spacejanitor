@@ -27,7 +27,7 @@ if (process.argv[1] === fileURLToPath(import.meta.url)) {
   const args = process.argv.slice(2);
   const tag = args[0];
   const i = args.indexOf("--package-version");
-  const pkg = i >= 0 ? args[i + 1] : undefined;
+  const pkg = i >= 0 ? (args[i + 1] ?? "") : undefined; // flag present without a value must fail, not skip the check
   const r = pkg === undefined ? parseReleaseTag(tag) : checkTagAgainstVersion(tag, pkg);
   if (!r.ok) {
     console.error(`ERROR: ${r.error}`);
