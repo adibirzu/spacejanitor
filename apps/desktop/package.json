@@ -5,6 +5,7 @@
   "author": "SpaceJanitor contributors",
   "description": "Electron desktop shell and tray app for SpaceJanitor.",
   "license": "MIT",
+  "homepage": "https://github.com/adibirzu/spacejanitor",
   "main": "dist/main.js",
   "scripts": {
     "generate-icons": "node scripts/generate-icons.mjs",

@@ -42,31 +42,25 @@ mac:
       arch:
         - universal
 
+# Arch is NOT listed per target for linux/win: release.yml passes --x64/--arm64 per matrix job, and an
+# arch list in this file would override that flag (every job would pack both arches with one sj).
 linux:
   category: System
+  # Without this electron-builder derives the name from the scoped npm package (@spacejanitor/desktop).
+  executableName: spacejanitor
+  # Required by the .deb target; a no-reply address so no personal email ships in the package.
+  maintainer: SpaceJanitor contributors <noreply@users.noreply.github.com>
   icon: build/icon.png
   artifactName: SpaceJanitor-${version}-${arch}.${ext}
   target:
     - target: AppImage
-      arch:
-        - x64
-        - arm64
     - target: deb
-      arch:
-        - x64
-        - arm64
 
 win:
   icon: build/icon.png
   target:
     - target: nsis
-      arch:
-        - x64
-        - arm64
     - target: msi
-      arch:
-        - x64
-        - arm64
 
 nsis:
   artifactName: SpaceJanitor-Setup-${version}-${arch}.${ext}
