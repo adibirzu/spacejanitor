@@ -357,24 +357,55 @@ fn strip_toml_comment(line: &str) -> &str {
     line
 }
 
-/// Net `[`/`]` depth of a line, ignoring brackets inside quoted strings.
-fn toml_bracket_depth(line: &str) -> i32 {
-    let (mut depth, mut in_single, mut in_double, mut escaped) = (0, false, false, false);
-    for ch in line.chars() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match ch {
-            '\\' if in_double => escaped = true,
-            '"' if !in_single => in_double = !in_double,
-            '\'' if !in_double => in_single = !in_single,
-            '[' if !in_single && !in_double => depth += 1,
-            ']' if !in_single && !in_double => depth -= 1,
-            _ => {}
+const MAX_TOML_MULTILINE_ARRAY_BYTES: usize = 256 * 1024;
+
+#[derive(Default)]
+struct TomlBrackets {
+    depth: i32,
+    quote: Option<char>,
+    escaped: bool,
+}
+
+impl TomlBrackets {
+    fn scan(&mut self, line: &str) {
+        for ch in line.chars() {
+            if self.escaped {
+                self.escaped = false;
+                continue;
+            }
+            match (self.quote, ch) {
+                (Some('"'), '\\') => self.escaped = true,
+                (Some(quote), ch) if quote == ch => self.quote = None,
+                (None, '"' | '\'') => self.quote = Some(ch),
+                (None, '[') => self.depth += 1,
+                (None, ']') => self.depth -= 1,
+                _ => {}
+            }
         }
     }
-    depth
+}
+
+fn finish_toml_array<'a>(
+    joined: &mut String,
+    brackets: &mut TomlBrackets,
+    lines: &mut impl Iterator<Item = &'a str>,
+    mut bytes_left: usize,
+) -> bool {
+    for raw in lines {
+        let Some(remaining) = bytes_left.checked_sub(raw.len() + 1) else {
+            return false;
+        };
+        bytes_left = remaining;
+        let line = strip_toml_comment(raw).trim();
+        joined.push(' ');
+        joined.push_str(line);
+        brackets.scan(" ");
+        brackets.scan(line);
+        if brackets.depth <= 0 {
+            return true;
+        }
+    }
+    false
 }
 
 fn unquote_toml_str(raw: &str) -> String {
@@ -451,12 +482,13 @@ fn split_toml_server_header(rest: &str) -> (String, &str) {
     }
 }
 
+/// Returns false if an incomplete multiline array stopped parsing before the end of the file.
 fn parse_toml_mcp_config(
     raw: &str,
     source_file: &str,
     servers: &mut Vec<ConfiguredMcpServer>,
     findings: &mut Vec<SecretFinding>,
-) {
+) -> bool {
     #[derive(Default)]
     struct TempServer {
         command: Option<String>,
@@ -472,20 +504,27 @@ fn parse_toml_mcp_config(
     let mut in_env_section = false;
     let mut in_header_section = false;
 
-    let mut lines = raw.lines();
+    let mut complete = true;
+    let mut lines = raw.split_terminator('\n');
     while let Some(raw_line) = lines.next() {
         // A multi-line array (`args = [` ... `]`) is joined into one logical line first.
-        let mut joined = strip_toml_comment(raw_line).trim().to_string();
-        if !joined.starts_with('[') && toml_bracket_depth(&joined) > 0 {
-            for next in lines.by_ref() {
-                joined.push(' ');
-                joined.push_str(strip_toml_comment(next).trim());
-                if toml_bracket_depth(&joined) <= 0 {
-                    break;
-                }
-            }
+        let line = strip_toml_comment(raw_line).trim();
+        let mut brackets = TomlBrackets::default();
+        if !line.starts_with('[') {
+            brackets.scan(line);
         }
-        let line = joined.as_str();
+        let mut joined;
+        let line = if brackets.depth > 0 {
+            joined = line.to_owned();
+            let bytes_left = MAX_TOML_MULTILINE_ARRAY_BYTES.saturating_sub(raw_line.len());
+            if !finish_toml_array(&mut joined, &mut brackets, &mut lines, bytes_left) {
+                complete = false;
+                break;
+            }
+            joined.as_str()
+        } else {
+            line
+        };
         if line.is_empty() {
             continue;
         }
@@ -594,6 +633,7 @@ fn parse_toml_mcp_config(
             match_tokens,
         });
     }
+    complete
 }
 
 fn default_mcp_config_files(home_dir: &Path) -> Vec<PathBuf> {
@@ -991,12 +1031,16 @@ pub fn audit_mcp_with_processes(
             .and_then(|e| e.to_str())
             .is_some_and(|e| e.eq_ignore_ascii_case("toml"));
         if is_toml {
-            parse_toml_mcp_config(
+            if !parse_toml_mcp_config(
                 &raw,
                 &file_str,
                 &mut configured_servers,
                 &mut secret_findings,
-            );
+            ) {
+                warnings.push(format!(
+                    "config TOML array unclosed or exceeds the multiline byte limit: {file_str}"
+                ));
+            }
         } else if let Err(err) = parse_json_mcp_config(
             &raw,
             &file_str,
@@ -1096,6 +1140,40 @@ mod tests {
         } else {
             tempfile::tempdir()
         }
+    }
+
+    #[test]
+    fn toml_array_work_stops_at_byte_limit() {
+        let first = "args = [";
+        let mut joined = first.to_owned();
+        let mut brackets = TomlBrackets::default();
+        brackets.scan(first);
+        let mut rest = [" 'one',", " # a comment", "]", "enabled = true"].into_iter();
+        let max_bytes = first.len() + 1 + " 'one',".len();
+        assert!(!finish_toml_array(
+            &mut joined,
+            &mut brackets,
+            &mut rest,
+            max_bytes - first.len(),
+        ));
+        assert_eq!(joined, "args = [ 'one',");
+        assert_eq!(rest.next(), Some("]"));
+    }
+
+    #[test]
+    fn toml_unclosed_args_are_not_reported_as_parsed() {
+        let mut servers = Vec::new();
+        let mut findings = Vec::new();
+        let complete = parse_toml_mcp_config(
+            "[mcp_servers.example]\ncommand = 'example'\nargs = [\n  'sample',\n",
+            "config.toml",
+            &mut servers,
+            &mut findings,
+        );
+        assert!(!complete);
+        assert_eq!(servers.len(), 1);
+        assert!(servers[0].args.is_empty());
+        assert!(findings.is_empty());
     }
 
     #[test]

@@ -43,7 +43,8 @@ Audit output (`mcp-audit`, `llm-audit`, `reap`, `memory`, `serve-stdio`) is buil
 - Live-process labels: the matched config label, a catalog package or client, otherwise `unknown-<8 hex of sha256(argv)>`.
 - `secret_findings` fire only on a real signal (a secret-named flag or env key, or a known token prefix, case-insensitive).
 - Config server labels are user-chosen and are shown only if at most 32 characters of `[a-z0-9._-]` with no alphanumeric run over 12; otherwise `server-<hash8>`. Do not use a secret as a server label.
-- Config files are opened once without following symlinks and validated on the opened handle (regular file, inside the home for default discovery, never inside a protected root). **Windows does not yet open them no-follow** ([issue #16](https://github.com/adibirzu/spacejanitor/issues/16)); a huge malformed TOML config can parse slowly ([issue #17](https://github.com/adibirzu/spacejanitor/issues/17)).
+- Config files are opened once without following leaf symlinks, then checked before reading from the opened handle. On Windows, the reader rejects leaf reparse points and checks the handle's final path against the protection and home rules. Windows directory listings are path-based.
+- The TOML reader scans multiline arrays incrementally and stops parsing the file with a warning if an array remains unclosed at EOF or exceeds 256 KiB. It retains entries parsed before the incomplete statement.
 
 ---
 
