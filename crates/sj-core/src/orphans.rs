@@ -19,6 +19,10 @@ const GIT_CALL_TIMEOUT: Duration = Duration::from_secs(25);
 const REPO_PROOF_BUDGET: Duration = Duration::from_secs(90);
 /// Wall-clock cap for a whole scan (all repositories together).
 const SCAN_BUDGET: Duration = Duration::from_secs(300);
+/// Most distinct tag/worktree-ref/reflog commits one repository may carry before the proof refuses
+/// with `too_many_local_commits_to_verify` (checked in batches, so this is a memory bound, not an
+/// accuracy trade-off).
+const MAX_EXTRA_COMMITS: usize = 200_000;
 
 /// Time limits for git proofs. Every git call is bounded, every repository is bounded, and the
 /// whole scan is bounded; anything that cannot finish in time fails closed (never "safe").
@@ -27,6 +31,7 @@ pub struct ProofLimits {
     pub call_timeout: Duration,
     pub repo_budget: Duration,
     pub scan_budget: Duration,
+    pub max_extra_commits: usize,
 }
 
 impl Default for ProofLimits {
@@ -35,6 +40,7 @@ impl Default for ProofLimits {
             call_timeout: GIT_CALL_TIMEOUT,
             repo_budget: REPO_PROOF_BUDGET,
             scan_budget: SCAN_BUDGET,
+            max_extra_commits: MAX_EXTRA_COMMITS,
         }
     }
 }
@@ -57,6 +63,7 @@ fn scan_deadline_passed() -> bool {
 struct ScanScope {
     prev_limits: ProofLimits,
     prev_deadline: Option<Instant>,
+    _home: HomeLease,
 }
 
 impl ScanScope {
@@ -64,7 +71,7 @@ impl ScanScope {
         let prev_limits = ACTIVE_LIMITS.with(|l| l.replace(limits));
         let prev_deadline =
             SCAN_DEADLINE.with(|d| d.replace(Some(Instant::now() + limits.scan_budget)));
-        Self { prev_limits, prev_deadline }
+        Self { prev_limits, prev_deadline, _home: HomeLease::acquire() }
     }
 }
 
@@ -208,30 +215,151 @@ pub fn executable_config_key(key: &str) -> Option<String> {
         || (k.starts_with("diff.") && ends(&["textconv", "command"]))
         || (k.starts_with("gpg.") && ends(&["program"]))
         || k.starts_with("uploadpack.")
-        || k.starts_with("ssh.");
+        || k.starts_with("ssh.")
+        // git-lfs runs `lfs.extension.<n>.clean/smudge` commands from config and spawns
+        // `lfs.customtransfer.<n>.path`: allowing the lfs FILTER must not open these doors
+        || k.starts_with("lfs.extension.")
+        || k.starts_with("lfs.customtransfer.")
+        || k == "lfs.standalonetransferagent";
     hit.then_some(k)
 }
 
-fn empty_home_dir() -> PathBuf {
-    static DIR: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir()
-            .join(format!("sj-git-home-{}-{nanos}", std::process::id()));
-        // create_dir (not create_dir_all): never adopt a pre-existing, possibly attacker-owned dir
-        let mut b = std::fs::DirBuilder::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::DirBuilderExt;
-            b.mode(0o700);
+/// Exact filter command lines `git lfs install` writes, per slot. Matched whole, never by prefix,
+/// so nothing can be appended (`; cmd`, `&& cmd`, `$(cmd)`, a path-qualified binary).
+const BENIGN_LFS_FILTERS: &[(&str, &[&str])] = &[
+    ("clean", &["git-lfs clean -- %f"]),
+    ("smudge", &["git-lfs smudge -- %f", "git-lfs smudge --skip -- %f"]),
+    ("process", &["git-lfs filter-process", "git-lfs filter-process --skip"]),
+];
+
+/// Credential helper values that name a stock helper (resolved as `git-credential-<name>`, never an
+/// arbitrary path or shell snippet) plus the one very common `gh` form.
+const BENIGN_CREDENTIAL_HELPERS: &[&str] = &[
+    "",
+    "osxkeychain",
+    "store",
+    "cache",
+    "manager",
+    "manager-core",
+    "libsecret",
+    "wincred",
+    "!gh auth git-credential",
+];
+
+fn benign_credential_helper(v: &str) -> bool {
+    if BENIGN_CREDENTIAL_HELPERS.contains(&v) {
+        return true;
+    }
+    // `cache --timeout=<seconds>`: the only argument form we vouch for
+    v.strip_prefix("cache --timeout=")
+        .is_some_and(|n| !n.is_empty() && n.len() <= 8 && n.chars().all(|c| c.is_ascii_digit()))
+}
+
+/// Entry-level verdict: like [`executable_config_key`] but with the value in hand, so the KNOWN
+/// benign forms (git-lfs filters, stock credential helpers) are not over-blocked while anything that
+/// can run an attacker-chosen command still is. `value` is `None` for a valueless (boolean) key.
+pub fn executable_config_entry(key: &str, value: Option<&str>) -> Option<String> {
+    let hit = executable_config_key(key)?;
+    let benign = match value {
+        None => false,
+        Some(v) => {
+            let filter_ok = hit.starts_with("filter.")
+                && BENIGN_LFS_FILTERS
+                    .iter()
+                    .any(|(slot, vals)| hit.ends_with(&format!(".{slot}")) && vals.contains(&v));
+            let helper_ok = hit.starts_with("credential.")
+                && hit.ends_with(".helper")
+                && benign_credential_helper(v);
+            filter_ok || helper_ok
         }
-        let _ = b.create(&dir);
-        dir
-    })
-    .clone()
+    };
+    (!benign).then_some(hit)
+}
+
+/// The scrubbed git environment's private HOME (empty, so curl finds no `~/.netrc`) plus the
+/// sanitized user gitconfig that lives inside it. Created lazily, shared by nested [`HomeLease`]s on
+/// one thread, and REMOVED when the last lease drops, whatever way the scope ends (success, `?`,
+/// timeout, panic).
+#[derive(Default)]
+struct HomeState {
+    depth: usize,
+    dir: Option<PathBuf>,
+    gitconfig: Option<PathBuf>,
+}
+
+thread_local! {
+    static HOME: std::cell::RefCell<HomeState> = std::cell::RefCell::new(HomeState::default());
+}
+
+pub(crate) struct HomeLease;
+
+impl HomeLease {
+    pub(crate) fn acquire() -> Self {
+        HOME.with(|h| h.borrow_mut().depth += 1);
+        Self
+    }
+}
+
+impl Drop for HomeLease {
+    fn drop(&mut self) {
+        let dir = HOME.with(|h| {
+            let mut h = h.borrow_mut();
+            h.depth = h.depth.saturating_sub(1);
+            if h.depth == 0 {
+                h.gitconfig = None;
+                h.dir.take()
+            } else {
+                None
+            }
+        });
+        if let Some(dir) = dir {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+}
+
+fn create_private_dir() -> Option<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let dir = std::env::temp_dir().join(format!("sj-git-home-{}-{nanos}-{seq}", std::process::id()));
+    // create_dir (not create_dir_all): never adopt a pre-existing, possibly attacker-owned dir
+    #[allow(unused_mut)]
+    let mut b = std::fs::DirBuilder::new();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        b.mode(0o700);
+    }
+    b.create(&dir).ok().map(|_| dir)
+}
+
+/// The HOME for the next scrubbed git call. Outside any lease nothing is created or leaked: a
+/// nonexistent path is just as empty for curl.
+fn empty_home_dir() -> PathBuf {
+    let existing = HOME.with(|h| {
+        let h = h.borrow();
+        (h.depth > 0).then(|| h.dir.clone())
+    });
+    match existing {
+        Some(Some(dir)) => dir,
+        Some(None) => match create_private_dir() {
+            Some(dir) => {
+                HOME.with(|h| h.borrow_mut().dir = Some(dir.clone()));
+                dir
+            }
+            None => unleased_home(),
+        },
+        None => unleased_home(),
+    }
+}
+
+fn unleased_home() -> PathBuf {
+    // not a creatable, predictable temp path: `<null device>/.netrc` can never exist
+    PathBuf::from(NULL_DEVICE)
 }
 
 /// Non-executable user settings that change how git SEES the working tree (line endings). Without
@@ -241,41 +369,37 @@ fn empty_home_dir() -> PathBuf {
 const USER_CONFIG_ALLOWLIST: &[&str] = &["core.autocrlf", "core.eol", "core.safecrlf"];
 
 fn sanitized_user_config() -> PathBuf {
-    // cached per distinct (GIT_CONFIG_GLOBAL, HOME): stable in production, correct if it changes
-    type EnvKey = (Option<OsString>, Option<OsString>);
-    static CACHE: std::sync::Mutex<Vec<(EnvKey, PathBuf)>> = std::sync::Mutex::new(Vec::new());
-    let key = (std::env::var_os("GIT_CONFIG_GLOBAL"), std::env::var_os("HOME"));
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some((_, p)) = cache.iter().find(|(k, _)| *k == key) {
-        return p.clone();
+    if let Some(path) = HOME.with(|h| h.borrow().gitconfig.clone()) {
+        return path;
     }
-    let path = {
-        let home = empty_home_dir();
-        let path = home.join(format!("gitconfig-{}", cache.len()));
-        let mut body = String::from("[core]\n");
-        for key in USER_CONFIG_ALLOWLIST {
-            let mut cmd = Command::new("git");
-            cmd.current_dir(&home)
-                .args(["config", "--get", key])
-                .env_remove("GIT_DIR")
-                .env_remove("GIT_WORK_TREE")
-                .stdin(Stdio::null())
-                .stderr(Stdio::null());
-            if let Ok(out) = cmd.output() {
-                let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                let simple = !val.is_empty()
-                    && val.len() < 16
-                    && val.chars().all(|c| c.is_ascii_alphanumeric());
-                if out.status.success() && simple {
-                    let name = key.trim_start_matches("core.");
-                    body.push_str(&format!("\t{name} = {val}\n"));
-                }
+    let home = empty_home_dir();
+    let leased = HOME.with(|h| h.borrow().dir.as_ref() == Some(&home));
+    if !leased {
+        // no lease: honour NO user config at all (the strictest answer)
+        return PathBuf::from(NULL_DEVICE);
+    }
+    let path = home.join("gitconfig");
+    let mut body = String::from("[core]\n");
+    for key in USER_CONFIG_ALLOWLIST {
+        let mut cmd = Command::new("git");
+        cmd.current_dir(&home)
+            .args(["config", "--get", key])
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .stdin(Stdio::null())
+            .stderr(Stdio::null());
+        if let Ok(out) = cmd.output() {
+            let val = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let simple =
+                !val.is_empty() && val.len() < 16 && val.chars().all(|c| c.is_ascii_alphanumeric());
+            if out.status.success() && simple {
+                let name = key.trim_start_matches("core.");
+                body.push_str(&format!("\t{name} = {val}\n"));
             }
         }
-        let _ = std::fs::write(&path, body);
-        path
-    };
-    cache.push((key, path.clone()));
+    }
+    let _ = std::fs::write(&path, body);
+    HOME.with(|h| h.borrow_mut().gitconfig = Some(path.clone()));
     path
 }
 
@@ -348,12 +472,6 @@ fn scrubbed_git() -> Command {
             "-c",
             "diff.ignoreSubmodules=all",
         ]);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        // own process group, so a timeout can kill git AND everything it spawned (ssh, helpers)
-        cmd.process_group(0);
-    }
     cmd
 }
 
@@ -426,15 +544,20 @@ fn executable_config_risk(git_ctx: &GitExecContext) -> Option<String> {
         let mut cmd = scrubbed_git();
         cmd.args(["config", "--file"])
             .arg(&f)
-            .args(["--list", "--name-only", "-z"]);
+            .args(["--list", "-z"]);
         let Ok((true, out)) = run_with_timeout(cmd, None, call_timeout()) else {
             return Some(UNREADABLE.to_string());
         };
-        for key in out.split('\0') {
-            if key.is_empty() {
+        // `-z` entries are `key\nvalue\0` (a valueless key has no newline)
+        for entry in out.split('\0') {
+            if entry.is_empty() {
                 continue;
             }
-            if let Some(hit) = executable_config_key(key) {
+            let (key, value) = match entry.split_once('\n') {
+                Some((k, v)) => (k, Some(v)),
+                None => (entry, None),
+            };
+            if let Some(hit) = executable_config_entry(key, value) {
                 return Some(format!("repo_config_can_execute:{hit}"));
             }
         }
@@ -452,18 +575,6 @@ fn call_timeout() -> Duration {
     }
 }
 
-/// Kill every process in the group led by `pgid` (git plus the ssh/helper children it spawned).
-/// Non-unix platforms only get `Child::kill` for the direct child.
-fn kill_process_group(pgid: u32) {
-    #[cfg(unix)]
-    // SAFETY: killpg only signals the process group we created with `process_group(0)`.
-    unsafe {
-        libc::killpg(pgid as libc::pid_t, libc::SIGKILL);
-    }
-    #[cfg(not(unix))]
-    let _ = pgid;
-}
-
 /// Run a command with a hard timeout, optional stdin, and stdout capture on a reader thread (so a
 /// large output cannot deadlock the wait loop). Timeout kills the child and reports `git_timeout`.
 fn run_with_timeout(
@@ -477,8 +588,17 @@ fn run_with_timeout(
     cmd.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    crate::proc_tree::configure(&mut cmd);
     let mut child = cmd.spawn()?;
-    let pgid = child.id();
+    // Dropping `tree` kills everything git spawned on EVERY exit path (success, error, timeout).
+    let tree = match crate::proc_tree::ProcTree::adopt(&child) {
+        Ok(t) => t,
+        Err(e) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(SjError::Git(format!("git_containment_failed:{e}")));
+        }
+    };
     if let (Some(data), Some(mut si)) = (input, child.stdin.take()) {
         std::thread::spawn(move || {
             let _ = si.write_all(&data);
@@ -499,7 +619,7 @@ fn run_with_timeout(
         match child.try_wait()? {
             Some(status) => {
                 // git is gone; reap anything it left holding our pipes so the join cannot block
-                kill_process_group(pgid);
+                tree.kill();
                 // bounded: a descendant that escaped the group (setsid) may still hold the pipe
                 let left = deadline.saturating_duration_since(Instant::now());
                 let out = out_rx
@@ -509,7 +629,7 @@ fn run_with_timeout(
             }
             None => {
                 if Instant::now() >= deadline {
-                    kill_process_group(pgid);
+                    tree.kill();
                     let _ = child.kill();
                     let _ = child.wait();
                     return Err(SjError::Git("git_timeout".to_string()));
@@ -572,6 +692,24 @@ fn present_objects(git_ctx: &GitExecContext, ids: &[String]) -> Vec<String> {
 /// How many of `shas` are NOT reachable from any of `tips` (plus `extra_not` pseudo-args such as
 /// `--reflog`). One git process for any number of commits; Err(()) = could not be determined.
 fn count_unreachable(
+    git_ctx: &GitExecContext,
+    shas: &[String],
+    tips: &[String],
+    pre_args: &[&str],
+    not_args: &[&str],
+) -> Result<u64, ()> {
+    // Batches bound each git process's stdin; every sha is judged independently of the others, so
+    // the per-batch counts simply add up. The per-call timeout and the scan deadline still apply to
+    // every batch (a repository too large to finish in time fails closed, never "safe").
+    const BATCH: usize = 5_000;
+    let mut total = 0u64;
+    for chunk in shas.chunks(BATCH) {
+        total = total.saturating_add(count_unreachable_batch(git_ctx, chunk, tips, pre_args, not_args)?);
+    }
+    Ok(total)
+}
+
+fn count_unreachable_batch(
     git_ctx: &GitExecContext,
     shas: &[String],
     tips: &[String],
@@ -663,7 +801,7 @@ fn collect_extra_local_commits(
         .filter(|l| !l.is_empty())
         .map(str::to_string)
         .collect();
-    if refs.len() + reflog.len() > 3000 {
+    if refs.union(&reflog).count() > active_limits().max_extra_commits {
         return Err("too_many_local_commits_to_verify".to_string());
     }
     if refs
@@ -676,21 +814,66 @@ fn collect_extra_local_commits(
     Ok((refs.into_iter().collect(), reflog.into_iter().collect()))
 }
 
-/// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
-/// survive the worktree being removed). None for a standalone repo.
-fn shared_git_ctx(git_ctx: &GitExecContext) -> Option<GitExecContext> {
-    let rel = read_regular_text(&git_ctx.git_dir.join("commondir")).ok()?;
+/// The common git dir of a LINKED worktree (`<git_dir>/commondir`), canonical. None for a git dir
+/// that is itself the common one (a standalone repository or a `.git` file pointing at one).
+fn linked_common_dir(git_dir: &Path) -> Option<PathBuf> {
+    let rel = read_regular_text(&git_dir.join("commondir")).ok()?;
     let rel = rel.trim();
     if rel.is_empty() {
         return None;
     }
-    let common = resolve_relative_from_dir(&git_ctx.git_dir, Path::new(rel));
-    let work_tree = common.parent().map(Path::to_path_buf).unwrap_or_else(|| common.clone());
+    // canonical, so `wt/.git/../..` style relative pointers become the real directory
+    std::fs::canonicalize(resolve_relative_from_dir(git_dir, Path::new(rel)))
+        .ok()
+        .map(strip_verbatim_prefix)
+}
+
+/// Windows `canonicalize` yields `\\?\C:\...`; git rejects that form as a `--git-dir`. Strip it for
+/// plain drive paths (UNC verbatim paths are left alone). No-op elsewhere.
+fn strip_verbatim_prefix(p: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = p.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            let b = rest.as_bytes();
+            if b.len() >= 2 && b[0].is_ascii_alphabetic() && b[1] == b':' {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    p
+}
+
+/// Git context for the SHARED git dir of a linked worktree (its branch reflogs live there and
+/// survive the worktree being removed). None for a standalone repo. The work tree handed to git is
+/// the main checkout for a normal repository and the common dir ITSELF for a bare one: never a
+/// guessed parent directory (those git calls only read refs and reflogs, never the work tree).
+fn shared_git_ctx(git_ctx: &GitExecContext) -> Option<GitExecContext> {
+    let common = linked_common_dir(&git_ctx.git_dir)?;
+    let work_tree = match common.file_name() {
+        Some(n) if n == ".git" => common.parent().map(Path::to_path_buf).unwrap_or_else(|| common.clone()),
+        _ => common.clone(),
+    };
     Some(GitExecContext {
         work_tree,
         git_dir: common,
         alternate_object_dirs: None,
     })
+}
+
+/// True when the repository's own config says `core.bare = true`. Read by PARSING the file (never
+/// by running anything repo-controlled); anything unreadable counts as bare (fail closed).
+fn common_dir_is_bare(common: &Path) -> bool {
+    let mut cmd = scrubbed_git();
+    cmd.args(["config", "--file"])
+        .arg(common.join("config"))
+        .args(["--bool", "--get", "core.bare"]);
+    match run_with_timeout(cmd, None, call_timeout()) {
+        Ok((true, out)) => out.trim() == "true",
+        // exit 1 = key not set (not bare); a spawn/timeout failure is "cannot tell"
+        Ok((false, _)) => false,
+        Err(_) => true,
+    }
 }
 
 /// Linked worktrees of this repository as (path, locked) from `git worktree list --porcelain`.
@@ -751,6 +934,7 @@ pub(crate) fn capture_git_snapshot_identity_staged(
     logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<(String, String, String), SjError> {
+    let _home = HomeLease::acquire();
     let (git_ctx, _) =
         build_git_exec_context(actual_repo, logical_repo, ctx).map_err(SjError::Git)?;
     let (head_ok, head) = run_git_ctx(&git_ctx, ["rev-parse", "--verify", "HEAD"])?;
@@ -991,6 +1175,34 @@ fn dir_bytes_no_follow(path: &Path) -> u64 {
     total
 }
 
+/// True when the checkout actually USES git-lfs: a tracked or info `.gitattributes` rule with
+/// `filter=lfs`, or a non-empty local LFS object store. Pushed commits then prove nothing about the
+/// LFS CONTENT (it may exist only in `<common>/lfs/objects` if the LFS upload was skipped), so such a
+/// checkout is never offered. Unused benign LFS config does not trigger this.
+fn uses_lfs(git_ctx: &GitExecContext) -> bool {
+    let common = linked_common_dir(&git_ctx.git_dir).unwrap_or_else(|| git_ctx.git_dir.clone());
+    let store = common.join("lfs").join("objects");
+    if let Ok(mut rd) = std::fs::read_dir(&store) {
+        if rd.next().is_some() {
+            return true;
+        }
+    }
+    // every TRACKED .gitattributes (any depth), read from the work tree; an unlistable index or an
+    // unreadable file fails closed
+    let mut files = vec![common.join("info").join("attributes")];
+    match run_git_raw_ctx(git_ctx, ["ls-files", "-z", "--", ":(glob)**/.gitattributes"]) {
+        Ok((true, out)) => files.extend(
+            out.split('\0').filter(|p| !p.is_empty()).map(|p| git_ctx.work_tree.join(p)),
+        ),
+        _ => return true,
+    }
+    files.iter().any(|f| match std::fs::symlink_metadata(f) {
+        Err(e) if e.kind() == ErrorKind::NotFound => false,
+        Err(_) => true,
+        Ok(_) => read_regular_text(f).map(|t| t.contains("filter=lfs")).unwrap_or(true),
+    })
+}
+
 /// True when the repository has (or may have) submodules: a `.gitmodules`, a `.git/modules` dir,
 /// or any gitlink (mode 160000) in the index. Unknown (listing failed) counts as "has".
 fn has_submodules(git_ctx: &GitExecContext) -> bool {
@@ -1010,6 +1222,7 @@ fn validate_single_repo_at(
     logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<OrphanCandidate, Vec<String>> {
+    let _home = HomeLease::acquire();
     let mut reasons = Vec::new();
     let proof_start = Instant::now();
     if scan_deadline_passed() {
@@ -1043,6 +1256,19 @@ fn validate_single_repo_at(
     // Block BEFORE any git invocation that could execute repo-controlled config.
     if let Some(risk) = executable_config_risk(&git_ctx) {
         reasons.push(risk);
+        return Err(reasons);
+    }
+
+    // A `.git` FILE that points straight at a bare repository (the `.bare` layout): this directory
+    // hosts the bare main repo, and every linked worktree anywhere on disk depends on it. Deleting
+    // it would destroy their git metadata and every branch only they hold. Refuse, by name.
+    if is_worktree && linked_common_dir(&git_ctx.git_dir).is_none() && common_dir_is_bare(&git_ctx.git_dir) {
+        reasons.push("bare_main_repository".to_string());
+        return Err(reasons);
+    }
+
+    if uses_lfs(&git_ctx) {
+        reasons.push("lfs_objects_unverified".to_string());
         return Err(reasons);
     }
 
@@ -1159,6 +1385,10 @@ fn validate_single_repo_at(
 
     let refs_before = snapshot_local_branches(&git_ctx);
     let extra_commits = collect_extra_local_commits(&git_ctx);
+    if let Err(reason) = &extra_commits {
+        // cap hit / listing failure: fail closed with the REAL reason
+        reasons.push(reason.clone());
+    }
     let mut all_branches_verified = false;
     if let Ok(ref local_branches) = refs_before {
         if !remotes.is_empty() && proof_start.elapsed() < active_limits().repo_budget {
@@ -1226,11 +1456,11 @@ fn validate_single_repo_at(
                 // tags and per-worktree refs: contained in some remote head/tag
                 let (ref_shas, reflog_shas) = match &extra_commits {
                     Ok(v) => v.clone(),
-                    Err(_) => (vec![String::new()], Vec::new()),
+                    // reported precisely below (never mislabelled as an unpushed commit)
+                    Err(_) => (Vec::new(), Vec::new()),
                 };
                 let refs_ok = ref_shas.is_empty()
-                    || (ref_shas[0] != String::new()
-                        && count_unreachable(&git_ctx, &ref_shas, &all_tips, &[], &[]) == Ok(0));
+                    || count_unreachable(&git_ctx, &ref_shas, &all_tips, &[], &[]) == Ok(0);
                 // HEAD reflog: for a linked worktree, commits still held by the SHARED reflogs (branch
                 // reflogs live in the common git dir and outlive the worktree) are not lost
                 let reflog_ok = if reflog_shas.is_empty() {
@@ -1524,6 +1754,7 @@ pub(crate) fn verify_orphan_safe_to_remove_staged(
     logical_repo: &Path,
     ctx: &ProtectionContext,
 ) -> Result<(), SjError> {
+    let _home = HomeLease::acquire();
     let prot = match anchor_to_cwd(logical_repo) {
         Ok(abs) => check_path_protection_anchored(&abs, ctx),
         Err(reason) => ProtectionVerdict::deny(reason),
@@ -1664,5 +1895,91 @@ mod tests {
         // Absolute rel is returned unchanged.
         let resolved_abs = resolve_relative_from_dir(&existing_base, &shared);
         assert_eq!(resolved_abs, shared);
+    }
+
+    // ---- process-tree kill (all platforms; the Windows leg runs on windows-latest CI) ----------
+
+    /// Re-entry point: the timeout test re-executes THIS test binary with SJ_TREE_ROLE set. As the
+    /// `parent` it spawns a `grandchild` (a second copy of this binary) and records its pid, then both
+    /// sleep. Without the env var it is a no-op, so a normal `cargo test` run is unaffected.
+    #[test]
+    fn tree_kill_helper_role() {
+        let Ok(role) = std::env::var("SJ_TREE_ROLE") else {
+            return;
+        };
+        let pidfile = std::env::var("SJ_TREE_PIDFILE").expect("pidfile");
+        if role == "parent" {
+            let exe = std::env::current_exe().unwrap();
+            // deliberately never waited on: it must outlive this process unless the tree is killed
+            #[allow(clippy::zombie_processes)]
+            let child = std::process::Command::new(exe)
+                .args(["--exact", "orphans::tests::tree_kill_helper_role", "--nocapture"])
+                .env("SJ_TREE_ROLE", "grandchild")
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("spawn grandchild");
+            std::fs::write(&pidfile, child.id().to_string()).unwrap();
+        }
+        std::thread::sleep(Duration::from_secs(120));
+    }
+
+    fn pid_is_alive(pid: u32) -> bool {
+        #[cfg(unix)]
+        {
+            // SAFETY: signal 0 only checks existence.
+            if unsafe { libc::kill(pid as libc::pid_t, 0) } != 0 {
+                return false;
+            }
+            // a killed process nobody has reaped yet is a zombie: dead for our purposes
+            let out = Command::new("ps").args(["-o", "stat=", "-p", &pid.to_string()]).output();
+            !matches!(out, Ok(o) if String::from_utf8_lossy(&o.stdout).trim_start().starts_with('Z'))
+        }
+        #[cfg(windows)]
+        {
+            let out = Command::new("tasklist")
+                .args(["/NH", "/FI", &format!("PID eq {pid}")])
+                .output()
+                .expect("tasklist");
+            String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
+        }
+    }
+
+    #[test]
+    fn timeout_kills_the_whole_process_tree_not_just_the_direct_child() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pidfile = tmp.path().join("grandchild.pid");
+        let mut cmd = Command::new(std::env::current_exe().unwrap());
+        cmd.args(["--exact", "orphans::tests::tree_kill_helper_role", "--nocapture"])
+            .env("SJ_TREE_ROLE", "parent")
+            .env("SJ_TREE_PIDFILE", &pidfile);
+        let started = Instant::now();
+        let res = run_with_timeout(cmd, None, Duration::from_secs(4));
+        assert!(
+            matches!(&res, Err(SjError::Git(r)) if r == "git_timeout"),
+            "expected git_timeout, got {res:?}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(30), "timeout did not bound the call");
+        let pid: u32 = std::fs::read_to_string(&pidfile)
+            .expect("the parent never recorded its grandchild; probe is not exercising the tree")
+            .trim()
+            .parse()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while pid_is_alive(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        let alive = pid_is_alive(pid);
+        if alive {
+            #[cfg(unix)]
+            // SAFETY: cleanup of the probe's own leaked process.
+            unsafe {
+                libc::kill(pid as libc::pid_t, libc::SIGKILL);
+            }
+            #[cfg(windows)]
+            let _ = Command::new("taskkill").args(["/F", "/PID", &pid.to_string()]).output();
+        }
+        assert!(!alive, "grandchild {pid} survived the timeout: only the direct child was killed");
     }
 }

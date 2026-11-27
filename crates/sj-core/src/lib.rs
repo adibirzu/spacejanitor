@@ -8,6 +8,7 @@ pub mod mcp_audit;
 pub mod memory;
 pub mod orphans;
 pub mod plan;
+mod proc_tree;
 pub mod protect;
 pub mod reap;
 pub mod redact;

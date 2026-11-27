@@ -19,6 +19,7 @@ fn scan(root: &Path, call: u64) -> (OrphansReport, Duration) {
         call_timeout: Duration::from_secs(call),
         repo_budget: Duration::from_secs(60),
         scan_budget: Duration::from_secs(60),
+        ..ProofLimits::default()
     };
     let t0 = Instant::now();
     let r =

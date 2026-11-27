@@ -9,12 +9,14 @@
     "include.path", "includeif.gitdir:/x/.path",
     "diff.external", "diff.x.textconv", "diff.x.command",
     "gpg.program", "gpg.ssh.program", "gpg.x509.program",
-    "uploadpack.packobjectshook", "http.proxy", "http.sslcertpasswordprotected", "http.https://example.com/.proxy", "http.https://example.com/.sslverify", "http.sslcainfo", "http.extraheader", "protocol.evil.allow", "protocol.allow", "protocol.fd.allow", "ssh.variant.x"
+    "uploadpack.packobjectshook", "http.proxy", "http.sslcertpasswordprotected", "http.https://example.com/.proxy", "http.https://example.com/.sslverify", "http.sslcainfo", "http.extraheader", "protocol.evil.allow", "protocol.allow", "protocol.fd.allow", "ssh.variant.x",
+    "lfs.extension.x.clean", "lfs.customtransfer.x.path", "lfs.standalonetransferagent"
   ],
   "allow": [
     "core.bare", "core.filemode", "core.repositoryformatversion", "core.worktree", "core.fsmonitor", "core.hookspath",
     "remote.origin.url", "remote.origin.fetch", "branch.main.remote", "branch.main.merge", "user.name", "user.email",
     "filter.x.required", "diff.x.binary", "http.sslverify", "extensions.worktreeconfig", "pull.rebase", "init.defaultbranch",
-    "gc.auto", "commit.gpgsign"
+    "gc.auto", "commit.gpgsign",
+    "lfs.repositoryformatversion", "lfs.locksverify", "lfs.https://example.com/r.git/info/lfs.locksverify"
   ]
 }
