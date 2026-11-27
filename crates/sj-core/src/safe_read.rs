@@ -13,8 +13,8 @@ use std::path::Path;
 #[cfg(windows)]
 use windows_sys::Win32::Storage::FileSystem::{
     GetFileType, GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT,
-    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-    FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TYPE_DISK, VOLUME_NAME_DOS,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_TYPE_DISK,
+    VOLUME_NAME_DOS,
 };
 
 /// Config files above this size are not read (they are not MCP configs).
@@ -22,7 +22,7 @@ const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadRefusal {
-    /// The file (or the opened handle's path) is a symlink or changed while being opened.
+    /// The file is a symlink or reparse point, or the path changed while it was being opened.
     Symlink,
     /// The canonical path is outside the canonical home (only enforced when requested).
     OutsideHome,
@@ -73,9 +73,7 @@ fn open_nofollow(path: &Path) -> std::io::Result<fs::File> {
     {
         use std::os::windows::fs::OpenOptionsExt;
         // Open directory reparse points as objects too, so the handle check can reject them.
-        // Exclude delete sharing to keep the opened file from being renamed during validation.
-        o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS)
-            .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE);
+        o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
     }
     o.open(path)
 }

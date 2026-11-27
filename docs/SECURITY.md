@@ -2,7 +2,7 @@
 
 SpaceJanitor inspects local filesystems, git repositories, running process arguments, and kernel counters, and optionally cleans operator-approved targets. Because a workstation janitor operates on sensitive local state, security invariants are enforced deterministically in `crates/sj-core`.
 
-> **Implementation status:** everything below is implemented on `main` unless marked otherwise. The root [SECURITY.md](../SECURITY.md) is the disclosure policy and the shorter threat model; this page is the detailed reference. Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12), [#16](https://github.com/adibirzu/spacejanitor/issues/16), [#17](https://github.com/adibirzu/spacejanitor/issues/17).
+> **Implementation status:** everything below is implemented on `main` unless marked otherwise. The root [SECURITY.md](../SECURITY.md) is the disclosure policy and the shorter threat model; this page is the detailed reference.
 
 ---
 

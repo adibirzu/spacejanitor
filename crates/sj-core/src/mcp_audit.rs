@@ -1177,6 +1177,27 @@ mod tests {
     }
 
     #[test]
+    fn audit_warns_about_unclosed_toml_arrays() {
+        let tmp = tempdir().unwrap();
+        let config = tmp.path().join("config.toml");
+        fs::write(
+            &config,
+            "[mcp_servers.example]\ncommand = 'example'\nargs = [\n",
+        )
+        .unwrap();
+        let opts = McpAuditOptions {
+            config_dirs: vec![config],
+            home_dir: None,
+        };
+        let report = audit_mcp_with_processes(&opts, &[]).unwrap();
+        assert_eq!(report.configured_servers.len(), 1);
+        assert!(report.configured_servers[0].args.is_empty());
+        assert!(report.warnings.iter().any(|warning| {
+            warning.starts_with("config TOML array unclosed or exceeds the multiline byte limit: ")
+        }));
+    }
+
+    #[test]
     fn toml_multiline_args_array_is_parsed_and_its_secret_is_redacted() {
         let tmp = tempdir().unwrap();
         let secret = "dummy_multiline_secret_for_unit_test_1357";

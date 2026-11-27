@@ -49,4 +49,4 @@ Workstations running multiple IDEs, local LLMs, VMs, and background agent worker
 | FR-2.5 Redaction | Implemented as a closed vocabulary (`crates/sj-core/data/redact_catalog.json`), not pattern matching | `redact.rs` |
 | FR-2.6 Remediation action IDs (`m1-reap-*`, `m2-*`) | Not implemented as named; reaping uses `sj reap` with its own digest and confirm phrase. Daemon restart / `sudo` actions are intentionally absent | `reap.rs` |
 
-**Open items:** [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse on huge malformed input), PR #18 (Linux extension, unmerged), owner-group aggregation, FR-2.6 action IDs.
+**Open items:** PR #18 (Linux extension, unmerged), owner-group aggregation, FR-2.6 action IDs.

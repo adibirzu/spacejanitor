@@ -1,6 +1,6 @@
 # ADR-004: Zero-Leak Privacy & Two-Step Remediation Gate
 
-- **Status:** Accepted and implemented (selection-bound gate; Windows removal and issue #16/#17 open)
+- **Status:** Accepted and implemented (selection-bound gate, Unix-only removal)
 - **Date:** 2026-11-24
 - **Drivers:** MIT open-source hygiene, defense against accidental deletion or process termination, secret safety.
 
@@ -43,4 +43,4 @@ System cleanup tools inspect sensitive locations: user home directories, git rep
 | Hygiene gates | `scripts/check-oss-hygiene.mjs` and gitleaks in CI |
 | Handle-anchored, no-follow removal | Implemented for macOS and Linux; Windows plans only |
 
-Open: [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse), [#12](https://github.com/adibirzu/spacejanitor/issues/12) (git-proof hardening).
+Git-proof hardening is tracked in [#12](https://github.com/adibirzu/spacejanitor/issues/12).
