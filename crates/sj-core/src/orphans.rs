@@ -475,10 +475,15 @@ fn scrubbed_git() -> Command {
     cmd
 }
 
-/// Read a small text file that must be a regular, non-symlink file. Opening is non-blocking so a
-/// FIFO planted in its place can never hang the scan, and the type is checked on the open handle.
+const MAX_REGULAR_TEXT_BYTES: u64 = 1 << 20;
+
 fn read_regular_text(path: &Path) -> Result<String, String> {
-    const MAX: u64 = 1 << 20;
+    read_regular_text_prefix(path, MAX_REGULAR_TEXT_BYTES)
+}
+
+/// Read up to `limit` bytes from a regular, non-symlink file. Opening is non-blocking so a
+/// FIFO planted in its place can never hang the scan, and the type is checked on the open handle.
+fn read_regular_text_prefix(path: &Path, limit: u64) -> Result<String, String> {
     let mut opts = std::fs::OpenOptions::new();
     opts.read(true);
     #[cfg(unix)]
@@ -492,7 +497,7 @@ fn read_regular_text(path: &Path) -> Result<String, String> {
         return Err("non_regular_file".to_string());
     }
     let mut buf = String::new();
-    f.take(MAX)
+    f.take(limit)
         .read_to_string(&mut buf)
         .map_err(|_| "unreadable".to_string())?;
     Ok(buf)
@@ -1175,10 +1180,9 @@ fn dir_bytes_no_follow(path: &Path) -> u64 {
     total
 }
 
-/// True when the checkout actually USES git-lfs: a tracked or info `.gitattributes` rule with
-/// `filter=lfs`, or a non-empty local LFS object store. Pushed commits then prove nothing about the
-/// LFS CONTENT (it may exist only in `<common>/lfs/objects` if the LFS upload was skipped), so such a
-/// checkout is never offered. Unused benign LFS config does not trigger this.
+/// True when the checkout uses git-lfs or attributes cannot rule it out. A `filter=lfs` rule or a
+/// non-empty local LFS object store means pushed commits alone cannot prove the LFS content exists
+/// remotely. Unused benign LFS config does not trigger this.
 fn uses_lfs(git_ctx: &GitExecContext) -> bool {
     let common = linked_common_dir(&git_ctx.git_dir).unwrap_or_else(|| git_ctx.git_dir.clone());
     let store = common.join("lfs").join("objects");
@@ -1187,10 +1191,9 @@ fn uses_lfs(git_ctx: &GitExecContext) -> bool {
             return true;
         }
     }
-    // every TRACKED .gitattributes (any depth), read from the work tree; an unlistable index or an
-    // unreadable file fails closed
+    // Inspect tracked attributes at any depth and with any casing in the work tree.
     let mut files = vec![common.join("info").join("attributes")];
-    match run_git_raw_ctx(git_ctx, ["ls-files", "-z", "--", ":(glob)**/.gitattributes"]) {
+    match run_git_raw_ctx(git_ctx, ["ls-files", "-z", "--", ":(glob,icase)**/.gitattributes"]) {
         Ok((true, out)) => files.extend(
             out.split('\0').filter(|p| !p.is_empty()).map(|p| git_ctx.work_tree.join(p)),
         ),
@@ -1199,7 +1202,10 @@ fn uses_lfs(git_ctx: &GitExecContext) -> bool {
     files.iter().any(|f| match std::fs::symlink_metadata(f) {
         Err(e) if e.kind() == ErrorKind::NotFound => false,
         Err(_) => true,
-        Ok(_) => read_regular_text(f).map(|t| t.contains("filter=lfs")).unwrap_or(true),
+        // Read one extra byte to distinguish a complete file from a truncated prefix.
+        Ok(_) => read_regular_text_prefix(f, MAX_REGULAR_TEXT_BYTES + 1)
+            .map(|t| t.len() as u64 > MAX_REGULAR_TEXT_BYTES || t.contains("filter=lfs"))
+            .unwrap_or(true),
     })
 }
 
@@ -1802,6 +1808,60 @@ pub fn verify_orphan_safe_to_remove(repo: &Path, ctx: &ProtectionContext) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn lfs_fixture(work_tree: &Path) -> GitExecContext {
+        let git_ctx = GitExecContext {
+            work_tree: work_tree.to_path_buf(),
+            git_dir: work_tree.join(".git"),
+            alternate_object_dirs: None,
+        };
+        let out = scrubbed_git()
+            .current_dir(work_tree)
+            .args(["init", "--template="])
+            .output()
+            .expect("initialize fixture repository");
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        git_ctx
+    }
+
+    #[test]
+    fn lfs_classifies_oversized_attributes_as_unverified() {
+        let _home = HomeLease::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let git_ctx = lfs_fixture(tmp.path());
+        let name = ".gitattributes";
+        let path = tmp.path().join(name);
+        let mut attributes = b"# inert fixture\n".repeat((1 << 20) / 16);
+        assert_eq!(attributes.len(), 1 << 20);
+        std::fs::write(&path, &attributes).unwrap();
+        assert!(run_git_raw_ctx(&git_ctx, ["add", "--", name]).unwrap().0);
+        assert!(!uses_lfs(&git_ctx), "complete inert attributes at the read limit");
+
+        attributes.extend_from_within(..);
+        attributes.extend_from_slice(b"*.data filter=lfs\n");
+        std::fs::write(&path, attributes).unwrap();
+        assert!(run_git_raw_ctx(&git_ctx, ["add", "--", name]).unwrap().0);
+        assert!(uses_lfs(&git_ctx), "oversized attributes must fail closed");
+
+        let mut inert = b"# inert fixture\n".repeat((1 << 20) / 16);
+        inert.push(b'\n');
+        std::fs::write(&path, inert).unwrap();
+        assert!(run_git_raw_ctx(&git_ctx, ["add", "--", name]).unwrap().0);
+        assert!(uses_lfs(&git_ctx), "an oversized prefix without any rule is inconclusive");
+    }
+
+    #[test]
+    fn lfs_classifies_mixed_case_nested_attributes_as_unverified() {
+        let _home = HomeLease::acquire();
+        let tmp = tempfile::tempdir().unwrap();
+        let git_ctx = lfs_fixture(tmp.path());
+        let name = "assets/nested/.GitAttributes";
+        let path = tmp.path().join(name);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"*.data filter=lfs\n").unwrap();
+        assert!(run_git_raw_ctx(&git_ctx, ["add", "--", name]).unwrap().0);
+        assert!(uses_lfs(&git_ctx), "mixed-case attributes must be inspected");
+    }
 
     #[test]
     fn anchor_to_cwd_preserves_filesystem_parent_components() {
