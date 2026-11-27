@@ -175,8 +175,6 @@ See [docs/USAGE.md](./docs/USAGE.md) for the full command reference.
 | **M7** | Release pipeline (`.github/workflows/release.yml`) | Workflow exists; **never run, no tag, no published artifacts** |
 | Linux extension | Linux audit, systemd/podman blockers, memory, gated remediation | Open in [PR #18](https://github.com/adibirzu/spacejanitor/pull/18), not merged |
 
-Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12) (git-proof hardening), [#16](https://github.com/adibirzu/spacejanitor/issues/16) (Windows no-follow config reads), [#17](https://github.com/adibirzu/spacejanitor/issues/17) (slow TOML parse on huge malformed input).
-
 ---
 
 ## Known limitations
@@ -188,7 +186,7 @@ Open hardening items: [#12](https://github.com/adibirzu/spacejanitor/issues/12) 
 
   Tracked in [issue #12](https://github.com/adibirzu/spacejanitor/issues/12). The Rust core now runs its git proofs with a scrubbed environment and config (no inherited config, proxy, credential helper or hooks), blocks repositories with submodules or any `http.*` config, kills the whole git process tree on timeout (a job object on Windows), and enforces a scan-wide deadline. The issue's leftovers (bare-repo worktrees, over-blocking of known-benign `filter.lfs`/`credential.helper`, the ref cap, temp HOME cleanup) are fixed; scanning nevertheless stays opt-in. By default no git command touches any repository (`doctor` only runs `git --version`). Opt in only for repositories you trust: `sj orphans --include-orphans`, `sj plan --include-orphans`, `spacejanitor-axi orphans --include-orphans`, or the explicit toggle in the desktop app (Disk view). When scanning is off, the desktop app shows orphan worktrees as "not scanned (disabled by default)", never as "no orphans". Trash cleanup, the confirmation gate, the protection gate, redaction, MCP audit and the SLM advisor are unaffected.
 - **Removal is Unix-only.** `sj plan --execute` and `sj reap --execute` run on macOS and Linux; on Windows `plan --execute` is refused and `sj reap` finds no eligible targets.
-- **Windows config reads** do not yet open MCP config files no-follow (issue #16), and a huge malformed TOML config can parse slowly (issue #17).
+- **Windows config discovery** uses path-based directory listings. Config-file reads reject leaf reparse points and validate the final path from the opened handle.
 - **No signed installers.** Nothing is published; when releases start they will be unsigned until code signing and notarization are enabled.
 
 ---

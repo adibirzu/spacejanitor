@@ -2,21 +2,27 @@
 //!
 //! A path check followed by a separate `fs::read_to_string(path)` leaves a window in which
 //! the file can be swapped for a symlink (or a FIFO) after it was validated. Here the file is
-//! opened once with `O_NOFOLLOW | O_NONBLOCK`, `fstat`-ed on the opened handle, and the
-//! handle is bound to the checked canonical path by `(st_dev, st_ino)` before any byte is read.
-//! Content is only ever read from that handle.
+//! opened once without following the final link. Unix checks the opened file's identity against
+//! the checked canonical path. Windows checks the final path obtained from the opened handle.
+//! Both read content only from the validated handle.
 
 use crate::protect::{check_path_protection, ProtectionContext};
 use std::fs;
 use std::io::Read;
 use std::path::Path;
+#[cfg(windows)]
+use windows_sys::Win32::Storage::FileSystem::{
+    GetFileType, GetFinalPathNameByHandleW, FILE_ATTRIBUTE_REPARSE_POINT,
+    FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED, FILE_TYPE_DISK,
+    VOLUME_NAME_DOS,
+};
 
 /// Config files above this size are not read (they are not MCP configs).
 const MAX_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ReadRefusal {
-    /// The file (or the opened handle's path) is a symlink or changed while being opened.
+    /// The file is a symlink or reparse point, or the path changed while it was being opened.
     Symlink,
     /// The canonical path is outside the canonical home (only enforced when requested).
     OutsideHome,
@@ -55,11 +61,6 @@ fn same_inode(a: &fs::Metadata, b: &fs::Metadata) -> bool {
     a.dev() == b.dev() && a.ino() == b.ino()
 }
 
-#[cfg(not(unix))]
-fn same_inode(_a: &fs::Metadata, _b: &fs::Metadata) -> bool {
-    true
-}
-
 fn open_nofollow(path: &Path) -> std::io::Result<fs::File> {
     let mut o = fs::OpenOptions::new();
     o.read(true);
@@ -68,7 +69,45 @@ fn open_nofollow(path: &Path) -> std::io::Result<fs::File> {
         use std::os::unix::fs::OpenOptionsExt;
         o.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
     }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Open directory reparse points as objects too, so the handle check can reject them.
+        o.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS);
+    }
     o.open(path)
+}
+
+#[cfg(windows)]
+fn final_path(file: &fs::File) -> Result<std::path::PathBuf, ReadRefusal> {
+    use std::os::windows::{ffi::OsStringExt, io::AsRawHandle};
+
+    let handle = file.as_raw_handle();
+    // SAFETY: `file` owns this valid handle and remains borrowed throughout the queries.
+    if unsafe { GetFileType(handle) } != FILE_TYPE_DISK {
+        return Err(ReadRefusal::NotRegular);
+    }
+    let query = |buf: &mut [u16]| {
+        // SAFETY: Win32 receives a live file handle and a writable UTF-16 buffer of this size.
+        unsafe {
+            GetFinalPathNameByHandleW(
+                handle,
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            ) as usize
+        }
+    };
+    let mut buf = vec![0; 260];
+    let mut len = query(&mut buf);
+    if len > buf.len() {
+        buf.resize(len, 0);
+        len = query(&mut buf);
+    }
+    if len == 0 || len >= buf.len() {
+        return Err(ReadRefusal::Unreadable);
+    }
+    Ok(std::ffi::OsString::from_wide(&buf[..len]).into())
 }
 
 /// Opens `path` without following a final symlink, validates the *opened handle*, and reads
@@ -104,13 +143,17 @@ pub(crate) fn trusted_client_config_ok(path: &Path, policy: &ReadPolicy<'_>) -> 
     let Ok(canon) = fs::canonicalize(path) else {
         return false;
     };
+    trusted_client_canonical_ok(path, &canon, policy)
+}
+
+fn trusted_client_canonical_ok(path: &Path, canon: &Path, policy: &ReadPolicy<'_>) -> bool {
     let Ok(rel) = path.strip_prefix(&policy.ctx.home_dir) else {
         return false;
     };
     if canon != policy.canon_home.join(rel) {
         return false;
     }
-    let v = check_path_protection(&canon, policy.ctx);
+    let v = check_path_protection(canon, policy.ctx);
     !v.protected
         || TRUSTED_CLIENT_HOMES
             .iter()
@@ -135,28 +178,41 @@ fn read_config_file_inner(
         }
     })?;
     let meta = file.metadata().map_err(|_| ReadRefusal::Unreadable)?;
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if meta.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(ReadRefusal::Symlink);
+        }
+    }
     if !meta.is_file() {
         return Err(ReadRefusal::NotRegular);
     }
     if meta.len() > MAX_CONFIG_BYTES {
         return Err(ReadRefusal::TooLarge);
     }
+    #[cfg(windows)]
+    let canon = final_path(&file)?;
+    #[cfg(not(windows))]
     let canon = fs::canonicalize(path).map_err(|_| ReadRefusal::Unreadable)?;
     if policy.require_in_home && !canon.starts_with(policy.canon_home) {
         return Err(ReadRefusal::OutsideHome);
     }
     let protected = if trusted_client {
-        !trusted_client_config_ok(path, policy)
+        !trusted_client_canonical_ok(path, &canon, policy)
     } else {
         check_path_protection(&canon, policy.ctx).protected
     };
     if protected {
         return Err(ReadRefusal::Protected);
     }
-    // The handle we hold must be the file at the canonical path we just validated.
-    let cm = fs::metadata(&canon).map_err(|_| ReadRefusal::Unreadable)?;
-    if !same_inode(&meta, &cm) {
-        return Err(ReadRefusal::Symlink);
+    #[cfg(unix)]
+    {
+        // The handle we hold must be the file at the canonical path we just validated.
+        let cm = fs::metadata(&canon).map_err(|_| ReadRefusal::Unreadable)?;
+        if !same_inode(&meta, &cm) {
+            return Err(ReadRefusal::Symlink);
+        }
     }
     let mut raw = String::new();
     file.take(MAX_CONFIG_BYTES)
@@ -317,6 +373,81 @@ fn libc_eloop() -> i32 {
 #[cfg(not(unix))]
 fn libc_eloop() -> i32 {
     -1
+}
+
+#[cfg(all(test, windows))]
+mod windows_tests {
+    use super::*;
+    use std::os::windows::fs::MetadataExt;
+    use std::process::Command;
+
+    #[test]
+    fn nofollow_open_returns_the_junction_object() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("fixture");
+        let junction = temp.path().join("junction");
+        fs::create_dir(&target).unwrap();
+        make_junction(&junction, &target);
+
+        let opened = open_nofollow(&junction).unwrap();
+        let attributes = opened.metadata().unwrap().file_attributes();
+        assert_ne!(attributes & FILE_ATTRIBUTE_REPARSE_POINT, 0);
+        let canon_home = fs::canonicalize(temp.path()).unwrap();
+        let ctx = ProtectionContext::new(temp.path().into(), Vec::new());
+        let policy = ReadPolicy {
+            ctx: &ctx,
+            canon_home: &canon_home,
+            require_in_home: true,
+        };
+        assert_eq!(
+            read_config_file(&junction, &policy),
+            Err(ReadRefusal::Symlink)
+        );
+    }
+
+    fn make_junction(junction: &Path, target: &Path) {
+        let created = Command::new("cmd")
+            .args(["/d", "/c", "mklink", "/j"])
+            .arg(junction)
+            .arg(target)
+            .output()
+            .unwrap();
+        assert!(created.status.success(), "junction fixture: {created:?}");
+    }
+
+    #[test]
+    fn policy_checks_the_opened_files_final_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let home = temp.path().join("home");
+        let other = temp.path().join("other");
+        fs::create_dir(&home).unwrap();
+        fs::create_dir(&other).unwrap();
+        fs::write(home.join("config.json"), "{}").unwrap();
+        fs::write(other.join("config.json"), "{\"fixture\":true}").unwrap();
+        make_junction(&home.join("junction"), &other);
+
+        let canon_home = fs::canonicalize(&home).unwrap();
+        let ctx = ProtectionContext::new(home.clone(), Vec::new());
+        let policy = ReadPolicy {
+            ctx: &ctx,
+            canon_home: &canon_home,
+            require_in_home: true,
+        };
+        assert_eq!(
+            read_config_file(&home.join("config.json"), &policy),
+            Ok("{}".into())
+        );
+        let via_junction = home.join("junction/config.json");
+        let file = open_nofollow(&via_junction).unwrap();
+        assert_eq!(
+            final_path(&file),
+            Ok(fs::canonicalize(other.join("config.json")).unwrap())
+        );
+        assert_eq!(
+            read_config_file(&via_junction, &policy),
+            Err(ReadRefusal::OutsideHome)
+        );
+    }
 }
 
 #[cfg(all(test, unix))]
